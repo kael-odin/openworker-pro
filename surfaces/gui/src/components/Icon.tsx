@@ -42,6 +42,7 @@ export type IconName =
   | "mic"
   | "stop"
   | "bell"
+  | "bot"
   | "x";
 
 export function Icon({
@@ -238,6 +239,17 @@ export function Icon({
         <svg {...s}>
           <path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
           <path d="M13.7 21a2 2 0 0 1-3.4 0" />
+        </svg>
+      );
+    case "bot":
+      return (
+        <svg {...s}>
+          <rect x="4" y="8" width="16" height="11" rx="3" />
+          <path d="M12 4v4" />
+          <circle cx="12" cy="3" r="1" />
+          <circle cx="9" cy="13" r="1.2" fill="currentColor" stroke="none" />
+          <circle cx="15" cy="13" r="1.2" fill="currentColor" stroke="none" />
+          <path d="M2 13v2M22 13v2" />
         </svg>
       );
     case "search":

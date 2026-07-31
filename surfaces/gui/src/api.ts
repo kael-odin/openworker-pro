@@ -1966,3 +1966,120 @@ export async function testNotifyChannel(
   });
   return res.json();
 }
+
+// -- digital humans (DHP bridge, 批次 C) -------------------------------------
+
+export interface SelectOption {
+  label: string;
+  value: string | number | boolean;
+}
+export interface ConfigField {
+  key: string;
+  label: string;
+  type: "string" | "text" | "number" | "boolean" | "url" | "email" | "select";
+  required: boolean;
+  description?: string;
+  default?: unknown;
+  placeholder?: string;
+  options?: SelectOption[];
+  secret?: boolean;
+}
+export interface DigitalHumanEntry {
+  slug: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  type: string;
+  category: string;
+  tags: string[];
+  icon: string;
+  locale: string;
+  min_app_version: string;
+  updated_at: string;
+  has_i18n: boolean;
+  installed: boolean;
+}
+export interface DigitalHumanDetail {
+  ok: boolean;
+  error?: string;
+  entry: DigitalHumanEntry;
+  spec: {
+    name: string;
+    version: string;
+    description: string;
+    system_prompt: string;
+    config_schema: ConfigField[];
+    notify_channels: string[];
+    has_schedule: boolean;
+    slug: string;
+    icon: string;
+  };
+  requires_consent: {
+    mcps: Array<{ id: string; reason: string; bundled: boolean }>;
+    skills: Array<{ id: string; reason: string; bundled: boolean }>;
+    permissions: string[];
+    browser_login: Array<{ url: string; label: string }>;
+    has_schedule: boolean;
+  };
+}
+export interface DigitalHumanInstance {
+  id: string;
+  slug: string;
+  name: string;
+  task_id: string;
+  config: Record<string, unknown>;
+  secret_keys: string[];
+  spec_version: string;
+  installed_at: number;
+  updated_at: number;
+  task: {
+    id: string;
+    title: string;
+    schedule: string;
+    schedule_raw: { kind: string; cron: string | null; fire_at: string | null; timezone: string };
+    enabled: boolean;
+    notify_channels: string[];
+    notify_level: string;
+    last_status: string | null;
+    run_count: number;
+  } | null;
+}
+
+export async function getDigitalHumans(
+  category?: string,
+): Promise<{ ok: boolean; humans: DigitalHumanEntry[]; categories: string[] }> {
+  const q = category ? `?category=${encodeURIComponent(category)}` : "";
+  const res = await fetch(`${httpBase()}/v1/digital-humans${q}`);
+  return res.json();
+}
+
+export async function getDigitalHuman(slug: string): Promise<DigitalHumanDetail> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}`);
+  return res.json();
+}
+
+export async function installDigitalHuman(
+  slug: string,
+  config: Record<string, unknown>,
+): Promise<{ ok: boolean; error?: string; instance?: DigitalHumanInstance; task?: unknown }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+  return res.json();
+}
+
+export async function getDigitalHumanInstances(): Promise<{ ok: boolean; instances: DigitalHumanInstance[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/instances`);
+  return res.json();
+}
+
+export async function uninstallDigitalHuman(instanceId: string): Promise<{ ok: boolean }> {
+  const res = await fetch(
+    `${httpBase()}/v1/digital-humans/instances/${encodeURIComponent(instanceId)}`,
+    { method: "DELETE" },
+  );
+  return res.json();
+}

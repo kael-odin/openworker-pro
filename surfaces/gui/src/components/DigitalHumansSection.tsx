@@ -1,0 +1,380 @@
+// 数字人商店 + 安装 + 实例管理（批次 C）。
+// 三栏心智：商店列表（分类筛选+搜索）→ 详情/安装表单（按 config_schema 动态渲染）→ 已装实例。
+// 后端走 /v1/digital-humans/*（见 api.ts）。密钥字段（config_schema[].secret）走 password 框，
+// 回显时不回填（与 notify 面板一致）。
+import { useEffect, useMemo, useState } from "react";
+import {
+  getDigitalHumans,
+  getDigitalHuman,
+  installDigitalHuman,
+  getDigitalHumanInstances,
+  uninstallDigitalHuman,
+  type DigitalHumanEntry,
+  type DigitalHumanDetail,
+  type DigitalHumanInstance,
+  type ConfigField,
+} from "../api";
+import { useT } from "../i18n/I18nProvider";
+import { GRP, GRP_H, ROW, PILL_ACCENT, PILL_LINE, TAG_ACCENT, TAG_QUIET, TAG_WARN, CHIP_OFF } from "./connectors/ui";
+
+const INPUT =
+  "px-3 py-1.5 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent w-full";
+const LABEL = "text-[12px] font-medium text-muted mb-1 block";
+const SEARCH_INPUT =
+  "w-full px-3 py-2 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent";
+const SCROLL = "overflow-y-auto";
+const ITEM = "px-4 py-2.5 cursor-pointer hover:bg-paper transition-colors";
+const ITEM_ACTIVE = "bg-accentSoft";
+
+// 默认值优先用 config_schema 的 default；缺省按类型给一个合理空值。
+function defaultFor(f: ConfigField): unknown {
+  if (f.default !== undefined && f.default !== null) return f.default;
+  switch (f.type) {
+    case "number":
+      return "";
+    case "boolean":
+      return false;
+    default:
+      return "";
+  }
+}
+
+function seedConfig(fields: ConfigField[]): Record<string, unknown> {
+  const cfg: Record<string, unknown> = {};
+  for (const f of fields) cfg[f.key] = defaultFor(f);
+  return cfg;
+}
+
+export function DigitalHumansSection() {
+  const { t } = useT();
+  const [humans, setHumans] = useState<DigitalHumanEntry[]>([]);
+  const [categories, setCategories] = useState<string[]>([]);
+  const [activeCat, setActiveCat] = useState<string>("");
+  const [query, setQuery] = useState("");
+  const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
+  const [detail, setDetail] = useState<DigitalHumanDetail | null>(null);
+  const [config, setConfig] = useState<Record<string, unknown>>({});
+  const [installing, setInstalling] = useState(false);
+  const [installMsg, setInstallMsg] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [instances, setInstances] = useState<DigitalHumanInstance[]>([]);
+
+  const reload = () => {
+    getDigitalHumans().then((r) => {
+      setHumans(r.humans);
+      setCategories(r.categories);
+    }).catch(() => {});
+    getDigitalHumanInstances().then((r) => setInstances(r.instances)).catch(() => {});
+  };
+  useEffect(reload, []);
+
+  const filtered = useMemo(() => {
+    let list = humans;
+    if (activeCat) list = list.filter((h) => h.category === activeCat);
+    if (query.trim()) {
+      const q = query.trim().toLowerCase();
+      list = list.filter(
+        (h) =>
+          h.name.toLowerCase().includes(q) ||
+          h.slug.toLowerCase().includes(q) ||
+          h.description.toLowerCase().includes(q) ||
+          h.tags.some((tag) => tag.toLowerCase().includes(q)),
+      );
+    }
+    return list;
+  }, [humans, activeCat, query]);
+
+  const installedSlugs = useMemo(() => new Set(instances.map((i) => i.slug)), [instances]);
+
+  const openDetail = async (slug: string) => {
+    setSelectedSlug(slug);
+    setInstallMsg(null);
+    setDetail(null);
+    try {
+      const d = await getDigitalHuman(slug);
+      if (d.ok) {
+        setDetail(d);
+        setConfig(seedConfig(d.spec.config_schema));
+      } else {
+        setInstallMsg({ ok: false, msg: d.error || t("digital.load_fail") });
+      }
+    } catch {
+      setInstallMsg({ ok: false, msg: t("digital.load_fail") });
+    }
+  };
+
+  const setField = (key: string, value: unknown) => {
+    setConfig((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const install = async () => {
+    if (!detail) return;
+    setInstalling(true);
+    setInstallMsg(null);
+    try {
+      const res = await installDigitalHuman(detail.entry.slug, config);
+      if (res.ok) {
+        setInstallMsg({ ok: true, msg: t("digital.install_ok") });
+        reload();
+      } else {
+        setInstallMsg({ ok: false, msg: res.error || t("digital.install_fail") });
+      }
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const uninstall = async (instanceId: string) => {
+    await uninstallDigitalHuman(instanceId);
+    reload();
+  };
+
+  return (
+    <section className="px-6 py-4">
+      {/* 商店列表 */}
+      <div className={GRP_H}>{t("digital.store_title")}</div>
+      <div className="flex gap-2 mb-3">
+        <input
+          className={SEARCH_INPUT}
+          placeholder={t("digital.search_placeholder")}
+          value={query}
+          spellCheck={false}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+      </div>
+      {/* 分类筛选 */}
+      <div className="flex flex-wrap gap-1.5 mb-3">
+        <button
+          className={
+            "text-[11.5px] px-2.5 py-1 rounded-full " +
+            (!activeCat ? "bg-accent text-white" : "bg-paper border border-line text-muted")
+          }
+          onClick={() => setActiveCat("")}
+        >
+          {t("digital.cat_all")}
+        </button>
+        {categories.map((c) => (
+          <button
+            key={c}
+            className={
+              "text-[11.5px] px-2.5 py-1 rounded-full " +
+              (activeCat === c ? "bg-accent text-white" : "bg-paper border border-line text-muted")
+            }
+            onClick={() => setActiveCat(c)}
+          >
+            {t("digital.cat_" + c) || c}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* 左：列表 */}
+        <div className={GRP + " " + SCROLL + " max-h-[560px]"}>
+          {filtered.length === 0 && (
+            <div className="px-4 py-6 text-[13px] text-faint text-center">{t("digital.empty")}</div>
+          )}
+          {filtered.map((h) => {
+            const active = selectedSlug === h.slug;
+            const installed = installedSlugs.has(h.slug);
+            return (
+              <div
+                key={h.slug}
+                className={ROW + " " + ITEM + (active ? " " + ITEM_ACTIVE : "")}
+                onClick={() => openDetail(h.slug)}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[13px] font-medium text-ink truncate">{h.name}</span>
+                    {installed && <span className={TAG_ACCENT}>{t("digital.installed_tag")}</span>}
+                  </div>
+                  <div className="text-[11.5px] text-faint truncate">{h.description}</div>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className={TAG_QUIET}>{h.category}</span>
+                    {h.tags.slice(0, 2).map((tag) => (
+                      <span key={tag} className="text-[10.5px] text-faint">
+                        #{tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <span className="text-faint text-[11px] shrink-0">v{h.version}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* 右：详情/安装 */}
+        <div>
+          {!detail ? (
+            <div className="rounded-xl2 border border-line bg-panel px-4 py-8 text-center text-[13px] text-faint">
+              {t("digital.select_hint")}
+            </div>
+          ) : (
+            <div className="rounded-xl2 border border-line bg-panel px-4 py-4">
+              <div className="flex items-center gap-2 mb-1">
+                <h3 className="text-[15px] font-semibold text-ink">{detail.spec.name}</h3>
+                <span className={TAG_QUIET}>v{detail.entry.version}</span>
+              </div>
+              <p className="text-[12.5px] text-muted mb-3">{detail.spec.description}</p>
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                {detail.requires_consent.mcps.map((m) => (
+                  <span key={m.id} className={TAG_WARN} title={m.reason}>
+                    MCP: {m.id}
+                  </span>
+                ))}
+                {detail.requires_consent.permissions.map((p) => (
+                  <span key={p} className={TAG_WARN}>
+                    {p}
+                  </span>
+                ))}
+                {!detail.requires_consent.has_schedule && (
+                  <span className={CHIP_OFF}>{t("digital.manual_run")}</span>
+                )}
+                {detail.spec.notify_channels.length > 0 && (
+                  <span className={TAG_QUIET}>
+                    {t("digital.notify_label")}: {detail.spec.notify_channels.join(", ")}
+                  </span>
+                )}
+              </div>
+
+              {detail.spec.config_schema.length > 0 && (
+                <>
+                  <div className="text-[12px] font-semibold text-muted mb-2">{t("digital.config_title")}</div>
+                  {detail.spec.config_schema.map((f) => (
+                    <ConfigFieldInput key={f.key} f={f} value={config[f.key]} onChange={(v) => setField(f.key, v)} t={t} />
+                  ))}
+                </>
+              )}
+
+              {installMsg && (
+                <div className={"text-[12px] mt-2 " + (installMsg.ok ? "text-accent" : "text-warnInk")}>
+                  {installMsg.msg}
+                </div>
+              )}
+
+              <div className="flex gap-2 mt-3">
+                <button className={PILL_ACCENT} onClick={install} disabled={installing}>
+                  {installing ? t("digital.installing") : t("digital.install_btn")}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 已装实例 */}
+      <div className={GRP_H}>{t("digital.instances_title")}</div>
+      <div className={GRP}>
+        {instances.length === 0 ? (
+          <div className="px-4 py-5 text-[13px] text-faint text-center">{t("digital.no_instances")}</div>
+        ) : (
+          instances.map((inst) => (
+            <div key={inst.id} className={ROW}>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] font-medium text-ink">{inst.name}</span>
+                  <span className={TAG_QUIET}>{inst.slug}</span>
+                  {inst.task?.enabled ? (
+                    <span className={TAG_ACCENT}>{t("digital.enabled")}</span>
+                  ) : (
+                    <span className={CHIP_OFF}>{t("digital.disabled")}</span>
+                  )}
+                </div>
+                <div className="text-[11.5px] text-faint">
+                  {inst.task?.schedule || t("digital.manual_run")}
+                  {inst.task?.last_status ? ` · ${t("digital.last_status")}: ${inst.task.last_status}` : ""}
+                  {inst.task?.run_count ? ` · ${inst.task.run_count} ${t("digital.runs")}` : ""}
+                </div>
+              </div>
+              <button className={PILL_LINE} onClick={() => uninstall(inst.id)}>
+                {t("digital.uninstall")}
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+// 单个 config_schema 字段的动态表单控件。
+function ConfigFieldInput({
+  f,
+  value,
+  onChange,
+  t,
+}: {
+  f: ConfigField;
+  value: unknown;
+  onChange: (v: unknown) => void;
+  t: (k: string) => string;
+}) {
+  const isSecret = f.secret;
+  const required = f.required;
+  const labelSuffix = required ? " *" : "";
+
+  let control: React.ReactNode;
+  if (f.type === "boolean") {
+    control = (
+      <label className="flex items-center gap-2 text-[13px] text-ink cursor-pointer">
+        <input
+          type="checkbox"
+          checked={Boolean(value)}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        {f.description || t("digital.field_boolean_hint")}
+      </label>
+    );
+  } else if (f.type === "select") {
+    control = (
+      <select
+        className={INPUT}
+        value={String(value ?? "")}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {!f.options?.some((o) => String(o.value) === String(value)) && (
+          <option value="">{t("digital.field_select_placeholder")}</option>
+        )}
+        {f.options?.map((o) => (
+          <option key={String(o.value)} value={String(o.value)}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    );
+  } else if (f.type === "text") {
+    control = (
+      <textarea
+        className={INPUT + " min-h-[60px] resize-y"}
+        placeholder={f.placeholder}
+        value={String(value ?? "")}
+        spellCheck={false}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    );
+  } else {
+    control = (
+      <input
+        className={INPUT}
+        type={isSecret ? "password" : f.type === "number" ? "number" : f.type === "email" ? "email" : f.type === "url" ? "url" : "text"}
+        placeholder={f.placeholder}
+        value={String(value ?? "")}
+        spellCheck={false}
+        onChange={(e) => onChange(f.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value)}
+      />
+    );
+  }
+
+  return (
+    <div className="mb-2.5">
+      <label className={LABEL}>
+        {f.label}
+        {labelSuffix}
+        {isSecret && <span className="text-faint ml-1">· {t("digital.field_secret")}</span>}
+      </label>
+      {control}
+      {f.description && f.type !== "boolean" && (
+        <div className="text-[11px] text-faint mt-0.5">{f.description}</div>
+      )}
+    </div>
+  );
+}
