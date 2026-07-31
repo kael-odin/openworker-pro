@@ -52,6 +52,31 @@ def build_instructions(spec: DigitalHumanSpec, config: dict[str, Any]) -> str:
     return "\n".join(preamble_lines) + "\n\n" + spec.system_prompt
 
 
+def reinstall_instructions(
+    spec: DigitalHumanSpec,
+    config: dict[str, Any],
+    *,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Rebuild task instructions for an already-installed instance (the edit path).
+
+    Mirrors :func:`build_instructions`, but lets the caller override the spec's system prompt with
+    a user-edited value (from the Developer block). When ``system_prompt`` is None, the spec's own
+    prompt is used unchanged — the same as a fresh install."""
+    if system_prompt is None:
+        return build_instructions(spec, config)
+    # Build a throwaway spec view with the edited prompt, reusing build_instructions so the
+    # ``## 用户配置`` preamble format stays identical across install and edit.
+    preamble_lines = [
+        "## 用户配置 (userConfig)",
+        "以下是本次运行的配置参数，请按此配置执行：",
+        "```json",
+        json.dumps(config, ensure_ascii=False, indent=2),
+        "```",
+    ]
+    return "\n".join(preamble_lines) + "\n\n" + (system_prompt or "")
+
+
 def validate_config(spec: DigitalHumanSpec, config: dict[str, Any]) -> list[str]:
     """Return a list of missing-required config keys (empty = valid). Also coerces types where
     possible (number/boolean) and fills defaults — mutates ``config`` in place."""

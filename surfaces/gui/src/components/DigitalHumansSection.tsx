@@ -16,6 +16,8 @@ import {
 } from "../api";
 import { useT } from "../i18n/I18nProvider";
 import { GRP, GRP_H, ROW, PILL_ACCENT, PILL_LINE, TAG_ACCENT, TAG_QUIET, TAG_WARN, CHIP_OFF } from "./connectors/ui";
+import { DhpSourcesSection } from "./DhpSourcesSection";
+import { DhEditPanel } from "./dh-edit/DhEditPanel";
 
 const INPUT =
   "px-3 py-1.5 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent w-full";
@@ -57,6 +59,7 @@ export function DigitalHumansSection() {
   const [installing, setInstalling] = useState(false);
   const [installMsg, setInstallMsg] = useState<{ ok: boolean; msg: string } | null>(null);
   const [instances, setInstances] = useState<DigitalHumanInstance[]>([]);
+  const [editing, setEditing] = useState<DigitalHumanInstance | null>(null);
 
   const reload = () => {
     getDigitalHumans().then((r) => {
@@ -66,6 +69,53 @@ export function DigitalHumansSection() {
     getDigitalHumanInstances().then((r) => setInstances(r.instances)).catch(() => {});
   };
   useEffect(reload, []);
+
+  // On mount, honor a pending "open full edit" request stashed by ScheduledView.
+  // The cross-surface deep-link (Automations ▸ 完整编辑) dispatches a window event,
+  // but this section mounts only AFTER the Settings surface opens — so the event
+  // fires before the listener exists. ScheduledView also stashes the id in
+  // sessionStorage; we read it here and clear it so it only opens once.
+  useEffect(() => {
+    const pendingId = sessionStorage.getItem("dh:edit-instance");
+    if (!pendingId) return;
+    sessionStorage.removeItem("dh:edit-instance");
+    getDigitalHumanInstances().then((r) => {
+      const inst = r.instances.find((i) => i.id === pendingId);
+      if (inst) setEditing(inst);
+    });
+  }, []);
+
+  // listen for uninstall events from DhEditPanel's danger zone
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent;
+      if (ce.detail) {
+        uninstallDigitalHuman(ce.detail as string).then(() => {
+          setEditing(null);
+          reload();
+        });
+      }
+    };
+    window.addEventListener("dh-uninstall", handler);
+    return () => window.removeEventListener("dh-uninstall", handler);
+  }, []);
+
+  // Deep-link: open DhEditPanel for an instance id (dispatched by ScheduledView's
+  // "打开完整编辑" affordance on digital-human tasks).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent;
+      const instId = ce.detail as string;
+      if (!instId) return;
+      // Make sure instances are loaded, then open the editor for the requested id.
+      getDigitalHumanInstances().then((r) => {
+        const inst = r.instances.find((i) => i.id === instId);
+        if (inst) setEditing(inst);
+      });
+    };
+    window.addEventListener("dh:edit-instance", handler);
+    return () => window.removeEventListener("dh:edit-instance", handler);
+  }, []);
 
   const filtered = useMemo(() => {
     let list = humans;
@@ -128,8 +178,16 @@ export function DigitalHumansSection() {
     reload();
   };
 
+  // 编辑态：展开 DhEditPanel，替换整个商店视图。
+  if (editing) {
+    return <DhEditPanel instance={editing} onBack={() => { setEditing(null); reload(); }} />;
+  }
+
   return (
     <section className="px-6 py-4">
+      {/* 源管理（最顶：列表空时用户第一反应是查源） */}
+      <DhpSourcesSection />
+
       {/* 商店列表 */}
       <div className={GRP_H}>{t("digital.store_title")}</div>
       <div className="flex gap-2 mb-3">
@@ -285,9 +343,14 @@ export function DigitalHumansSection() {
                   {inst.task?.run_count ? ` · ${inst.task.run_count} ${t("digital.runs")}` : ""}
                 </div>
               </div>
-              <button className={PILL_LINE} onClick={() => uninstall(inst.id)}>
-                {t("digital.uninstall")}
-              </button>
+              <div className="flex gap-2 shrink-0">
+                <button className={PILL_ACCENT} onClick={() => setEditing(inst)}>
+                  {t("dh_edit.edit")}
+                </button>
+                <button className={PILL_LINE} onClick={() => uninstall(inst.id)}>
+                  {t("digital.uninstall")}
+                </button>
+              </div>
             </div>
           ))
         )}

@@ -361,7 +361,9 @@ export function McpTab() {
   );
 }
 
-function McpRow({
+// Exported so CustomizeView's MCPs section can reuse the exact same row rendering
+// (one source of truth for MCP list item UI — toggling, OAuth sign-in, tools expansion).
+export function McpRow({
   server,
   onToggle,
   onRemove,

@@ -12,7 +12,7 @@ import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # Shell metacharacters that turn one "allowlisted" command into several. Any of these in a
 # command disqualifies it from allowlist auto-run — approval is required instead. Covers
@@ -94,6 +94,11 @@ class PermissionEngine:
     task_rules: dict[str, set[str]] = field(default_factory=dict)
     # User-local risk override resolver (Phase 2). None → use the base classification.
     risk_overrides: Optional[RiskOverrides] = None
+    # User-facing permission rules (E2): tool_name → "allow"|"deny"|"ask" (or None to
+    # defer). This is the highest-precedence layer — checked before the risk-based
+    # classification. ``deny`` blocks outright, ``allow`` bypasses approval, ``ask``
+    # forces approval even for otherwise-read tools. None/missing → defer to risk.
+    rule_resolver: Optional[Callable[[str], Optional[str]]] = None
     # Shared, possibly-mutable list of roots (RootDir-like / dicts). When omitted, the single
     # `workspace_root` is the sole writable root (back-compat). Kept by reference and re-read on
     # every check, so runtime add/remove of folders takes effect without rebuilding the engine.
@@ -122,6 +127,20 @@ class PermissionEngine:
     ) -> Decision:
         arguments = arguments or {}
         is_connector = getattr(metadata, "category", "") == "connector"
+
+        # User-facing permission rules (E2) take precedence over risk classification —
+        # they are the user's explicit statement of intent. deny blocks outright; allow
+        # bypasses approval (even for otherwise-consequential tools); ask forces approval
+        # even for otherwise-read tools. None/no match → defer to the risk-based path below.
+        if self.rule_resolver is not None:
+            action = self.rule_resolver(tool_name)
+            if action == "deny":
+                return Decision(False, f"规则禁止：{tool_name}", needs_user=False)
+            if action == "allow":
+                return Decision(True, f"规则允许：{tool_name}")
+            if action == "ask":
+                return Decision(False, f"规则要求审批：{tool_name}", needs_user=True)
+
         risk = classify(tool_name, metadata, self.risk_overrides)
         is_write = risk is RiskClass.WRITE_LOCAL
         is_shell = risk is RiskClass.EXEC

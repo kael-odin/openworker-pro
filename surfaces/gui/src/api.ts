@@ -18,16 +18,61 @@ const apiToken = (): string =>
   (import.meta as any).env?.VITE_COWORKER_API_TOKEN ||
   (typeof __COWORKER_DEV_TOKEN__ === "string" ? __COWORKER_DEV_TOKEN__ : "");
 
+// Dev-only token self-heal. The baked-in __COWORKER_DEV_TOKEN__ is frozen at vite startup,
+// so a sidecar restart (which rotates sidecar-8765.token) silently breaks every request with
+// 401 until vite is manually restarted. The vite dev server re-reads the token file on each
+// request to /__dev_token__ (see vite.config.ts); on a 401 we fetch it once, cache the fresh
+// token, and retry. No-op in the desktop shell (Tauri injects its in-memory token; the
+// runtime global short-circuits apiToken() above so this path is never reached).
+let devTokenOverride = "";
+let devTokenFetching: Promise<string> | null = null;
+const refreshDevToken = async (): Promise<string> => {
+  if (devTokenOverride) return devTokenOverride;
+  if (!devTokenFetching) {
+    // The middleware lives on the vite dev server (window.location.origin, port 1420), NOT on
+    // the sidecar (httpBase, port 8765) — the sidecar has no such route and would 401.
+    const origin =
+      (typeof window !== "undefined" && window.location && window.location.origin) ||
+      httpBase();
+    devTokenFetching = globalThis
+      .fetch(`${origin}/__dev_token__.json`)
+      .then((r) => r.json())
+      .then((d: { token?: string }) => {
+        const t = d.token || "";
+        if (t) devTokenOverride = t; // cache for subsequent retries
+        devTokenFetching = null;
+        return t;
+      })
+      .catch(() => {
+        devTokenFetching = null;
+        return "";
+      });
+  }
+  return devTokenFetching;
+};
+
 // All local REST calls pass through this module, so a module-local wrapper applies launch
-// authentication without asking every endpoint helper to remember the security header.
-const fetch = (
+// authentication without asking every endpoint helper to remember the security header. In dev
+// (browser) mode, a 401 triggers one token self-heal + retry (sidecar restarts rotate the token).
+const fetch = async (
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> => {
-  const headers = new Headers(init.headers);
-  const token = apiToken();
-  if (token) headers.set("X-OpenWorker-Token", token);
-  return globalThis.fetch(input, { ...init, headers });
+  const applyToken = (headers: Headers) => {
+    const token = devTokenOverride || apiToken();
+    if (token) headers.set("X-OpenWorker-Token", token);
+    return headers;
+  };
+  const headers = applyToken(new Headers(init.headers));
+  const res = await globalThis.fetch(input, { ...init, headers });
+  if (res.status !== 401) return res;
+  // 401: try to refresh the dev token once and retry. Skip in the desktop shell (Tauri's
+  // in-memory token never rotates this way) and skip if already retried via init.
+  if ((init as any).__retried) return res;
+  const fresh = await refreshDevToken();
+  if (!fresh) return res;
+  const retryHeaders = applyToken(new Headers(init.headers));
+  return globalThis.fetch(input, { ...init, headers: retryHeaders, __retried: true } as RequestInit);
 };
 
 const openWebSocket = (url: string): WebSocket => {
@@ -332,6 +377,535 @@ export async function signoutMcp(name: string): Promise<{ ok: boolean }> {
   });
   return res.json();
 }
+
+// -- skills -------------------------------------------------------------------
+// Skills follow the Anthropic SKILL.md format (progressive disclosure).
+// The backend currently only exposes list_skills (no install/uninstall yet — E1).
+export interface Skill {
+  name: string;
+  description: string;
+}
+
+export async function getSkills(): Promise<Skill[]> {
+  const res = await fetch(`${httpBase()}/v1/skills`);
+  return (await res.json()).skills ?? [];
+}
+
+// -- skill sources + install/uninstall (E1) -----------------------------------
+// Mirrors the DHP source API: list/add/update/remove sources, browse a source's catalog,
+// install a named skill into state_dir()/skills, uninstall by name.
+export interface SkillSource {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  is_default: boolean;
+  source_type: string; // "git" | "local" | "http"
+}
+
+export interface SkillCatalogItem {
+  name: string;
+  description: string;
+  path: string;
+  installed: boolean;
+}
+
+export async function getSkillSources(): Promise<SkillSource[]> {
+  const res = await fetch(`${httpBase()}/v1/skills/sources`);
+  return (await res.json()).sources ?? [];
+}
+
+export async function addSkillSource(
+  name: string,
+  url: string,
+  sourceType = "http",
+): Promise<{ ok: boolean; error?: string; source?: SkillSource }> {
+  const res = await fetch(`${httpBase()}/v1/skills/sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, source_type: sourceType }),
+  });
+  return res.json();
+}
+
+export async function updateSkillSource(
+  sourceId: string,
+  changes: Partial<SkillSource>,
+): Promise<{ ok: boolean; error?: string; source?: SkillSource }> {
+  const res = await fetch(`${httpBase()}/v1/skills/sources/${sourceId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function removeSkillSource(
+  sourceId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/skills/sources/${sourceId}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function getSkillCatalog(
+  sourceId: string,
+): Promise<{ ok: boolean; error?: string; source?: SkillSource; skills?: SkillCatalogItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/skills/sources/${sourceId}/catalog`);
+  return res.json();
+}
+
+export async function installSkill(
+  sourceId: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/skills/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_id: sourceId, name }),
+  });
+  return res.json();
+}
+
+export async function uninstallSkill(name: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+// -- Plugins (marketplace install/uninstall, E4) ------------------------------
+// Claude-Code-format plugins installed from marketplace sources. The official
+// claude-plugins-official.git is built in. Plugins land under state_dir()/plugins/<name>/;
+// their skills/ and commands/ subfolders are picked up by the existing loaders.
+export interface PluginSource {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  is_default: boolean;
+  source_type: string; // "git"
+}
+
+export interface PluginCatalogItem {
+  name: string;
+  description: string;
+  category: string;
+  author?: string;
+  homepage?: string;
+  version?: string;
+  source_info?: Record<string, unknown>;
+  sha?: string;
+  installed: boolean;
+}
+
+export interface InstalledPlugin {
+  name: string;
+  version: string;
+  description: string;
+  source_id: string;
+  source_info: Record<string, unknown>;
+  components: { skills: string[]; commands: string[]; mcps: string[] };
+  installed_at: string;
+  sha: string;
+  present: boolean;
+}
+
+export async function getPlugins(): Promise<InstalledPlugin[]> {
+  const res = await fetch(`${httpBase()}/v1/plugins`);
+  return (await res.json()).plugins ?? [];
+}
+
+export async function getPluginSources(): Promise<PluginSource[]> {
+  const res = await fetch(`${httpBase()}/v1/plugins/sources`);
+  return (await res.json()).sources ?? [];
+}
+
+export async function addPluginSource(
+  name: string,
+  url: string,
+  sourceType = "git",
+): Promise<{ ok: boolean; error?: string; source?: PluginSource }> {
+  const res = await fetch(`${httpBase()}/v1/plugins/sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, source_type: sourceType }),
+  });
+  return res.json();
+}
+
+export async function updatePluginSource(
+  sourceId: string,
+  changes: Partial<PluginSource>,
+): Promise<{ ok: boolean; error?: string; source?: PluginSource }> {
+  const res = await fetch(`${httpBase()}/v1/plugins/sources/${sourceId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function removePluginSource(
+  sourceId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/plugins/sources/${sourceId}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function getPluginCatalog(
+  sourceId: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  source?: PluginSource;
+  plugins?: PluginCatalogItem[];
+  categories?: string[];
+}> {
+  const res = await fetch(`${httpBase()}/v1/plugins/sources/${sourceId}/catalog`);
+  return res.json();
+}
+
+export async function installPlugin(
+  sourceId: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string; name?: string }> {
+  const res = await fetch(`${httpBase()}/v1/plugins/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_id: sourceId, name }),
+  });
+  return res.json();
+}
+
+export async function uninstallPlugin(
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/plugins/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function checkPluginUpdates(): Promise<{
+  ok: boolean;
+  items: Array<{
+    name: string;
+    installed_sha: string;
+    latest_sha: string;
+    latest_version: string;
+    up_to_date: boolean;
+  }>;
+}> {
+  const res = await fetch(`${httpBase()}/v1/plugins/updates`);
+  return res.json();
+}
+
+export async function updatePlugin(
+  name: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/plugins/${encodeURIComponent(name)}/update`, {
+    method: "POST",
+  });
+  return res.json();
+}
+
+// -- Digital-human plugin/command/subagent health (E4) ------------------------
+export interface DepHealthItem {
+  id: string;
+  reason: string;
+  installed: boolean;
+}
+export async function getDhpPluginsHealth(
+  slug: string,
+): Promise<{ ok: boolean; items?: DepHealthItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${slug}/plugins-health`);
+  return res.json();
+}
+export async function getDhpCommandsHealth(
+  slug: string,
+): Promise<{ ok: boolean; items?: DepHealthItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${slug}/commands-health`);
+  return res.json();
+}
+export async function getDhpSubagentsHealth(
+  slug: string,
+): Promise<{ ok: boolean; items?: DepHealthItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${slug}/subagents-health`);
+  return res.json();
+}
+
+// -- Browser login state (E5) -------------------------------------------------
+// A persisted logged-in session for a site (Playwright storageState or pasted
+// cookies). browser_open_url auto-loads the matching session when the agent
+// visits a URL whose host matches a login entry.
+export type LoginExpiryStatus = "no_state" | "session" | "valid" | "expiring" | "expired";
+
+export interface LoginExpiry {
+  status: LoginExpiryStatus;
+  /** ISO UTC of the latest cookie expiry, when a real expiry exists. */
+  expires_at?: string;
+}
+
+export interface BrowserLogin {
+  id: string;
+  url: string;
+  label: string;
+  storage_state_path: string;
+  cookie_path: string;
+  mode: "playwright" | "cookies";
+  has_state: boolean;
+  captured_at: string;
+  notes: string;
+  expiry?: LoginExpiry;
+}
+
+export async function getBrowserLogins(): Promise<BrowserLogin[]> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins`);
+  return (await res.json()).logins ?? [];
+}
+
+export async function addBrowserLogin(
+  url: string,
+  label: string,
+  mode = "playwright",
+): Promise<{
+  ok: boolean;
+  error?: string;
+  id?: string;
+  entry?: BrowserLogin;
+  playwright_available?: boolean;
+}> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, label, mode }),
+  });
+  return res.json();
+}
+
+export async function captureBrowserLogin(
+  id: string,
+): Promise<{
+  ok: boolean;
+  fallback?: string;
+  mode?: string;
+  id?: string;
+  url?: string;
+  error?: string;
+}> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/${encodeURIComponent(id)}/capture`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  return res.json();
+}
+
+export async function getBrowserLoginCaptureState(): Promise<{
+  active: boolean;
+  login_id?: string;
+  url?: string;
+  title?: string;
+}> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/capture-state`);
+  return res.json();
+}
+
+export async function confirmBrowserLoginCapture(
+  id: string,
+): Promise<{ ok: boolean; error?: string; storage_state_path?: string; captured_at?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/browser/logins/${encodeURIComponent(id)}/capture/confirm`,
+    { method: "POST" },
+  );
+  return res.json();
+}
+
+export async function cancelBrowserLoginCapture(): Promise<{ ok: boolean }> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/capture/cancel`, {
+    method: "POST",
+  });
+  return res.json();
+}
+
+export async function saveBrowserLoginCookies(
+  id: string,
+  cookieJson: string,
+): Promise<{ ok: boolean; error?: string; cookie_path?: string; captured_at?: string; count?: number }> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/${encodeURIComponent(id)}/cookies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cookie_json: cookieJson }),
+  });
+  return res.json();
+}
+
+export async function removeBrowserLogin(id: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function exportBrowserLogins(): Promise<{
+  version: number;
+  logins: Array<BrowserLogin & { _files?: Record<string, string> }>;
+}> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/export`);
+  return res.json();
+}
+
+export async function importBrowserLogins(
+  payload: string,
+): Promise<{ ok: boolean; imported?: number; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/browser/logins/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ payload }),
+  });
+  return res.json();
+}
+
+export interface LoginHealthItem {
+  url: string;
+  label: string;
+  logged_in: boolean;
+  expiry?: LoginExpiry;
+}
+
+export async function getDhpLoginsHealth(
+  slug: string,
+): Promise<{ ok: boolean; items?: LoginHealthItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${slug}/logins-health`);
+  return res.json();
+}
+
+// -- Rules (allow/deny/ask permission layer, E2) ------------------------------
+// A rule = glob pattern (matched against the tool name) + action (allow/deny/ask).
+export type RuleAction = "allow" | "deny" | "ask";
+
+export interface Rule {
+  id: string;
+  pattern: string;
+  action: RuleAction;
+  reason: string;
+  enabled: boolean;
+}
+
+export async function getRules(): Promise<Rule[]> {
+  const res = await fetch(`${httpBase()}/v1/rules`);
+  return (await res.json()).rules ?? [];
+}
+
+export async function addRule(
+  pattern: string,
+  action: RuleAction,
+  reason = "",
+): Promise<{ ok: boolean; error?: string; rule?: Rule }> {
+  const res = await fetch(`${httpBase()}/v1/rules`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pattern, action, reason }),
+  });
+  return res.json();
+}
+
+export async function updateRule(
+  ruleId: string,
+  changes: Partial<Rule>,
+): Promise<{ ok: boolean; error?: string; rule?: Rule }> {
+  const res = await fetch(`${httpBase()}/v1/rules/${ruleId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function removeRule(ruleId: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/rules/${ruleId}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+// -- Hooks (pre_run/post_run, E2) ---------------------------------------------
+// A hook fires on pre_run (before engine build, can skip) or post_run (after status
+// determined). CRUD only — firing is internal to the scheduler.
+export type HookEvent = "pre_run" | "post_run";
+
+export interface Hook {
+  id: string;
+  name: string;
+  event: HookEvent;
+  match: string; // glob against task name; "*" = all
+  command: string; // shell command or script path
+  enabled: boolean;
+}
+
+export async function getHooks(): Promise<Hook[]> {
+  const res = await fetch(`${httpBase()}/v1/hooks`);
+  return (await res.json()).hooks ?? [];
+}
+
+export async function addHook(
+  name: string,
+  event: HookEvent,
+  command: string,
+  match = "*",
+): Promise<{ ok: boolean; error?: string; hook?: Hook }> {
+  const res = await fetch(`${httpBase()}/v1/hooks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, event, command, match }),
+  });
+  return res.json();
+}
+
+export async function updateHook(
+  hookId: string,
+  changes: Partial<Hook>,
+): Promise<{ ok: boolean; error?: string; hook?: Hook }> {
+  const res = await fetch(`${httpBase()}/v1/hooks/${hookId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function removeHook(hookId: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/hooks/${hookId}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+// -- Commands (slash prompt templates, E3) ------------------------------------
+// Read-only discovery of state_dir()/commands/<name>/COMMAND.md. The Composer "/" autocomplete
+// lists these; selecting one fetches the full prompt_template and expands it into the input.
+export interface Command {
+  name: string;
+  description: string;
+  prompt_template?: string; // only present from getCommand(name)
+  allowed_tools?: string[];
+}
+
+export async function getCommands(): Promise<Command[]> {
+  const res = await fetch(`${httpBase()}/v1/commands`);
+  return (await res.json()).commands ?? [];
+}
+
+export async function getCommand(name: string): Promise<Command | null> {
+  const res = await fetch(`${httpBase()}/v1/commands/${encodeURIComponent(name)}`);
+  if (!res.ok) return null;
+  return (await res.json()).command ?? null;
+}
+
 
 // -- connectors ---------------------------------------------------------------
 export interface ConnectorField {
@@ -960,6 +1534,95 @@ export async function installPersona(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+  const out = await res.json();
+  if (out.ok) announcePersonasChanged();
+  return out;
+}
+
+// -- Persona marketplace sources (批次 E4 后续) -------------------------------
+// Git repos of *.md persona manifests the user can browse + install from. Mirrors
+// plugin sources. No builtin source today (no Anthropic-official persona marketplace);
+// the user adds their own. Install reuses the consent path — lands disabled.
+export interface PersonaSource {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  is_default: boolean;
+  source_type: string; // "git"
+}
+
+export interface PersonaCatalogItem {
+  id: string;
+  name: string;
+  tagline: string;
+  description: string;
+  icon: string;
+  family: string; // "code" | "knowledge"
+  file: string; // repo-relative manifest path
+  installed: boolean;
+}
+
+export async function getPersonaSources(): Promise<PersonaSource[]> {
+  const res = await fetch(`${httpBase()}/v1/personas/sources`);
+  return (await res.json()).sources ?? [];
+}
+
+export async function addPersonaSource(
+  name: string,
+  url: string,
+  sourceType = "git",
+): Promise<{ ok: boolean; error?: string; source?: PersonaSource }> {
+  const res = await fetch(`${httpBase()}/v1/personas/sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, source_type: sourceType }),
+  });
+  return res.json();
+}
+
+export async function updatePersonaSource(
+  sourceId: string,
+  changes: Partial<PersonaSource>,
+): Promise<{ ok: boolean; error?: string; source?: PersonaSource }> {
+  const res = await fetch(`${httpBase()}/v1/personas/sources/${sourceId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function removePersonaSource(
+  sourceId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/personas/sources/${sourceId}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function getPersonaCatalog(
+  sourceId: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  source?: PersonaSource;
+  personas?: PersonaCatalogItem[];
+}> {
+  const res = await fetch(`${httpBase()}/v1/personas/sources/${sourceId}/catalog`);
+  return res.json();
+}
+
+export async function installPersonaFromSource(
+  sourceId: string,
+  personaId: string,
+): Promise<{ ok: boolean; consent?: PersonaConsent; personas?: Persona[]; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/personas/sources/${sourceId}/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ persona_id: personaId }),
   });
   const out = await res.json();
   if (out.ok) announcePersonasChanged();
@@ -2034,10 +2697,17 @@ export interface DigitalHumanDetail {
     has_schedule: boolean;
     slug: string;
     icon: string;
+    spec_version: string;
+    author: string;
+    type: string;
+    recommended_model: string | null;
   };
   requires_consent: {
     mcps: Array<{ id: string; reason: string; bundled: boolean }>;
     skills: Array<{ id: string; reason: string; bundled: boolean }>;
+    plugins: Array<{ id: string; reason: string; bundled: boolean }>;
+    commands: Array<{ id: string; reason: string; bundled: boolean }>;
+    subagents: Array<{ id: string; reason: string; bundled: boolean }>;
     permissions: string[];
     browser_login: Array<{ url: string; label: string }>;
     has_schedule: boolean;
@@ -2100,6 +2770,124 @@ export async function uninstallDigitalHuman(instanceId: string): Promise<{ ok: b
   const res = await fetch(
     `${httpBase()}/v1/digital-humans/instances/${encodeURIComponent(instanceId)}`,
     { method: "DELETE" },
+  );
+  return res.json();
+}
+
+// 编辑已装实例：改 system_prompt / user_config / cron / notify / title / enabled。
+export async function updateDigitalHumanInstance(
+  instanceId: string,
+  changes: {
+    system_prompt?: string;
+    user_config?: Record<string, unknown>;
+    cron?: string;
+    notify_channels?: string[];
+    notify_level?: string;
+    title?: string;
+    enabled?: boolean;
+  },
+): Promise<{ ok: boolean; error?: string; instance?: DigitalHumanInstance }> {
+  const res = await fetch(
+    `${httpBase()}/v1/digital-humans/instances/${encodeURIComponent(instanceId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(changes),
+    },
+  );
+  return res.json();
+}
+
+// 源管理：列/增/改/删。
+export interface DhpSource {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  is_default: boolean;
+  source_type: string;
+}
+
+export async function getDhpSources(): Promise<{ ok: boolean; sources: DhpSource[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/sources`);
+  return res.json();
+}
+
+export async function addDhpSource(
+  name: string,
+  url: string,
+  sourceType = "dhp",
+): Promise<{ ok: boolean; error?: string; source?: DhpSource }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, source_type: sourceType }),
+  });
+  return res.json();
+}
+
+export async function updateDhpSource(
+  sourceId: string,
+  changes: { name?: string; url?: string; enabled?: boolean },
+): Promise<{ ok: boolean; error?: string; source?: DhpSource }> {
+  const res = await fetch(
+    `${httpBase()}/v1/digital-humans/sources/${encodeURIComponent(sourceId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(changes),
+    },
+  );
+  return res.json();
+}
+
+export async function removeDhpSource(sourceId: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/digital-humans/sources/${encodeURIComponent(sourceId)}`,
+    { method: "DELETE" },
+  );
+  return res.json();
+}
+
+// 依赖健康检查。
+export interface McpHealthItem {
+  name: string;
+  reason: string;
+  configured: boolean;
+  status: string;
+  tool_count: number;
+}
+export async function getDhpMcpHealth(
+  slug: string,
+): Promise<{ ok: boolean; error?: string; items: McpHealthItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}/mcp-health`);
+  return res.json();
+}
+
+export interface SkillHealthItem {
+  id: string;
+  reason: string;
+  installed: boolean;
+}
+export async function getDhpSkillsHealth(
+  slug: string,
+): Promise<{ ok: boolean; error?: string; items: SkillHealthItem[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}/skills-health`);
+  return res.json();
+}
+
+// 升级检查。
+export async function getDhpUpgradeCheck(
+  instanceId: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  installed_version: string;
+  latest_version: string;
+  up_to_date: boolean;
+}> {
+  const res = await fetch(
+    `${httpBase()}/v1/digital-humans/instances/${encodeURIComponent(instanceId)}/upgrade-check`,
   );
   return res.json();
 }

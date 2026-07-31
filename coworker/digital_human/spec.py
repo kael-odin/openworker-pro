@@ -117,6 +117,42 @@ class SkillDependency:
 
 
 @dataclass
+class PluginDependency:
+    """A plugin the digital human requires (installed from the plugin marketplace)."""
+
+    id: str
+    reason: str = ""
+    bundled: bool = False
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "reason": self.reason, "bundled": self.bundled}
+
+
+@dataclass
+class CommandDependency:
+    """A slash command the digital human requires (shipped standalone or via a plugin)."""
+
+    id: str
+    reason: str = ""
+    bundled: bool = False
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "reason": self.reason, "bundled": self.bundled}
+
+
+@dataclass
+class SubagentDependency:
+    """A persona the digital human can delegate subtasks to (via delegate_to_subagent)."""
+
+    id: str
+    reason: str = ""
+    bundled: bool = False
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "reason": self.reason, "bundled": self.bundled}
+
+
+@dataclass
 class SubscriptionDef:
     """One trigger source. ``cron`` is the resolved openworker cron expression (from ``every`` or
     ``cron``); ``every`` retains the raw interval for the UI. Non-schedule sources keep ``cron=None``
@@ -159,6 +195,9 @@ class DigitalHumanSpec:
     config_schema: list[ConfigField] = field(default_factory=list)
     requires_mcps: list[McpDependency] = field(default_factory=list)
     requires_skills: list[SkillDependency] = field(default_factory=list)
+    requires_plugins: list[PluginDependency] = field(default_factory=list)
+    requires_commands: list[CommandDependency] = field(default_factory=list)
+    requires_subagents: list[SubagentDependency] = field(default_factory=list)
     filters: list[dict[str, Any]] = field(default_factory=list)
     memory_schema: dict[str, Any] = field(default_factory=dict)
     output: dict[str, Any] = field(default_factory=dict)
@@ -211,6 +250,9 @@ class DigitalHumanSpec:
             "requires": {
                 "mcps": [m.to_dict() for m in self.requires_mcps],
                 "skills": [s.to_dict() for s in self.requires_skills],
+                "plugins": [p.to_dict() for p in self.requires_plugins],
+                "commands": [c.to_dict() for c in self.requires_commands],
+                "subagents": [s.to_dict() for s in self.requires_subagents],
             },
             "filters": list(self.filters),
             "memory_schema": dict(self.memory_schema),
@@ -385,9 +427,17 @@ def _parse_subscriptions(raw: Any, slug_hint: str) -> list[SubscriptionDef]:
     return out
 
 
-def _parse_requires(raw: Any, slug_hint: str) -> tuple[list[McpDependency], list[SkillDependency]]:
+def _parse_requires(
+    raw: Any, slug_hint: str
+) -> tuple[
+    list[McpDependency],
+    list[SkillDependency],
+    list[PluginDependency],
+    list[CommandDependency],
+    list[SubagentDependency],
+]:
     if raw is None:
-        return [], []
+        return [], [], [], [], []
     if not isinstance(raw, dict):
         raise SpecError(f"spec {slug_hint!r}: `requires` must be a mapping")
 
@@ -421,7 +471,38 @@ def _parse_requires(raw: Any, slug_hint: str) -> tuple[list[McpDependency], list
                 files=[str(f) for f in files] if isinstance(files, list) else [],
             )
         )
-    return mcps, skills
+
+    plugins: list[PluginDependency] = []
+    for item in _normalize_dep_list(raw.get("plugins"), f"spec {slug_hint!r}: requires.plugins"):
+        plugins.append(
+            PluginDependency(
+                id=str(item["id"]).strip(),
+                reason=str(item.get("reason", "")).strip(),
+                bundled=bool(item.get("bundled", False)),
+            )
+        )
+
+    commands: list[CommandDependency] = []
+    for item in _normalize_dep_list(raw.get("commands"), f"spec {slug_hint!r}: requires.commands"):
+        commands.append(
+            CommandDependency(
+                id=str(item["id"]).strip(),
+                reason=str(item.get("reason", "")).strip(),
+                bundled=bool(item.get("bundled", False)),
+            )
+        )
+
+    subagents: list[SubagentDependency] = []
+    for item in _normalize_dep_list(raw.get("subagents"), f"spec {slug_hint!r}: requires.subagents"):
+        subagents.append(
+            SubagentDependency(
+                id=str(item["id"]).strip(),
+                reason=str(item.get("reason", "")).strip(),
+                bundled=bool(item.get("bundled", False)),
+            )
+        )
+
+    return mcps, skills, plugins, commands, subagents
 
 
 def _normalize_dep_list(raw: Any, ctx: str) -> list[dict[str, Any]]:
@@ -509,7 +590,7 @@ def parse_spec(text: str, *, source: Optional[str] = None) -> DigitalHumanSpec:
         raise SpecError(f"spec {slug_hint!r}: only `automation` may declare `subscriptions`")
 
     config_schema = _parse_config_schema(config_raw, slug_hint)
-    requires_mcps, requires_skills = _parse_requires(requires_raw, slug_hint)
+    requires_mcps, requires_skills, requires_plugins, requires_commands, requires_subagents = _parse_requires(requires_raw, slug_hint)
 
     extra = {k: v for k, v in meta.items() if k not in _KNOWN_KEYS}
 
@@ -526,6 +607,9 @@ def parse_spec(text: str, *, source: Optional[str] = None) -> DigitalHumanSpec:
         config_schema=config_schema,
         requires_mcps=requires_mcps,
         requires_skills=requires_skills,
+        requires_plugins=requires_plugins,
+        requires_commands=requires_commands,
+        requires_subagents=requires_subagents,
         filters=_as_dict_list(meta.get("filters"), f"spec {slug_hint!r}: filters"),
         memory_schema=meta.get("memory_schema") if isinstance(meta.get("memory_schema"), dict) else {},
         output=meta.get("output") if isinstance(meta.get("output"), dict) else {},

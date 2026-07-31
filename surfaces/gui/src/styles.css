@@ -442,7 +442,7 @@ body {
 .approval-btns { display: flex; gap: 8px; margin-top: 13px; flex-wrap: wrap; align-items: center; }
 .approval-btns .spacer { flex: 1; }
 .approval .resolved { margin-top: 10px; font-size: 12.5px; color: var(--muted); }
-button.btn { font: inherit; font-size: 13px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--panel); cursor: pointer; }
+button.btn { font: inherit; font-size: 13px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--panel); cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
 button.btn.icon-only { display: inline-flex; align-items: center; justify-content: center; padding: 7px 9px; flex: none; color: var(--muted); }
 button.btn.icon-only:hover { color: var(--ink); }
 button.btn:hover { background: var(--paper); }
@@ -917,8 +917,9 @@ button.btn.sm { padding: 5px 13px; font-size: 12.5px; }
 
 /* -- Scheduled view (page shell + head are Tailwind, §28) -------------------- */
 .sched-detail { display: flex; flex-direction: column; gap: 10px; }
-.sched-detail-head { display: flex; align-items: center; justify-content: space-between; }
-.sched-actions { display: flex; align-items: center; gap: 12px; }
+.sched-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sched-detail-head > h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sched-actions { display: flex; align-items: center; gap: 8px; flex: none; flex-wrap: wrap; justify-content: flex-end; }
 .sched-instructions { font-size: 13.5px; color: var(--ink); white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; line-height: 1.5; }
 /* "Allowed without asking" — the automation's standing-approval revoke list (§25). */
 .sched-grants { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
@@ -941,6 +942,14 @@ button.btn.sm.danger-btn:hover { border-color: var(--danger); }
 .sched-edit-title { font-size: 18px; font-weight: 600; max-width: 360px; }
 .sched-edit-sched { margin: 12px 0 4px; }
 .sched-edit-instr { min-height: 96px; }
+/* SchedulePicker wrapper in edit mode (unified with DhEditPanel's layout). */
+.sched-edit-sched-wrap { margin: 4px 0 8px; }
+/* "数字人" badge on a task whose automation is a digital-human instance. */
+.sched-dh-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  margin-left: 8px; padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; color: var(--accent); background: var(--accent-soft);
+}
 .sched-run { border-bottom: 1px solid var(--line); }
 .sched-run-row { display: flex; align-items: center; justify-content: space-between; font-size: 13px; padding: 8px 2px; cursor: pointer; color: var(--muted); }
 .run-ok { color: var(--ok); } .run-error { color: var(--accent); } .run-running { color: var(--muted); }

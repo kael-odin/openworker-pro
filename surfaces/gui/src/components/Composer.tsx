@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { Attachment, SessionUsage } from "../types";
 import { isPdfFile, readFile } from "../attach";
-import { getSettings, inspectPdf } from "../api";
+import { getSettings, inspectPdf, getCommands, getCommand } from "../api";
 import { formatTokens, totalTokens } from "../usage";
 import { Dropdown, type Option } from "./Dropdown";
 import { Icon } from "./Icon";
@@ -34,7 +34,12 @@ const permissionOptions = (t: (k: string) => string): Option[] =>
 // goes stale and silently offers ids the backend never confirmed (caught 2026-07-21).
 
 // Drop the provider prefix for display (anthropic:claude-opus-4-8 → claude-opus-4-8); full id on hover.
-const shortModel = (m: string) => (m.includes(":") ? m.split(":").slice(1).join(":") : m);
+// Guard against undefined (the health/settings payloads can briefly carry undefined model ids
+// during sidecar reconnection, which would crash the picker on .includes).
+const shortModel = (m: string) => {
+  const s = m || "";
+  return s.includes(":") ? s.split(":").slice(1).join(":") : s;
+};
 
 // Identify an attachment by name + payload size so duplicates (e.g. the same file picked twice,
 // or a prefill applied twice) collapse to one chip.
@@ -106,6 +111,15 @@ export function Composer(props: Props) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const noticeTimer = useRef<number | null>(null);
 
+  // Slash-command autocomplete (E3): typing "/" at the start of a line (or after a space)
+  // opens a popup of available /commands. Selecting one fetches its prompt_template and
+  // expands it into the textarea in place of the "/query". The catalog loads once on mount.
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashQuery, setSlashQuery] = useState("");
+  const [slashCommands, setSlashCommands] = useState<{ name: string; description: string }[]>([]);
+  const slashStart = useRef<number>(-1); // index of the "/" in the text
+
   // Rejected-attachment notice: visible ~8s, then clears (or on ✕).
   const showAttachNotice = (message: string) => {
     setAttachNotice(message);
@@ -144,6 +158,73 @@ export function Composer(props: Props) {
     setAttachments([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.resetKey]);
+
+  // Load the slash-command catalog once (lightweight: name + description only). The full
+  // prompt_template is fetched on selection. Errors stay silent — "/" just won't pop.
+  useEffect(() => {
+    let cancelled = false;
+    getCommands()
+      .then((cmds) => {
+        if (!cancelled) setSlashCommands(cmds.map((c) => ({ name: c.name, description: c.description })));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Detect an active slash query at the caret: a "/" either at the start of the text or right
+  // after whitespace, with no whitespace after it (the user is still typing the command name).
+  // Returns the "/" index + the query text after it, or null when no slash is active.
+  const detectSlash = (value: string, caret: number): { start: number; query: string } | null => {
+    if (caret === 0) return null;
+    // Walk back from the caret to find the nearest "/".
+    let i = caret - 1;
+    while (i >= 0 && value[i] !== " " && value[i] !== "\n") {
+      if (value[i] === "/") {
+        // Must be at start-of-text or preceded by whitespace to count as a command trigger.
+        const prev = i === 0 ? "" : value[i - 1];
+        if (i === 0 || prev === " " || prev === "\n") {
+          return { start: i, query: value.slice(i + 1, caret) };
+        }
+        return null;
+      }
+      i -= 1;
+    }
+    return null;
+  };
+
+  const slashFiltered = slashOpen
+    ? slashCommands.filter((c) => {
+        const q = slashQuery.toLowerCase();
+        if (!q) return true;
+        return c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q);
+      })
+    : [];
+  // Keep the selection index in range as the filtered list shrinks.
+  if (slashIndex > slashFiltered.length - 1 && slashFiltered.length > 0) {
+    setSlashIndex(Math.max(0, slashFiltered.length - 1));
+  }
+
+  // Expand the selected command: fetch its prompt_template and replace the "/query" token in
+  // the textarea with the template text. The slash token has no spaces (by detectSlash), so it
+  // runs from slashStart to the next whitespace (or end). Closes the popup + refocuses.
+  const applySlashCommand = async (name: string) => {
+    const start = slashStart.current;
+    setSlashOpen(false);
+    const cmd = await getCommand(name);
+    if (!cmd || !cmd.prompt_template || start < 0) {
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      return;
+    }
+    setText((cur) => {
+      // Find the end of the slash token: next whitespace after start, or end of text.
+      let end = start;
+      while (end < cur.length && cur[end] !== " " && cur[end] !== "\n") end += 1;
+      return cur.slice(0, start) + cmd.prompt_template! + cur.slice(end);
+    });
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
 
   // Dictation is intentionally native-only: the browser/dev build remains a local server client
   // and never turns on the browser microphone or ships audio anywhere.
@@ -281,6 +362,30 @@ export function Composer(props: Props) {
   };
 
   const onKey = (e: React.KeyboardEvent) => {
+    // Slash popup navigation takes priority when open.
+    if (slashOpen && slashFiltered.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashIndex((i) => (i + 1) % slashFiltered.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashIndex((i) => (i - 1 + slashFiltered.length) % slashFiltered.length);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        const pick = slashFiltered[slashIndex];
+        if (pick) void applySlashCommand(pick.name);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashOpen(false);
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -335,8 +440,8 @@ export function Composer(props: Props) {
 
   const modelsLoaded = !!(props.models && props.models.length);
   const modelOptions: Option[] = Array.from(
-    new Set([props.model, ...(props.models || [])]),
-  ).map((m) => ({
+    new Set([props.model, ...(props.models || [])]).values(),
+  ).filter((m) => m).map((m) => ({
     value: m,
     label: props.modelLabels?.[m] || shortModel(m),
   }));
@@ -405,11 +510,57 @@ export function Composer(props: Props) {
           className="w-full block px-3.5 pt-3.5 pb-1.5 text-[14.5px]"
           placeholder={props.placeholder || t("composer.placeholder")}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            const v = e.target.value;
+            const caret = e.target.selectionStart ?? v.length;
+            setText(v);
+            const hit = detectSlash(v, caret);
+            if (hit) {
+              slashStart.current = hit.start;
+              setSlashQuery(hit.query);
+              setSlashOpen(true);
+              setSlashIndex(0);
+            } else if (slashOpen) {
+              setSlashOpen(false);
+            }
+          }}
           onKeyDown={onKey}
           onPaste={onPaste}
+          onBlur={() => {
+            // Delay so a mousedown on a popup item completes before we close.
+            window.setTimeout(() => setSlashOpen(false), 150);
+          }}
           rows={1}
         />
+
+        {/* Slash-command autocomplete popup (E3). Renders above the textarea; clicking an item
+            expands its template. Empty query shows all commands; no matches shows a hint. */}
+        {slashOpen && (
+          <div className="absolute z-40 bottom-full mb-1 left-0 right-0 max-h-[260px] overflow-y-auto rounded-xl border border-line bg-panel shadow-2xl py-1.5">
+            {slashFiltered.length === 0 ? (
+              <div className="px-3.5 py-2 text-[12.5px] text-faint">{t("composer.slash_empty")}</div>
+            ) : (
+              slashFiltered.map((c, i) => (
+                <button
+                  key={c.name}
+                  className={
+                    "w-full text-left px-3.5 py-2 flex items-baseline gap-2.5 " +
+                    (i === slashIndex ? "bg-paper text-ink" : "text-muted hover:bg-paper")
+                  }
+                  onMouseEnter={() => setSlashIndex(i)}
+                  onMouseDown={(e) => {
+                    // mousedown (not click) so the textarea doesn't lose focus before apply.
+                    e.preventDefault();
+                    void applySlashCommand(c.name);
+                  }}
+                >
+                  <span className="text-[13px] font-medium text-ink shrink-0">/{c.name}</span>
+                  <span className="text-[12px] text-faint truncate">{c.description}</span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
 
         {/* Three-control row (§22): + attach · Mode ⌄ …(right)… model (fresh only) · send */}
         <div className="px-2.5 pb-2.5 pt-1 flex items-center gap-1.5">

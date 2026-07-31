@@ -1,22 +1,20 @@
-"""DHP registry store — resolve digital humans from a local DHP repo clone or the official index.
+"""DHP registry store — resolve digital humans from one or more configured sources.
 
-Two sources, one API:
+A *source* (see :mod:`.sources`) is either an HTTP index (the default — the DHP GitHub Pages site)
+or a local ``digital-human-protocol`` checkout. The registry aggregates every enabled source:
+``list`` merges their catalog entries, ``get_spec`` locates which source owns a slug and fetches
+its spec through that source's adapter (see :mod:`.adapters`).
 
-* **Local repo** — a clone of ``openkursar/digital-human-protocol`` on disk. The registry reads
-  ``index.json`` for the catalog (slug / name / description / category / tags / icon / i18n), then
-  lazily parses ``packages/digital-humans/<slug>/spec.yaml`` on demand via :mod:`.spec`. This is the
-  zero-network path used in dev and by users who keep the repo cloned.
-* **Remote index** — the same ``index.json`` served at the DHP GitHub Pages URL. Used for listing
-  when no local repo is configured; spec fetch then requires a per-slug download (future; the local
-  repo is the supported path today).
+This multi-source design fixes the empty-store bug at its root: the default HTTP source is always
+present (re-asserted on startup), so the store is never empty even when no local clone exists and
+no ``OPENWORKER_DHP_REPO`` env is set — which was the sidecar-restart failure mode.
 
-The registry never holds full specs in memory — only the lightweight index entries. Specs are
-parsed on demand and cached by slug.
+For backward compatibility (and dev/tests that pass a repo dir directly), the single-``repo_dir``
+constructor still works; it builds a single local source under the hood.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -39,7 +37,7 @@ class RegistryEntry:
     """One row of the DHP ``index.json`` ``apps`` array — the catalog listing without the full spec."""
 
     slug: str
-    name: str
+    name: str = ""
     version: str = ""
     author: str = ""
     description: str = ""
@@ -49,11 +47,12 @@ class RegistryEntry:
     icon: str = ""
     locale: str = ""
     min_app_version: str = ""
-    path: str = ""  # repo-relative path to the package dir
+    path: str = ""  # source-relative path to the package dir
     checksum: str = ""
     size_bytes: int = 0
     i18n: dict[str, Any] = field(default_factory=dict)
     updated_at: str = ""
+    source_id: str = ""  # which source owns this entry
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,45 +94,81 @@ def _entry_from_index(item: dict[str, Any]) -> RegistryEntry:
 
 
 class DhpRegistry:
-    """Resolves DHP catalog entries + specs from a local repo clone (and, in future, the remote index).
+    """Resolves DHP catalog entries + specs across one or more sources.
 
-    Pass ``repo_dir`` = the root of a ``digital-human-protocol`` checkout (the dir containing
-    ``index.json`` and ``packages/``). The registry reads ``index.json`` eagerly (it's small) and
-    parses specs lazily.
+    Pass a list of :class:`~coworker.digital_human.sources.RegistrySource` (the production path —
+    the manager builds these from SourceManager) OR a single ``repo_dir`` (the legacy/dev path).
+    Sources are resolved lazily through adapters; a source that fails to load yields no entries
+    rather than crashing the whole store.
     """
 
-    def __init__(self, repo_dir: Optional[str | Path] = None) -> None:
-        self.repo_dir = Path(repo_dir) if repo_dir else None
-        self._entries: dict[str, RegistryEntry] = {}
+    def __init__(self, sources=None, *, repo_dir: Optional[str | Path] = None) -> None:
+        # source_id → adapter. Adapters are built lazily on first use (so a misconfigured HTTP
+        # source doesn't fail at startup — it fails when first queried, and only for that source).
+        self._adapters: dict[str, Any] = {}
+        self._entry_index: dict[str, tuple[str, RegistryEntry]] = {}  # slug → (source_id, entry)
+        self._loaded = False
         self._spec_cache: dict[str, DigitalHumanSpec] = {}
-        if self.repo_dir is not None:
-            self._load_index(self.repo_dir / "index.json")
 
-    # -- loading ----------------------------------------------------------------
-    def _load_index(self, index_path: Path) -> None:
-        if not index_path.is_file():
+        # Backward-compat: the legacy constructor was DhpRegistry(repo_dir) — a positional path.
+        # Detect a str/Path passed as the first arg and treat it as repo_dir.
+        if sources is not None and not _is_source_list(sources):
+            repo_dir = sources
+            sources = None
+
+        if sources is not None:
+            # Multi-source path. Import here to avoid a circular import at module load.
+            from .adapters import make_adapter
+
+            self._sources = list(sources)
+            for src in self._sources:
+                if not src.enabled:
+                    continue
+                adapter = make_adapter(src)
+                if adapter is not None:
+                    self._adapters[src.id] = adapter
+        else:
+            # Legacy single-repo path (tests, dev with OPENWORKER_DHP_REPO).
+            from .adapters import LocalRepoAdapter
+
+            self._sources = []
+            if repo_dir is not None:
+                repo_path = Path(repo_dir)
+                if repo_path.is_dir():
+                    adapter = LocalRepoAdapter(repo_path)
+                    self._adapters["local"] = adapter
+                    self._sources.append(_LegacyLocalSource(str(repo_path)))
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
             return
-        try:
-            data = json.loads(index_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return
-        for item in data.get("apps") or []:
-            if not isinstance(item, dict):
+        self._loaded = True
+        self._entry_index.clear()
+        # Default-source entries take precedence on slug collision (first source in list wins).
+        # We iterate in the source order given (SourceManager sorts default-first).
+        for source_id, adapter in self._adapters.items():
+            try:
+                entries = adapter.fetch_index()
+            except Exception:
                 continue
-            entry = _entry_from_index(item)
-            if entry.slug:
-                self._entries[entry.slug] = entry
+            for entry in entries:
+                if entry.slug and entry.slug not in self._entry_index:
+                    entry.source_id = source_id
+                    self._entry_index[entry.slug] = (source_id, entry)
 
     # -- queries ----------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self._entries)
+        self._ensure_loaded()
+        return len(self._entry_index)
 
     def slugs(self) -> list[str]:
-        return sorted(self._entries)
+        self._ensure_loaded()
+        return sorted(self._entry_index)
 
     def list(self, *, category: Optional[str] = None) -> list[RegistryEntry]:
         """Catalog entries, optionally filtered by category. Sorted by category order then name."""
-        entries = list(self._entries.values())
+        self._ensure_loaded()
+        entries = [e for _, e in self._entry_index.values()]
         if category:
             entries = [e for e in entries if e.category == category]
         entries.sort(key=lambda e: (_cat_rank(e.category), e.name.lower()))
@@ -141,40 +176,53 @@ class DhpRegistry:
 
     def categories(self) -> list[str]:
         """Distinct categories present, in canonical order."""
-        present = {e.category for e in self._entries.values() if e.category}
+        self._ensure_loaded()
+        present = {e.category for _, e in self._entry_index.values() if e.category}
         return [c for c in CATEGORY_ORDER if c in present] + sorted(present - set(CATEGORY_ORDER))
 
     def get(self, slug: str) -> Optional[RegistryEntry]:
-        return self._entries.get(slug)
+        self._ensure_loaded()
+        pair = self._entry_index.get(slug)
+        return pair[1] if pair else None
 
     def get_spec(self, slug: str) -> DigitalHumanSpec:
-        """Parse and return the full spec for ``slug``. Raises :class:`SpecError` if the slug is
-        unknown or the spec is malformed."""
+        """Parse and return the full spec for ``slug``. Raises :class:`SpecError` if unknown."""
         if slug in self._spec_cache:
             return self._spec_cache[slug]
-        entry = self._entries.get(slug)
-        if entry is None or self.repo_dir is None:
+        self._ensure_loaded()
+        pair = self._entry_index.get(slug)
+        if pair is None:
             raise SpecError(f"digital human {slug!r} is not in the registry")
-        # Resolve the package dir: prefer the index `path`, fall back to the conventional location.
-        pkg_dir = self.repo_dir / entry.path if entry.path else self.repo_dir / "packages" / "digital-humans" / slug
-        spec_path = pkg_dir / "spec.yaml"
-        if not spec_path.is_file():
-            # Some packages might use spec.json.
-            alt = pkg_dir / "spec.json"
-            if alt.is_file():
-                spec_path = alt
-            else:
-                raise SpecError(f"no spec.yaml found for {slug!r} at {pkg_dir}")
-        spec = load_spec_file(spec_path)
+        source_id, entry = pair
+        adapter = self._adapters.get(source_id)
+        if adapter is None:
+            raise SpecError(f"source {source_id!r} for {slug!r} is not available")
+        spec = adapter.fetch_spec(slug, entry.path or f"packages/digital-humans/{slug}/spec.yaml")
         self._spec_cache[slug] = spec
         return spec
 
     def reload(self) -> None:
-        """Drop caches and re-read the index (e.g. after a ``git pull`` of the repo)."""
-        self._entries.clear()
+        """Drop caches and re-fetch indexes (e.g. after a source is added/toggled)."""
+        for adapter in self._adapters.values():
+            try:
+                adapter.reload()
+            except Exception:
+                pass
+        self._entry_index.clear()
         self._spec_cache.clear()
-        if self.repo_dir is not None:
-            self._load_index(self.repo_dir / "index.json")
+        self._loaded = False
+
+
+@dataclass
+class _LegacyLocalSource:
+    """A minimal source-like object for the legacy ``repo_dir`` constructor."""
+
+    url: str
+    enabled: bool = True
+    is_default: bool = True
+    source_type: str = "local"
+    id: str = "local"
+    name: str = "本地 DHP 仓库"
 
 
 def _cat_rank(category: str) -> int:
@@ -182,3 +230,17 @@ def _cat_rank(category: str) -> int:
         return CATEGORY_ORDER.index(category)
     except ValueError:
         return len(CATEGORY_ORDER)
+
+
+def _is_source_list(value) -> bool:
+    """True if ``value`` is a list/iterable of RegistrySource-like objects (vs a bare path string).
+
+    Used to disambiguate the legacy ``DhpRegistry(repo_dir)`` positional call from the multi-source
+    ``DhpRegistry(sources_list)`` call — a str/Path arg is repo_dir, a list is sources.
+    """
+    if isinstance(value, (str, Path, bytes)):
+        return False
+    if isinstance(value, (list, tuple)):
+        return all(hasattr(item, "source_type") for item in value) if value else True
+    # A generator of RegistrySource objects — accept it.
+    return hasattr(value, "__iter__")

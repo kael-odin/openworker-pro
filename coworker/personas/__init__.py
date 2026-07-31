@@ -10,6 +10,13 @@ from __future__ import annotations
 
 from .manifest import PersonaManifest, ManifestError, parse_manifest, load_manifest_file
 from .registry import PersonaRegistry, PersonaState, DEFAULT_PERSONA_ID
+from .sources import PersonaSource, PersonaSourceManager, BUILTIN_SOURCES
+from .marketplace import (
+    PersonaMarketplaceError,
+    list_catalog,
+    install_persona,
+    uninstall_persona,
+)
 
 __all__ = [
     "PersonaManifest",
@@ -19,4 +26,11 @@ __all__ = [
     "PersonaRegistry",
     "PersonaState",
     "DEFAULT_PERSONA_ID",
+    "PersonaSource",
+    "PersonaSourceManager",
+    "BUILTIN_SOURCES",
+    "PersonaMarketplaceError",
+    "list_catalog",
+    "install_persona",
+    "uninstall_persona",
 ]

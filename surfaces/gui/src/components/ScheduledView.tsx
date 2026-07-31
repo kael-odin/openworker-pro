@@ -4,32 +4,28 @@ import {
   deleteAutomation,
   getAutomation,
   getAutomations,
+  getDigitalHumanInstances,
   markAutomationSeen,
   announceAutomationsChanged,
   updateAutomation,
   type Automation,
   type AutomationRun,
+  type DigitalHumanInstance,
 } from "../api";
 import { useT } from "../i18n/I18nProvider";
 import { Icon } from "./Icon";
 import { PanelHead } from "./IntegrationsView";
 import { AutomationQuickstart } from "./AutomationQuickstart";
+import { SystemPromptEditor } from "./dh-edit/SystemPromptEditor";
+import { SchedulePicker } from "./dh-edit/SchedulePicker";
 
 // Shared utility strings (the §28 page shell — mirrors IntegrationsView's constants).
 const CARD = "rounded-xl2 border border-line bg-panel";
 
 // Parse a simple "min hour * * dow" cron back into the time + frequency the editor uses.
 // Falls back to 09:00 / daily for anything it doesn't recognize (e.g. agent-written crons).
-function fromCron(cron?: string | null): { time: string; freq: string } {
-  const parts = (cron || "").trim().split(/\s+/);
-  if (parts.length !== 5) return { time: "09:00", freq: "daily" };
-  const [m, h, , , dow] = parts;
-  const hh = String(Math.min(23, Math.max(0, parseInt(h, 10) || 9))).padStart(2, "0");
-  const mm = String(Math.min(59, Math.max(0, parseInt(m, 10) || 0))).padStart(2, "0");
-  const freq = dow === "1-5" ? "weekdays" : dow === "0,6" || dow === "6,0" ? "weekends" : "daily";
-  return { time: `${hh}:${mm}`, freq };
-}
-
+// NOTE: the TaskDetail editor now uses SchedulePicker (cron-native), so this helper only
+// remains for any future read-side need; the create form still uses toCron below.
 const fmt = (t: number | null) =>
   t ? new Date(t * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "—";
 
@@ -62,9 +58,12 @@ interface Props {
   onRunNow: (taskId: string, title?: string) => void;
   // Open directly on a task's detail (set by the run banner's "Back to runs").
   initialOpenId?: string | null;
+  // Deep-link into Settings (e.g. "digital" tab) — used by the "open full edit" affordance
+  // on digital-human tasks.
+  onOpenSettings?: (tab: string) => void;
 }
 
-export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
+export function ScheduledView({ onOpenRun, onRunNow, initialOpenId, onOpenSettings }: Props) {
   const { t } = useT();
   const [tasks, setTasks] = useState<Automation[]>([]);
   const [openId, setOpenId] = useState<string | null>(initialOpenId ?? null);
@@ -115,6 +114,7 @@ export function ScheduledView({ onOpenRun, onRunNow, initialOpenId }: Props) {
         onBack={() => { setOpenId(null); refresh(); }}
         onOpenRun={onOpenRun}
         onRunNow={onRunNow}
+        onOpenFullEdit={onOpenSettings ? () => onOpenSettings("digital") : undefined}
       />
     );
   }
@@ -278,6 +278,7 @@ function TaskDetail({
   onBack,
   onOpenRun,
   onRunNow,
+  onOpenFullEdit,
 }: {
   id: string;
   onBack: () => void;
@@ -288,15 +289,18 @@ function TaskDetail({
     task?: { id: string; title: string },
   ) => void;
   onRunNow: (taskId: string, title?: string) => void;
+  // Open Settings ▸ 数字人 ▸ DhEditPanel (deep-link for digital-human tasks).
+  onOpenFullEdit?: () => void;
 }) {
   const [task, setTask] = useState<Automation | null>(null);
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [time, setTime] = useState("09:00");
-  const [freq, setFreq] = useState("daily");
+  const [cron, setCron] = useState("0 0 * * *");
   const [saving, setSaving] = useState(false);
+  // Is this task a digital-human instance? If so, offer "open full edit" → DhEditPanel.
+  const [dhInstance, setDhInstance] = useState<DigitalHumanInstance | null>(null);
   const { t } = useT();
 
   // The seen mark AS OF opening — the "new" pills compare against this frozen value
@@ -317,9 +321,14 @@ function TaskDetail({
         setSeenMark((cur) => (cur === null ? d.task?.seen_runs_at ?? 0 : cur));
       })
       .catch(() => {});
+  // Detect whether this automation is a digital-human instance (so we can offer the
+  // rich AppConfigPanel-style editor instead of the plain instructions textarea).
   useEffect(() => {
     setSeenMark(null);
     refresh();
+    getDigitalHumanInstances()
+      .then((r) => setDhInstance(r.instances.find((i) => i.task_id === id) ?? null))
+      .catch(() => setDhInstance(null));
     // Opening the detail IS reading it: advance the seen mark and nudge the
     // sidebar so the badge clears immediately (UX-023).
     markAutomationSeen(id)
@@ -337,9 +346,7 @@ function TaskDetail({
   const startEdit = () => {
     setTitle(task.title);
     setInstructions(task.instructions);
-    const { time: t, freq: f } = fromCron(task.schedule_raw?.cron);
-    setTime(t);
-    setFreq(f);
+    setCron(task.schedule_raw?.cron || "0 0 * * *");
     setEditing(true);
   };
   const saveEdit = async () => {
@@ -348,7 +355,7 @@ function TaskDetail({
       await updateAutomation(id, {
         title: title.trim(),
         instructions: instructions.trim(),
-        cron: toCron(time, freq),
+        cron,
       });
       await refresh();
       setEditing(false);
@@ -397,6 +404,24 @@ function TaskDetail({
                   {t("scheduled.run_now")}
                 </button>
                 <button className="btn sm" onClick={startEdit}>{t("scheduled.edit")}</button>
+                {dhInstance && (
+                  <button
+                    className="btn sm"
+                    title={t("scheduled.open_full_edit_hint")}
+                    onClick={() => {
+                      // Deep-link into Settings ▸ 数字人 ▸ DhEditPanel for this instance.
+                      // Stash the id in sessionStorage because the DigitalHumansSection
+                      // listener mounts only after the Settings surface opens (so the
+                      // window event below would race and miss). The window event is a
+                      // fallback for the already-mounted case.
+                      sessionStorage.setItem("dh:edit-instance", dhInstance.id);
+                      window.dispatchEvent(new CustomEvent("dh:edit-instance", { detail: dhInstance.id }));
+                      onOpenFullEdit?.();
+                    }}
+                  >
+                    <Icon name="sliders" size={14} /> {t("scheduled.open_full_edit")}
+                  </button>
+                )}
                 <button className="btn sm danger-btn" onClick={remove}>
                   <Icon name="trash" size={14} /> {t("scheduled.delete")}
                 </button>
@@ -406,19 +431,11 @@ function TaskDetail({
         </div>
 
         {editing ? (
-          <div className="tmpl-sched sched-edit-sched">
-            <label className="tmpl-field">
-              <span>{t("scheduled.at")}</span>
-              <input type="time" className="tmpl-input tmpl-time" value={time} onChange={(e) => setTime(e.target.value)} />
-            </label>
-            <label className="tmpl-field">
-              <span>{t("scheduled.repeat")}</span>
-              <select className="tmpl-input tmpl-select" value={freq} onChange={(e) => setFreq(e.target.value)}>
-                <option value="daily">{t("scheduled.repeat_daily")}</option>
-                <option value="weekdays">{t("scheduled.repeat_weekdays")}</option>
-                <option value="weekends">{t("scheduled.repeat_weekends")}</option>
-              </select>
-            </label>
+          <div className="sched-edit-sched-wrap">
+            <SchedulePicker
+              cron={cron}
+              onChange={(c) => setCron(c)}
+            />
           </div>
         ) : (
           <div className="conn-meta">
@@ -427,15 +444,19 @@ function TaskDetail({
               <span className="slider" />
             </label>{" "}
             {(task.enabled ? t("scheduled.active_next", { when: fmt(task.next_run) }) : t("scheduled.paused")) + " · " + task.schedule}
+            {dhInstance && (
+              <span className="sched-dh-tag">
+                <Icon name="bot" size={13} /> {t("scheduled.dh_tag")}
+              </span>
+            )}
           </div>
         )}
 
         <div className="sa-sub">{t("scheduled.instructions_label")}</div>
         {editing ? (
-          <textarea
-            className="tmpl-input tmpl-textarea sched-edit-instr"
+          <SystemPromptEditor
             value={instructions}
-            onChange={(e) => setInstructions(e.target.value)}
+            onChange={(v) => setInstructions(v)}
           />
         ) : (
           <div className="sched-instructions">{task.instructions}</div>

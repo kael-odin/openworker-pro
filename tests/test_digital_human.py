@@ -235,6 +235,30 @@ def test_legacy_required_mcps_alias():
     assert s.requires_mcps[0].id == "ai-browser"
 
 
+def test_requires_plugins_commands_subagents_parsed():
+    """E4: spec.requires unifies {mcps, skills, plugins, commands, subagents}."""
+    s = parse_spec(
+        "name: x\nversion: '1'\nauthor: a\ndescription: d\ntype: skill\nsystem_prompt: y\n"
+        "requires:\n"
+        "  plugins:\n"
+        "    - id: chrome-devtools\n      reason: inspect browser\n"
+        "  commands:\n"
+        "    - review\n"
+        "  subagents:\n"
+        "    - id: researcher\n"
+    )
+    assert len(s.requires_plugins) == 1
+    assert s.requires_plugins[0].id == "chrome-devtools"
+    assert s.requires_plugins[0].reason == "inspect browser"
+    assert len(s.requires_commands) == 1
+    assert s.requires_commands[0].id == "review"
+    assert len(s.requires_subagents) == 1
+    assert s.requires_subagents[0].id == "researcher"
+    # to_dict surfaces all five requires kinds.
+    d = s.to_dict()
+    assert set(d["requires"].keys()) == {"mcps", "skills", "plugins", "commands", "subagents"}
+
+
 def test_subscription_shorthand():
     """§15: type/config at entry level == nested under source."""
     s = parse_spec(
@@ -490,3 +514,339 @@ def test_registry_parses_all_real_specs():
         except Exception as e:
             failures.append((slug, str(e)))
     assert not failures, f"spec parse failures: {failures}"
+
+
+# -- source management (批次 D2) ---------------------------------------------
+
+
+def test_source_manager_seeds_builtins_when_empty(tmp_path):
+    from coworker.digital_human.sources import SourceManager, BUILTIN_SOURCES
+
+    prefs: dict = {}
+    saved = []
+    sm = SourceManager(prefs, lambda: saved.append("saved"))
+    sm.ensure_builtins()
+    assert prefs["dhp_sources"], "builtin source should be persisted"
+    assert prefs["dhp_sources"][0]["id"] == BUILTIN_SOURCES[0].id
+    assert prefs["dhp_sources"][0]["is_default"] is True
+    assert saved  # save was called
+
+
+def test_source_manager_builtin_cannot_be_removed(tmp_path):
+    from coworker.digital_human.sources import SourceManager
+
+    prefs: dict = {}
+    sm = SourceManager(prefs, lambda: None)
+    sm.ensure_builtins()
+    builtin_id = sm.list()[0].id
+    assert sm.remove(builtin_id) is False  # builtin is undeletable
+    assert sm.list()[0].id == builtin_id  # still there
+
+
+def test_source_manager_add_toggle_remove_custom(tmp_path):
+    from coworker.digital_human.sources import SourceManager
+
+    prefs: dict = {}
+    sm = SourceManager(prefs, lambda: None)
+    sm.ensure_builtins()
+    src = sm.add("My Mirror", "https://example.com/dhp")
+    assert src.id != "dhp-official"
+    # Toggle off.
+    sm.update(src.id, {"enabled": False})
+    assert not sm.list()[0].enabled or not next(s for s in sm.list() if s.id == src.id).enabled
+    # Custom source can be removed.
+    assert sm.remove(src.id) is True
+    assert all(s.id != src.id for s in sm.list())
+
+
+def test_source_manager_ensure_builtins_preserves_disabled_preference(tmp_path):
+    from coworker.digital_human.sources import SourceManager
+
+    prefs: dict = {}
+    sm = SourceManager(prefs, lambda: None)
+    sm.ensure_builtins()
+    builtin_id = sm.list()[0].id
+    # User disables the builtin.
+    sm.update(builtin_id, {"enabled": False})
+    # A second ensure_builtins (e.g. restart) keeps it disabled.
+    sm2 = SourceManager(prefs, lambda: None)
+    sm2.ensure_builtins()
+    assert next(s for s in sm2.list() if s.id == builtin_id).enabled is False
+
+
+def test_source_manager_add_rejects_empty_fields():
+    from coworker.digital_human.sources import SourceManager
+
+    sm = SourceManager({}, lambda: None)
+    with pytest.raises(ValueError):
+        sm.add("", "https://x")
+    with pytest.raises(ValueError):
+        sm.add("name", "")
+
+
+# -- HTTP adapter (mocked httpx, no real network) -----------------------------
+
+
+class _FakeResponse:
+    def __init__(self, *, json_data=None, text=None, status=200):
+        self._json = json_data
+        self.text = text or ""
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._json
+
+
+class _FakeHttpxClient:
+    """Captures the urls requested and returns scripted responses."""
+
+    def __init__(self, responses: dict[str, _FakeResponse]):
+        self._responses = responses
+        self.requested: list[str] = []
+
+    def get(self, url):
+        self.requested.append(url)
+        return self._responses.get(url, _FakeResponse(status=404, text="not found"))
+
+
+def test_http_adapter_fetch_index_and_spec(monkeypatch):
+    from coworker.digital_human.adapters import DhpHttpAdapter
+
+    index_url = "https://example.com/dhp/index.json"
+    spec_url = "https://example.com/dhp/packages/digital-humans/foo/spec.yaml"
+    fake = _FakeHttpxClient(
+        {
+            index_url: _FakeResponse(
+                json_data={"apps": [{"slug": "foo", "name": "Foo", "path": "packages/digital-humans/foo"}]}
+            ),
+            spec_url: _FakeResponse(
+                text="name: Foo\nversion: '1.0.0'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: hi\nsubscriptions: []\n"
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "coworker.digital_human.adapters.httpx", type("M", (), {"Client": lambda *a, **k: fake})
+    )
+    adapter = DhpHttpAdapter("https://example.com/dhp")
+    entries = adapter.fetch_index()
+    assert len(entries) == 1 and entries[0].slug == "foo"
+    spec = adapter.fetch_spec("foo", "packages/digital-humans/foo")
+    assert spec.name == "Foo"
+    assert spec.system_prompt.strip() == "hi"
+
+
+def test_http_adapter_network_failure_returns_empty(monkeypatch):
+    from coworker.digital_human.adapters import DhpHttpAdapter
+
+    class _BoomClient:
+        def get(self, url):
+            raise ConnectionError("no network")
+
+    monkeypatch.setattr(
+        "coworker.digital_human.adapters.httpx", type("M", (), {"Client": lambda *a, **k: _BoomClient()})
+    )
+    adapter = DhpHttpAdapter("https://example.com/dhp")
+    # First load with no cache → empty list, not a crash.
+    assert adapter.fetch_index() == []
+
+
+def test_assert_safe_rel_path_rejects_traversal():
+    from coworker.digital_human.adapters import assert_safe_rel_path
+
+    assert assert_safe_rel_path("packages/digital-humans/foo") == "packages/digital-humans/foo"
+    with pytest.raises(SpecError):
+        assert_safe_rel_path("../etc/passwd")
+    with pytest.raises(SpecError):
+        assert_safe_rel_path("/abs/path")
+    with pytest.raises(SpecError):
+        assert_safe_rel_path("a/../../b")
+
+
+# -- multi-source registry ----------------------------------------------------
+
+
+def test_registry_merges_multiple_sources(tmp_path):
+    from coworker.digital_human.sources import RegistrySource
+    from coworker.digital_human.store import DhpRegistry
+
+    # Two local sources, each with one entry.
+    src_a = tmp_path / "a"
+    src_b = tmp_path / "b"
+    for src, slug in [(src_a, "alpha"), (src_b, "beta")]:
+        (src / "packages" / "digital-humans" / slug).mkdir(parents=True)
+        (src / "packages" / "digital-humans" / slug / "spec.yaml").write_text(
+            f"name: {slug}\nversion: '1'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: x\nsubscriptions: []\n",
+            encoding="utf-8",
+        )
+        (src / "index.json").write_text(
+            json.dumps({"apps": [{"slug": slug, "name": slug, "path": f"packages/digital-humans/{slug}"}]}),
+            encoding="utf-8",
+        )
+    reg = DhpRegistry(
+        [
+            RegistrySource(id="a", name="A", url=str(src_a), source_type="local"),
+            RegistrySource(id="b", name="B", url=str(src_b), source_type="local"),
+        ]
+    )
+    assert set(reg.slugs()) == {"alpha", "beta"}
+    assert reg.get_spec("alpha").name == "alpha"
+    assert reg.get_spec("beta").name == "beta"
+
+
+def test_registry_disabled_source_skipped(tmp_path):
+    from coworker.digital_human.sources import RegistrySource
+    from coworker.digital_human.store import DhpRegistry
+
+    src_a = tmp_path / "a"
+    (src_a / "packages" / "digital-humans" / "alpha").mkdir(parents=True)
+    (src_a / "packages" / "digital-humans" / "alpha" / "spec.yaml").write_text(
+        "name: alpha\nversion: '1'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: x\nsubscriptions: []\n",
+        encoding="utf-8",
+    )
+    (src_a / "index.json").write_text(
+        json.dumps({"apps": [{"slug": "alpha", "name": "alpha", "path": "packages/digital-humans/alpha"}]}),
+        encoding="utf-8",
+    )
+    reg = DhpRegistry(
+        [RegistrySource(id="a", name="A", url=str(src_a), source_type="local", enabled=False)]
+    )
+    assert reg.slugs() == []  # disabled source contributes nothing
+
+
+# -- update_digital_human (编辑链路) -----------------------------------------
+
+
+class _FakeManager:
+    """A minimal manager exposing only what update_digital_human needs (avoids the full SessionManager)."""
+
+    def __init__(self, tmp_path):
+        from coworker.secrets import SecretStore
+
+        self.task_store = _FakeTaskStore()
+        self.secrets = SecretStore(tmp_path / "secrets.json")
+        self.dhp_instances = InstanceStore(tmp_path / "dh.json", secrets=self.secrets)
+        # Build a registry from a local source with one spec.
+        repo = tmp_path / "repo"
+        (repo / "packages" / "digital-humans" / "news").mkdir(parents=True)
+        (repo / "packages" / "digital-humans" / "news" / "spec.yaml").write_text(
+            "name: News\nversion: '1.0.0'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: Report news.\n"
+            "store:\n  slug: news\n"
+            "subscriptions:\n  - source:\n      type: schedule\n      config:\n        every: 24h\n"
+            "config_schema:\n  - key: topic\n    label: Topic\n    type: string\n    default: AI\n"
+            "  - key: api_key\n    label: K\n    type: string\n",
+            encoding="utf-8",
+        )
+        (repo / "index.json").write_text(
+            json.dumps({"apps": [{"slug": "news", "name": "News", "path": "packages/digital-humans/news"}]}),
+            encoding="utf-8",
+        )
+        from coworker.digital_human.sources import RegistrySource
+
+        self.dhp_registry = DhpRegistry([RegistrySource(id="local", name="L", url=str(repo), source_type="local")])
+        # update_digital_human calls self.update_automation — wire to the real SessionManager method.
+        from coworker.server.manager import SessionManager
+
+        self.update_automation = SessionManager.update_automation.__get__(self)
+
+
+def test_update_digital_human_changes_cron(tmp_path):
+    from coworker.digital_human import install_digital_human
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    spec = mgr.dhp_registry.get_spec("news")
+    inst_result = install_digital_human(
+        spec, {}, task_store=mgr.task_store, scratch_provider=lambda sid: sid, instances=mgr.dhp_instances
+    )
+    assert inst_result["ok"]
+    inst_id = inst_result["instance"]["id"]
+
+    result = SessionManager.update_digital_human(mgr, inst_id, {"cron": "0 9 * * *"})
+    assert result["ok"], result
+    task = mgr.task_store.get(inst_result["instance"]["task_id"])
+    assert task.schedule.cron == "0 9 * * *"
+
+
+def test_update_digital_human_changes_system_prompt(tmp_path):
+    from coworker.digital_human import install_digital_human
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    spec = mgr.dhp_registry.get_spec("news")
+    inst_result = install_digital_human(
+        spec, {}, task_store=mgr.task_store, scratch_provider=lambda sid: sid, instances=mgr.dhp_instances
+    )
+    inst_id = inst_result["instance"]["id"]
+
+    new_prompt = "You are a rewritten agent. Do better things."
+    result = SessionManager.update_digital_human(mgr, inst_id, {"system_prompt": new_prompt})
+    assert result["ok"], result
+    task = mgr.task_store.get(inst_result["instance"]["task_id"])
+    # Prompt rebuilt with preamble preserved.
+    assert "## 用户配置" in task.instructions
+    assert new_prompt in task.instructions
+    assert "Report news." not in task.instructions  # old prompt replaced
+
+
+def test_update_digital_human_changes_config_and_secret(tmp_path):
+    from coworker.digital_human import install_digital_human
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    spec = mgr.dhp_registry.get_spec("news")
+    inst_result = install_digital_human(
+        spec, {}, task_store=mgr.task_store, scratch_provider=lambda sid: sid, instances=mgr.dhp_instances
+    )
+    inst_id = inst_result["instance"]["id"]
+
+    result = SessionManager.update_digital_human(
+        mgr, inst_id, {"user_config": {"topic": "sports", "api_key": "sk-new"}}
+    )
+    assert result["ok"], result
+    inst = mgr.dhp_instances.get(inst_id)
+    assert inst.config["topic"] == "sports"
+    assert "api_key" not in inst.config  # secret stays out of plaintext
+    assert inst.secret_keys == ["api_key"]
+    secret_data = mgr.secrets.get(inst.secret_profile())
+    assert secret_data["api_key"] == "sk-new"
+
+
+def test_update_digital_human_unknown_instance_fails(tmp_path):
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    result = SessionManager.update_digital_human(mgr, "nope", {"cron": "0 0 * * *"})
+    assert not result["ok"]
+    assert "not found" in result["error"]
+
+
+# -- upgrade check ------------------------------------------------------------
+
+
+def test_upgrade_check_detects_outdated(tmp_path):
+    from coworker.digital_human import install_digital_human
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    spec = mgr.dhp_registry.get_spec("news")
+    inst_result = install_digital_human(
+        spec, {}, task_store=mgr.task_store, scratch_provider=lambda sid: sid, instances=mgr.dhp_instances
+    )
+    inst_id = inst_result["instance"]["id"]
+    # Bump the registry version after install.
+    spec_yaml = mgr.dhp_registry.get_spec("news")
+    original = spec_yaml.version
+    # Simulate a newer version in the index entry without touching the spec file.
+    mgr.dhp_registry._ensure_loaded()
+    _, entry = mgr.dhp_registry._entry_index["news"]
+    entry.version = "2.0.0"
+    result = SessionManager.dhp_upgrade_check(mgr, inst_id)
+    assert result["ok"]
+    assert result["installed_version"] == "1.0.0"
+    assert result["latest_version"] == "2.0.0"
+    assert result["up_to_date"] is False
+

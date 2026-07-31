@@ -39,7 +39,16 @@ from .spec import (
 )
 from .store import DhpRegistry, RegistryEntry
 from .instances import DigitalHumanInstance, InstanceStore
-from .installer import install_digital_human, uninstall_digital_human
+from .installer import (
+    install_digital_human,
+    uninstall_digital_human,
+    reinstall_instructions,
+    build_instructions,
+    validate_config,
+    split_config,
+)
+from .sources import RegistrySource, SourceManager
+from .adapters import DhpHttpAdapter, LocalRepoAdapter, make_adapter
 
 __all__ = [
     "DigitalHumanSpec",
@@ -56,4 +65,13 @@ __all__ = [
     "InstanceStore",
     "install_digital_human",
     "uninstall_digital_human",
+    "reinstall_instructions",
+    "build_instructions",
+    "validate_config",
+    "split_config",
+    "RegistrySource",
+    "SourceManager",
+    "DhpHttpAdapter",
+    "LocalRepoAdapter",
+    "make_adapter",
 ]

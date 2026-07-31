@@ -43,6 +43,11 @@ export type IconName =
   | "stop"
   | "bell"
   | "bot"
+  | "maximize"
+  | "puzzle"
+  | "terminal"
+  | "listChecks"
+  | "key"
   | "x";
 
 export function Icon({
@@ -169,6 +174,21 @@ export function Icon({
       return (
         <svg {...s}>
           <path d="M6 6l12 12M18 6L6 18" />
+        </svg>
+      );
+    case "key":
+      // A round-headed key: bow (head) on the left, bit (teeth) on the right.
+      return (
+        <svg {...s}>
+          <circle cx="8" cy="8" r="4" />
+          <path d="M11 11l8 8M17 17l2-2M19 19l2-2" />
+        </svg>
+      );
+    case "maximize":
+      // Diagonal arrows pointing outward — full-screen / expand affordance.
+      return (
+        <svg {...s}>
+          <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3" />
         </svg>
       );
     case "folderPlus":
@@ -320,11 +340,38 @@ export function Icon({
           <path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" />
         </svg>
       );
+    case "puzzle":
+      // A clean four-block "extensions" glyph (2×2 grid, top-right block nudged out)
+      // — reads as "modules / add-ons" without the visual noise of a jigsaw piece.
+      return (
+        <svg {...s}>
+          <rect x="3.5" y="3.5" width="7" height="7" rx="1.8" />
+          <rect x="13.5" y="3.5" width="7" height="7" rx="1.8" />
+          <rect x="3.5" y="13.5" width="7" height="7" rx="1.8" />
+          <rect x="13.5" y="13.5" width="7" height="7" rx="1.8" />
+        </svg>
+      );
     case "audit":
       return (
         <svg {...s}>
           <path d="M7 4h10a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" />
           <path d="M8.5 9h7M8.5 13h7M8.5 17H13" />
+        </svg>
+      );
+    case "terminal":
+      // A command-prompt / terminal window — the slash-command semantic mark.
+      return (
+        <svg {...s}>
+          <rect x="3" y="4" width="18" height="16" rx="2.5" />
+          <path d="M7 9l3 2.2L7 13.4M12.5 14h4.5" />
+        </svg>
+      );
+    case "listChecks":
+      // A checklist — two checked items + one pending — the "rules / standards" mark.
+      return (
+        <svg {...s}>
+          <path d="M4 6.5l1.4 1.4L8 5.2M4 13l1.4 1.4L8 11.7" />
+          <path d="M11 6.5h9M11 13h9M4 19h16" />
         </svg>
       );
     case "chevronRight":

@@ -28,6 +28,7 @@ from .permissions import Mode, PermissionEngine
 from .project import load_agents_md
 from .roots import RootDir, normalize_roots, render_context
 from .providers import ProviderClient, ProviderRouter
+from .commands import CommandLoader, command_catalog_text
 from .overrides import RiskOverrideStore
 from .secrets import SecretStore, state_dir
 from .skills import SkillLoader, skill_catalog_text, skill_tools
@@ -35,7 +36,7 @@ from .tools import ToolRegistry
 from .tools.ask import ask_user_tool
 from .tools.directories import request_directory_tool
 from .tools.plan import propose_plan_tool
-from .tools.subagent import explorer_tools
+from .tools.subagent import delegate_tools, explorer_tools
 from .web import make_web_fetch_tool, make_web_search_tool
 from .workspace_trust import WorkspaceTrustStore
 from .tools.shell import LocalExecutor
@@ -133,6 +134,9 @@ def build_engine(
     channel_buffer: Optional[Any] = None,
     routing_targets: Optional[list[str]] = None,
     connector_filter: Optional[set[str]] = None,
+    rule_resolver: Optional[Any] = None,
+    persona_registry: Optional[Any] = None,
+    command_loader: Optional[CommandLoader] = None,
 ) -> TurnEngine:
     ws = Path(workspace).expanduser().resolve() if workspace else None
     if agent.needs_workspace and ws is None:
@@ -223,6 +227,19 @@ def build_engine(
                 model_settings=model_settings,
             )
         )
+        # Generic persona delegation (E3): let the code agent fan subtasks out to any
+        # installed persona's own engine. Same low-risk/plan-mode pattern as explore, so
+        # independent delegations parallelize. No-op when no registry is wired (TUI/direct).
+        if persona_registry is not None:
+            registry.register_all(
+                delegate_tools(
+                    persona_registry=persona_registry,
+                    workspace=ws,
+                    provider=provider,
+                    model=model,
+                    model_settings=model_settings,
+                )
+            )
     # Scheduling: knowledge surfaces with a workspace can set up scheduled tasks (origin = this
     # session). Code stays out (it fans out to explorers instead).
     if task_store is not None and ws is not None and agent.family == "knowledge":
@@ -265,6 +282,13 @@ def build_engine(
     if catalog:
         instructions = f"{instructions}\n\n{catalog}"
 
+    # Slash commands (E3) — user-triggered prompt templates. Informational only (commands
+    # aren't agent tools); this lets the agent reference available workflows in conversation.
+    if command_loader is not None:
+        command_catalog = command_catalog_text(command_loader)
+        if command_catalog:
+            instructions = f"{instructions}\n\n{command_catalog}"
+
     # User-local risk overrides (mainly to relax MCP's conservative default). Empty store →
     # no-op; never written by persona loading (the no-self-grant rule).
     risk_overrides = RiskOverrideStore(state_dir() / "risk_overrides.json").resolver()
@@ -278,6 +302,7 @@ def build_engine(
         auto_allow_tools=set(config.auto_allow),
         roots=root_list or None,
         risk_overrides=risk_overrides,
+        rule_resolver=rule_resolver,
     )
     # The plan-mode exit door. Always registered (surfaces can flip a live session into
     # plan mode via set_mode, and the registry is fixed at build); the engine rejects the

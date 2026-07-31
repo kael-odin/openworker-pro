@@ -19,6 +19,33 @@ import aisuite as ai
 
 from ..web.guard import check_url
 
+# Decoupled login-state lookup: the manager registers a callback that resolves a URL
+# to an absolute storageState.json path (or None) when the agent opens a browser URL.
+# This keeps browser_automation.py manager-free; the binding is set in manager.__init__.
+_login_state_resolver: Optional[Callable[[str], Optional[str]]] = None
+
+
+def set_login_state_resolver(fn: Optional[Callable[[str], Optional[str]]]) -> None:
+    """Register the callback ``browser_open_url`` uses to inject persisted login state.
+
+    ``fn(url) -> abs_path | None``. Wired by the manager (which owns the
+    BrowserLoginRegistry); None (the default) means no login state is known and the
+    browser opens a clean context as before.
+    """
+    global _login_state_resolver
+    _login_state_resolver = fn
+
+
+def _resolve_login_state(url: str) -> Optional[str]:
+    """Return the absolute storageState.json path for ``url``'s host, or None."""
+    fn = _login_state_resolver
+    if fn is None:
+        return None
+    try:
+        return fn(url)
+    except Exception:
+        return None
+
 
 def _meta(
     name: str, *, approval: bool = False, capabilities: Optional[list[str]] = None
@@ -68,6 +95,7 @@ class _BrowserController:
         self._browser = None
         self._context = None
         self._page = None
+        self._storage_state: Optional[str] = None  # what the current context was built with
         self._error: Optional[str] = None
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="coworker-browser"
@@ -114,10 +142,19 @@ class _BrowserController:
             "details": str(exc),
         }
 
-    def page(self):
+    def page(self, storage_state: Optional[str] = None):
         with self._lock:
             if self._error:
                 return None, {"error": self._error}
+            # If a login-state file is requested and the current context was created
+            # without it (or vice-versa), tear down so we rebuild with the right state.
+            # ``_storage_state`` tracks what the *current* context was built with.
+            need_rebuild = (
+                self._page is not None
+                and getattr(self, "_storage_state", None) != storage_state
+            )
+            if need_rebuild:
+                self._teardown_context_locked()
             if self._page is not None:
                 return self._page, None
             try:
@@ -125,10 +162,17 @@ class _BrowserController:
 
                 self._playwright = sync_playwright().start()
                 self._browser = self._playwright.chromium.launch(headless=False)
-                self._context = self._browser.new_context(
-                    viewport={"width": 1280, "height": 900}
-                )
+                ctx_kwargs: dict[str, Any] = {
+                    "viewport": {"width": 1280, "height": 900}
+                }
+                # Inject persisted login state (cookies + localStorage) when the caller
+                # resolved one for this URL's host. Lets agents reuse a captured login
+                # session without re-authenticating.
+                if storage_state and Path(storage_state).is_file():
+                    ctx_kwargs["storage_state"] = storage_state
+                self._context = self._browser.new_context(**ctx_kwargs)
                 self._page = self._context.new_page()
+                self._storage_state = storage_state
                 self._touch(
                     open=True, status="open", last_action="open browser", last_error=""
                 )
@@ -136,6 +180,18 @@ class _BrowserController:
             except Exception as exc:
                 self._touch(open=False, status="error", last_error=str(exc))
                 return None, self._setup_error(exc)
+
+    def _teardown_context_locked(self) -> None:
+        """Close just the context/page (keep the browser process alive for rebuild)."""
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        finally:
+            self._context = None
+            self._page = None
+            self._storage_state = None
 
     def _submit(self, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         return self._executor.submit(fn).result()
@@ -159,6 +215,7 @@ class _BrowserController:
                 self._browser = None
                 self._context = None
                 self._page = None
+                self._storage_state = None
                 self._touch(open=False, status="closed", url="", title="", controls=[])
             return {"ok": True}
 
@@ -197,10 +254,12 @@ class _BrowserController:
                 )
                 return {"error": str(exc)}
 
-    def call(self, action: str, fn: Callable[[Any], dict[str, Any]]) -> dict[str, Any]:
+    def call(
+        self, action: str, fn: Callable[[Any], dict[str, Any]], *, storage_state: Optional[str] = None
+    ) -> dict[str, Any]:
         def run() -> dict[str, Any]:
             with self._lock:
-                page, err = self.page()
+                page, err = self.page(storage_state=storage_state)
                 if err:
                     return err
                 self._touch(last_action=action, last_result="running", last_error="")
@@ -340,12 +399,17 @@ def make_browser_automation_tools() -> list[Callable[..., Any]]:
         blocked = check_url(url)
         if blocked:
             return {"error": blocked}
+        # If we hold a captured login session for this URL's host, rebuild the browser
+        # context with that storageState so the agent navigates already-authenticated.
+        # No-op when no login state is known (clean context, as before).
+        storage_state = _resolve_login_state(url)
         return _BROWSER.call(
             "open_url",
             lambda page: (
                 page.goto(url, wait_until=wait_until, timeout=30000),
                 {"ok": True, "url": page.url},
             )[1],
+            storage_state=storage_state,
         )
 
     browser_open_url.__name__ = "browser_open_url"

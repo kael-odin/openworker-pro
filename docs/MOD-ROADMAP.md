@@ -64,10 +64,10 @@
 
 **目标**：从微信/企微触发 agent、接收通知、双向对话。中文用户场景刚需。
 
-**合规红线**：Halo 的 `weixin-ilink.provider.ts` / `ilink-api.ts` 是逆向微信个人版协议，**法律风险高，不移植**。只做合规路径：
+**可选**：Halo 的 `weixin-ilink.provider.ts` / `ilink-api.ts` 连接个人微信
 - **企微群机器人 webhook**（已在功能 1 覆盖，此处复用）。
 - **企微自建应用 API**（需企业 corpid/secret，正规 OAuth，合规）：收消息（回调）+ 发消息 + 通讯录。
-- 个人微信：明确不支持，README 注明。
+
 
 **后端**（`coworker/connectors/wecom_app/`，新建）：
 - `provider.py`：企微应用 API 封装（access_token 管理、消息加解密、回调校验）。

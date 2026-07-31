@@ -57,6 +57,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { ScheduledView } from "./components/ScheduledView";
 import { RightRail } from "./components/RightRail";
 import { IntegrationsView } from "./components/IntegrationsView";
+import { CustomizeView } from "./components/CustomizeView";
 import { SettingsView } from "./components/SettingsView";
 import { PersonaView } from "./components/PersonaView";
 import { AuditView } from "./components/AuditView";
@@ -229,10 +230,10 @@ export function App() {
   const [scheduledOpenId, setScheduledOpenId] = useState<string | null>(null);
   const [gateCreate, setGateCreate] = useState(false);
   // Which Settings section the full-page Settings surface opens on (§ Settings-as-page).
-  const [settingsTab, setSettingsTab] = useState<"appearance" | "models" | "voice" | "personas">(
+  const [settingsTab, setSettingsTab] = useState<"appearance" | "models" | "voice" | "personas" | "notify" | "digital">(
     "appearance",
   );
-  const openSettings = (tab: "appearance" | "models" | "voice" | "personas" = "appearance") => {
+  const openSettings = (tab: "appearance" | "models" | "voice" | "personas" | "notify" | "digital" = "appearance") => {
     setSettingsTab(tab);
     setSurface("settings");
   };
@@ -241,7 +242,7 @@ export function App() {
   // load; corrected by loadSettings.
   const [modelReady, setModelReady] = useState(true);
   const [surface, setSurface] = useState<
-    "session" | "scheduled" | "integrations" | "audit" | "inbox" | "persona" | "settings"
+    "session" | "scheduled" | "customize" | "integrations" | "audit" | "inbox" | "persona" | "settings"
   >("session");
   // A remembered Scheduled-detail target must not outlive the surface (see the
   // scheduledOpenId comment above): nav re-entry lands on the list, never a
@@ -470,7 +471,10 @@ export function App() {
       getHealth()
         .then(async (h) => {
           if (cancelled) return;
-          setModel(h.model);
+          // The sidecar's /v1/health returns a truncated body {status:"ok"} (no model)
+          // when the request isn't authenticated — guard so we don't clobber a valid
+          // model with undefined and crash downstream consumers (.includes on undefined).
+          if (h.model) setModel(h.model);
           // First-run setup wizard (desktop): show until the user completes/dismisses it.
           if (isTauri()) {
             getSettings()
@@ -1166,9 +1170,12 @@ export function App() {
   const { t } = useT();
   // Curated labels read "Claude Opus 4.8 · Anthropic" — the provider suffix is dropdown context,
   // noise in a facts line. Fall back to the raw id without its provider prefix.
+  // Guard `model` — getHealth()/ready events can briefly set it to undefined when the
+  // sidecar omits the field, which would crash the render (.includes on undefined).
+  const safeModel = model || "";
   const modelDisplay =
-    modelLabels[model]?.split(" · ")[0] ||
-    (model.includes(":") ? model.split(":").slice(1).join(":") : model);
+    modelLabels[safeModel]?.split(" · ")[0] ||
+    (safeModel.includes(":") ? safeModel.split(":").slice(1).join(":") : safeModel);
   // Persona name dropped for this release (owner ask 2026-07-22): personas are hidden,
   // so "Coworker" read as noise. The model (+ project folder) are the real fixed facts.
   const subtitleParts = [modelDisplay];
@@ -1302,7 +1309,7 @@ export function App() {
         <Onboarding
           onDone={(next) => {
             setOnboarding(false);
-            getHealth().then((h) => setModel(h.model)).catch(() => {});
+            getHealth().then((h) => h.model && setModel(h.model)).catch(() => {});
             loadSettings(); // pick up a model connected during setup (clears the composer chip)
             if (next === "gallery") {
               // The specialists tip: land on Settings ▸ Personas, where the Gallery link lives.
@@ -1345,9 +1352,11 @@ export function App() {
           setSurface("scheduled");
         }}
         onOpenIntegrations={() => setSurface("integrations")}
+        onOpenCustomize={() => setSurface("customize")}
         onOpenAudit={() => setSurface("audit")}
         onOpenInbox={() => setSurface("inbox")}
         scheduledActive={surface === "scheduled"}
+        customizeActive={surface === "customize"}
         integrationsActive={surface === "integrations"}
         auditActive={surface === "audit"}
         inboxActive={surface === "inbox"}
@@ -1360,7 +1369,10 @@ export function App() {
           onOpenRun={openRunSession}
           onRunNow={runTaskNow}
           initialOpenId={scheduledOpenId}
+          onOpenSettings={(tab) => openSettings(tab as "appearance" | "models" | "voice" | "personas" | "notify" | "digital")}
         />
+      ) : surface === "customize" ? (
+        <CustomizeView />
       ) : surface === "integrations" ? (
         <IntegrationsView />
       ) : surface === "settings" ? (

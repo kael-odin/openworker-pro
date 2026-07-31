@@ -466,6 +466,39 @@ def create_app(manager: SessionManager) -> FastAPI:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "consent": summaries, "personas": reg.list_all()}
 
+    # -- Persona marketplace sources (批次 E4 后续) ---------------------------
+    # Browse + install personas from git marketplace repos (mirrors the plugin
+    # marketplace routes). Install reuses the consent path above — lands disabled.
+    @app.get("/v1/personas/sources")
+    def persona_sources() -> dict[str, Any]:
+        return {"sources": manager.list_persona_sources()}
+
+    @app.post("/v1/personas/sources")
+    def add_persona_source(body: dict) -> dict[str, Any]:
+        return manager.add_persona_source(
+            str(body.get("name", "")), str(body.get("url", "")),
+            source_type=str(body.get("source_type", "git") or "git"),
+        )
+
+    @app.patch("/v1/personas/sources/{source_id}")
+    def update_persona_source(source_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_persona_source(source_id, body)
+
+    @app.delete("/v1/personas/sources/{source_id}")
+    def remove_persona_source(source_id: str) -> dict[str, Any]:
+        return manager.remove_persona_source(source_id)
+
+    @app.get("/v1/personas/sources/{source_id}/catalog")
+    def persona_catalog(source_id: str) -> dict[str, Any]:
+        return manager.list_persona_catalog(source_id)
+
+    @app.post("/v1/personas/sources/{source_id}/install")
+    def install_persona_from_source(source_id: str, body: dict) -> dict[str, Any]:
+        persona_id = str((body or {}).get("persona_id", "")).strip()
+        if not persona_id:
+            return {"ok": False, "error": "persona_id is required"}
+        return manager.install_persona_from_source(source_id, persona_id)
+
     @app.get("/v1/cloud/gallery/{slug}")
     def cloud_gallery_detail(slug: str) -> dict[str, Any]:
         """Solo page for one gallery coworker: publisher pitch + capabilities
@@ -559,6 +592,198 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.get("/v1/skills")
     def skills() -> dict[str, Any]:
         return {"skills": manager.list_skills()}
+
+    # -- skill sources + install/uninstall (批次 E1) -----------------------------
+    # Browse a source's catalog, install a skill into state_dir()/skills, uninstall, and CRUD
+    # the source list. Mirrors the DHP source routes.
+    @app.get("/v1/skills/sources")
+    def skill_sources() -> dict[str, Any]:
+        return {"sources": manager.list_skill_sources()}
+
+    @app.post("/v1/skills/sources")
+    def add_skill_source(body: dict) -> dict[str, Any]:
+        return manager.add_skill_source(
+            body.get("name", ""), body.get("url", ""),
+            source_type=body.get("source_type", "http"),
+        )
+
+    @app.patch("/v1/skills/sources/{source_id}")
+    def update_skill_source(source_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_skill_source(source_id, body)
+
+    @app.delete("/v1/skills/sources/{source_id}")
+    def remove_skill_source(source_id: str) -> dict[str, Any]:
+        return manager.remove_skill_source(source_id)
+
+    @app.get("/v1/skills/sources/{source_id}/catalog")
+    def skill_source_catalog(source_id: str) -> dict[str, Any]:
+        return manager.list_skill_catalog(source_id)
+
+    @app.post("/v1/skills/install")
+    def install_skill(body: dict) -> dict[str, Any]:
+        return manager.install_skill(body.get("source_id", ""), body.get("name", ""))
+
+    @app.delete("/v1/skills/{name}")
+    def uninstall_skill(name: str) -> dict[str, Any]:
+        return manager.uninstall_skill(name)
+
+    # -- Rules (allow/deny/ask permission layer, 批次 E2) -------------------------
+    # CRUD for user-facing tool-permission rules. Each rule = glob pattern (matched
+    # against the tool name) + action (allow/deny/ask). The agent resolves these
+    # alongside the lower-level risk overrides; Rules are the user's explicit statement.
+    @app.get("/v1/rules")
+    def rules() -> dict[str, Any]:
+        return {"rules": manager.list_rules()}
+
+    @app.post("/v1/rules")
+    def add_rule(body: dict) -> dict[str, Any]:
+        return manager.add_rule(
+            body.get("pattern", ""), body.get("action", ""),
+            reason=body.get("reason", ""),
+        )
+
+    @app.patch("/v1/rules/{rule_id}")
+    def update_rule(rule_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_rule(rule_id, body)
+
+    @app.delete("/v1/rules/{rule_id}")
+    def remove_rule(rule_id: str) -> dict[str, Any]:
+        return manager.remove_rule(rule_id)
+
+    # -- Hooks (pre_run/post_run, 批次 E2) ----------------------------------------
+    # CRUD for run-lifecycle hooks. A hook fires on pre_run (before engine build, can
+    # skip) or post_run (after status determined). CRUD only — firing is internal to
+    # _run_scheduled_task.
+    @app.get("/v1/hooks")
+    def hooks() -> dict[str, Any]:
+        return {"hooks": manager.list_hooks()}
+
+    @app.post("/v1/hooks")
+    def add_hook(body: dict) -> dict[str, Any]:
+        return manager.add_hook(
+            body.get("name", ""), body.get("event", ""), body.get("command", ""),
+            match=body.get("match", "*"),
+        )
+
+    @app.patch("/v1/hooks/{hook_id}")
+    def update_hook(hook_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_hook(hook_id, body)
+
+    @app.delete("/v1/hooks/{hook_id}")
+    def remove_hook(hook_id: str) -> dict[str, Any]:
+        return manager.remove_hook(hook_id)
+
+    # -- Commands (slash prompt templates, 批次 E3) ------------------------------
+    # Read-only discovery of state_dir()/commands/<name>/COMMAND.md. The frontend lists
+    # these for the Composer "/" autocomplete (GET /v1/commands) and fetches the full
+    # prompt_template when the user selects one (GET /v1/commands/{name}).
+    @app.get("/v1/commands")
+    def commands() -> dict[str, Any]:
+        return {"commands": manager.list_commands()}
+
+    @app.get("/v1/commands/{name}")
+    def get_command(name: str):
+        c = manager.get_command(name)
+        if c is None:
+            return JSONResponse(
+                status_code=404, content={"error": f"unknown command: {name}"}
+            )
+        return {"command": c}
+
+    # -- Plugins (marketplace install/uninstall, 批次 E4) ----------------------
+    # Claude-Code-format plugins from marketplace sources (the official
+    # claude-plugins-official.git is built in). Browse a source's catalog, install a named
+    # plugin into state_dir()/plugins, uninstall, and check for updates. Mirrors the skill
+    # source routes.
+    @app.get("/v1/plugins")
+    def plugins() -> dict[str, Any]:
+        return {"plugins": manager.list_plugins()}
+
+    @app.get("/v1/plugins/sources")
+    def plugin_sources() -> dict[str, Any]:
+        return {"sources": manager.list_plugin_sources()}
+
+    @app.post("/v1/plugins/sources")
+    def add_plugin_source(body: dict) -> dict[str, Any]:
+        return manager.add_plugin_source(
+            body.get("name", ""), body.get("url", ""),
+            source_type=body.get("source_type", "git"),
+        )
+
+    @app.patch("/v1/plugins/sources/{source_id}")
+    def update_plugin_source(source_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_plugin_source(source_id, body)
+
+    @app.delete("/v1/plugins/sources/{source_id}")
+    def remove_plugin_source(source_id: str) -> dict[str, Any]:
+        return manager.remove_plugin_source(source_id)
+
+    @app.get("/v1/plugins/sources/{source_id}/catalog")
+    def plugin_source_catalog(source_id: str) -> dict[str, Any]:
+        return manager.list_plugin_catalog(source_id)
+
+    @app.post("/v1/plugins/install")
+    def install_plugin(body: dict) -> dict[str, Any]:
+        return manager.install_plugin(body.get("source_id", ""), body.get("name", ""))
+
+    @app.delete("/v1/plugins/{name}")
+    def uninstall_plugin(name: str) -> dict[str, Any]:
+        return manager.uninstall_plugin(name)
+
+    @app.get("/v1/plugins/updates")
+    def plugin_updates() -> dict[str, Any]:
+        return manager.check_plugin_updates()
+
+    @app.post("/v1/plugins/{name}/update")
+    def update_plugin(name: str) -> dict[str, Any]:
+        return manager.update_plugin(name)
+
+    # -- Browser login state (E5) ------------------------------------------------
+    @app.get("/v1/browser/logins")
+    def browser_logins() -> dict[str, Any]:
+        return {"logins": manager.list_browser_logins()}
+
+    @app.post("/v1/browser/logins")
+    def add_browser_login(body: dict) -> dict[str, Any]:
+        return manager.add_browser_login(
+            body.get("url", ""), body.get("label", ""), mode=body.get("mode", "playwright")
+        )
+
+    @app.post("/v1/browser/logins/{login_id}/capture")
+    def begin_browser_login_capture(login_id: str) -> dict[str, Any]:
+        return manager.begin_browser_login_capture(login_id)
+
+    @app.get("/v1/browser/logins/capture-state")
+    def browser_login_capture_state() -> dict[str, Any]:
+        return manager.browser_login_capture_state()
+
+    @app.post("/v1/browser/logins/{login_id}/capture/confirm")
+    def confirm_browser_login_capture(login_id: str) -> dict[str, Any]:
+        return manager.confirm_browser_login_capture(login_id)
+
+    @app.post("/v1/browser/logins/capture/cancel")
+    def cancel_browser_login_capture() -> dict[str, Any]:
+        return manager.cancel_browser_login_capture()
+
+    @app.post("/v1/browser/logins/{login_id}/cookies")
+    def save_browser_login_cookies(login_id: str, body: dict) -> dict[str, Any]:
+        return manager.save_browser_login_cookies(login_id, body.get("cookie_json", ""))
+
+    @app.get("/v1/browser/logins/export")
+    def export_browser_logins() -> dict[str, Any]:
+        return manager.export_browser_logins()
+
+    @app.post("/v1/browser/logins/import")
+    def import_browser_logins(body: dict) -> dict[str, Any]:
+        return manager.import_browser_logins(body.get("payload", ""))
+
+    @app.delete("/v1/browser/logins/{login_id}")
+    def remove_browser_login(login_id: str) -> dict[str, Any]:
+        return manager.remove_browser_login(login_id)
+
+    @app.get("/v1/digital-humans/{slug}/logins-health")
+    def digital_human_logins_health(slug: str) -> dict[str, Any]:
+        return manager.dhp_logins_health(slug)
 
     @app.get("/v1/workspaces/recent")
     def recent_workspaces() -> dict[str, Any]:
@@ -1563,14 +1788,41 @@ def create_app(manager: SessionManager) -> FastAPI:
         return manager.list_digital_humans(category=category)
 
     # Fixed-path routes registered BEFORE the {slug} route so FastAPI doesn't match
-    # "instances" as a slug.
+    # "instances" / "sources" as a slug.
+    @app.get("/v1/digital-humans/sources")
+    def digital_human_sources_list() -> dict[str, Any]:
+        return manager.list_dhp_sources()
+
+    @app.post("/v1/digital-humans/sources")
+    def digital_human_sources_add(body: dict) -> dict[str, Any]:
+        name = body.get("name") or ""
+        url = body.get("url") or ""
+        source_type = body.get("source_type") or "dhp"
+        return manager.add_dhp_source(name, url, source_type=source_type)
+
+    @app.patch("/v1/digital-humans/sources/{source_id}")
+    def digital_human_sources_update(source_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_dhp_source(source_id, body or {})
+
+    @app.delete("/v1/digital-humans/sources/{source_id}")
+    def digital_human_sources_remove(source_id: str) -> dict[str, Any]:
+        return manager.remove_dhp_source(source_id)
+
     @app.get("/v1/digital-humans/instances")
     def digital_human_instances() -> dict[str, Any]:
         return manager.list_dh_instances()
 
+    @app.patch("/v1/digital-humans/instances/{instance_id}")
+    def digital_human_update(instance_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_digital_human(instance_id, body or {})
+
     @app.delete("/v1/digital-humans/instances/{instance_id}")
     def digital_human_uninstall(instance_id: str) -> dict[str, Any]:
         return manager.uninstall_digital_human(instance_id)
+
+    @app.get("/v1/digital-humans/instances/{instance_id}/upgrade-check")
+    def digital_human_upgrade_check(instance_id: str) -> dict[str, Any]:
+        return manager.dhp_upgrade_check(instance_id)
 
     @app.get("/v1/digital-humans/{slug}")
     def digital_human_detail(slug: str) -> dict[str, Any]:
@@ -1580,6 +1832,26 @@ def create_app(manager: SessionManager) -> FastAPI:
     def digital_human_install(slug: str, body: dict) -> dict[str, Any]:
         config = body.get("config") or {}
         return manager.install_digital_human(slug, config)
+
+    @app.get("/v1/digital-humans/{slug}/mcp-health")
+    def digital_human_mcp_health(slug: str) -> dict[str, Any]:
+        return manager.dhp_mcp_health(slug)
+
+    @app.get("/v1/digital-humans/{slug}/skills-health")
+    def digital_human_skills_health(slug: str) -> dict[str, Any]:
+        return manager.dhp_skills_health(slug)
+
+    @app.get("/v1/digital-humans/{slug}/plugins-health")
+    def digital_human_plugins_health(slug: str) -> dict[str, Any]:
+        return manager.dhp_plugins_health(slug)
+
+    @app.get("/v1/digital-humans/{slug}/commands-health")
+    def digital_human_commands_health(slug: str) -> dict[str, Any]:
+        return manager.dhp_commands_health(slug)
+
+    @app.get("/v1/digital-humans/{slug}/subagents-health")
+    def digital_human_subagents_health(slug: str) -> dict[str, Any]:
+        return manager.dhp_subagents_health(slug)
 
     @app.websocket("/ws/session/{session_id}")
     async def ws_session(ws: WebSocket, session_id: str) -> None:

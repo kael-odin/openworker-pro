@@ -157,10 +157,12 @@ interface Props {
   onOpenScheduled: () => void;
   // Scheduled-band row click: open the Automations surface ON that automation (UX-023).
   onOpenAutomation: (id: string) => void;
+  onOpenCustomize: () => void;
   onOpenIntegrations: () => void;
   onOpenAudit: () => void;
   onOpenInbox: () => void;
   scheduledActive: boolean;
+  customizeActive: boolean;
   integrationsActive: boolean;
   auditActive: boolean;
   inboxActive: boolean;
@@ -1061,6 +1063,22 @@ export function Sidebar(props: Props) {
         >
           <Icon name="clock" size={15} className="shrink-0" />
           <span className="flex-1">{t("sidebar.automations")}</span>
+        </button>
+      </div>
+
+      {/* Customize: a first-class nav row — the extension hub (Plugins/MCPs/Skills/
+          Subagents/Rules/Commands/Hooks). Sits right below Automations. */}
+      <div className="px-2.5 mt-1">
+        <button
+          className={
+            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-[13px] text-left hover:bg-paper hover:text-ink " +
+            (props.customizeActive ? "text-ink bg-paper" : "text-muted")
+          }
+          data-testid="nav-customize"
+          onClick={props.onOpenCustomize}
+        >
+          <Icon name="puzzle" size={15} className="shrink-0" />
+          <span className="flex-1">{t("sidebar.customize")}</span>
         </button>
       </div>
 

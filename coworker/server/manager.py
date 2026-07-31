@@ -190,14 +190,81 @@ class SessionManager:
         # process singleton so agents.get_agent resolves persona ids (incl. third-party) here.
         self.personas = PersonaRegistry(state_path=base / "personas.json")
         set_persona_registry(self.personas)
-        # DHP digital-human registry + installed instances (批次 B). The registry resolves specs
-        # from a local DHP repo clone (OPENWORKER_DHP_REPO env, or a sibling dir at dev time).
-        from ..digital_human import DhpRegistry, InstanceStore
+        # Persona marketplace sources (E4 后续) — git repos of *.md persona manifests the user
+        # can browse + install from. Mirrors plugin_sources / skill_sources. No builtin source
+        # today (no Anthropic-official persona marketplace yet); the user adds their own. The
+        # empty-store guard (builtins can't be deleted) still applies if we ship one later.
+        from ..personas import PersonaSourceManager
+
+        self.persona_sources = PersonaSourceManager(self._prefs, self._save_prefs)
+        self.persona_sources.ensure_builtins()
+        self._persona_cache_root = base / "persona_sources_cache"
+        # DHP digital-human registry + installed instances (批次 B, 多源化于批次 D2). Sources are
+        # persisted in prefs (dhp_sources) and the default HTTP source is re-asserted on startup, so
+        # the store is never empty even without a local clone or OPENWORKER_DHP_REPO env — the root
+        # cause of the empty-store bug.
+        from ..digital_human import DhpRegistry, InstanceStore, SourceManager
+
+        self.dhp_sources = SourceManager(self._prefs, self._save_prefs)
+        self.dhp_sources.ensure_builtins()
+        # If a local DHP repo is configured via env, register it as an additional local source so
+        # dev/test still benefits from the clone without losing the default HTTP source.
         import os as _os
 
-        _dhp_repo = _os.environ.get("OPENWORKER_DHP_REPO") or str(base / "digital-human-protocol")
-        self.dhp_registry = DhpRegistry(_dhp_repo if Path(_dhp_repo).is_dir() else None)
+        _env_repo = _os.environ.get("OPENWORKER_DHP_REPO")
+        if _env_repo and Path(_env_repo).is_dir():
+            existing = {s.url for s in self.dhp_sources.list()}
+            if _env_repo not in existing:
+                self.dhp_sources.add("本地 DHP 仓库", _env_repo, source_type="local")
+        self.dhp_registry = DhpRegistry(self.dhp_sources.list(enabled_only=True))
         self.dhp_instances = InstanceStore(base / "digital-humans.json", secrets=self.secrets)
+        # Skill sources (批次 E1) — same prefs-persisted SourceManager pattern as DHP. Skills
+        # install into state_dir()/skills/<name>/ (the SkillLoader discovery dir); git-source
+        # clones are cached under state_dir()/skill_sources_cache/ and shared across installs.
+        from ..skills import SkillSourceManager
+
+        self.skill_sources = SkillSourceManager(self._prefs, self._save_prefs)
+        self.skill_sources.ensure_builtins()
+        self._skill_cache_root = base / "skill_sources_cache"
+        # Rules (allow/deny/ask permission layer, E2) + Hooks (pre_run/post_run, E2) —
+        # same prefs-persisted store pattern as skill_sources. Rules are the user-facing
+        # permission layer above overrides.py's risk-class relaxer; hooks fire around
+        # scheduled runs (pre_run before engine build, post_run in the finally block).
+        from ..rules import RuleStore
+        from ..hooks import HookStore
+
+        self.rule_store = RuleStore(self._prefs, self._save_prefs)
+        self.hooks = HookStore(self._prefs, self._save_prefs)
+        # Commands (E3) — reusable slash command templates (`/name`). Read-only discovery of
+        # state_dir()/commands/<name>/COMMAND.md; command files are hand-authored or installed
+        # via E4 plugin packaging. Same loader pattern as SkillLoader, but commands are
+        # user-triggered prompt templates, not agent tools.
+        from ..commands import CommandLoader
+
+        self.command_loader = CommandLoader([state_dir() / "commands"])
+        # Plugins (E4) — Claude-Code-format distribution units installed from marketplace
+        # sources. Plugins live under state_dir()/plugins/<name>/; their skills/ and commands/
+        # subfolders are picked up by the loaders above (see _plugin_skill_dirs /
+        # _plugin_command_dirs). The official Anthropic marketplace is built in.
+        from ..plugins import PluginSourceManager, PluginRegistry
+
+        self.plugin_sources = PluginSourceManager(self._prefs, self._save_prefs)
+        self.plugin_sources.ensure_builtins()
+        self._plugin_cache_root = base / "plugin_sources_cache"
+        self.plugin_registry = PluginRegistry(self._prefs, self._save_prefs)
+        # Browser login state (E5) — persisted login sessions (Playwright storageState or
+        # pasted cookies) under state_dir()/browser_profiles/<id>/. When the agent opens a
+        # browser URL whose host matches a captured login, browser_automation rebuilds
+        # the context with that storageState so the agent is already authenticated.
+        from ..browser_logins import BrowserLoginRegistry
+
+        self.browser_logins = BrowserLoginRegistry(self._prefs, self._save_prefs)
+        self._browser_profiles_dir = base / "browser_profiles"
+        self._browser_profiles_dir.mkdir(parents=True, exist_ok=True)
+        # Wire the decoupled resolver used by browser_open_url.
+        from ..connectors.browser_automation import set_login_state_resolver
+
+        set_login_state_resolver(self._resolve_login_state_for_url)
         # Inbox (cross-session human-attention queue), routing (named inboxes + Slack/Telegram
         # bindings), the Unattended toggle, and self-wake records.
         self.inbox = InboxStore(base / "inbox.json")
@@ -466,6 +533,13 @@ class SessionManager:
             routing_targets=self._routing_targets(session_id, agent),
             # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
             connector_filter=self.effective_connectors(session_id, agent_name),
+            # User-facing permission rules (E2): allow/deny/ask takes precedence over
+            # risk classification in the permission engine.
+            rule_resolver=self.rule_store.resolver(),
+            # Persona delegation (E3) + slash commands (E3): let code-family agents
+            # delegate subtasks to any installed persona, and surface available /commands.
+            persona_registry=self.personas,
+            command_loader=self._engine_command_loader(),
         )
         # An automation run rebuilt here (manual "Run now" over WS, durable resume) still
         # carries its task's standing allowances — the rules live on the task record.
@@ -1224,6 +1298,238 @@ class SessionManager:
     def browser_close(self) -> dict[str, Any]:
         return browser_close_session()
 
+    # -- Browser login state (E5) ----------------------------------------------
+
+    def _resolve_login_state_for_url(self, url: str) -> Optional[str]:
+        """Resolver wired into browser_automation: URL host → abs storageState path or None.
+
+        Also normalizes pasted-cookie entries: if a login was captured via cookie paste
+        (no storageState.json yet), lazily convert cookies.json → storageState.json on
+        first use so browser_open_url has a single code path.
+        """
+        from ..browser_logins import match_login_for_url
+
+        login = match_login_for_url(url, self.browser_logins.list())
+        if login is None or not login.has_state:
+            return None
+        return self._login_state_abs_path(login)
+
+    def _login_state_abs_path(self, login) -> Optional[str]:
+        """Absolute path to a usable storageState.json for ``login``, converting cookies if needed."""
+        from ..browser_login_capture import cookies_to_storage_state
+
+        state = state_dir()
+        # Preferred: a Playwright-captured storageState.json already on disk.
+        if login.storage_state_path:
+            p = state / login.storage_state_path
+            if p.is_file():
+                return str(p)
+        # Fallback: convert pasted cookies.json into a storageState.json (lazy, once).
+        if login.cookie_path:
+            cookies_p = state / login.cookie_path
+            if cookies_p.is_file():
+                state_p = cookies_p.parent / "storageState.json"
+                if cookies_to_storage_state(cookies_p, state_p):
+                    return str(state_p)
+        return None
+
+    def list_browser_logins(self) -> list[dict[str, Any]]:
+        from ..browser_login_capture import inspect_login_expiry
+
+        base = state_dir()
+        out = []
+        for l in self.browser_logins.list():
+            d = l.to_dict()
+            d["expiry"] = inspect_login_expiry(l, base)
+            out.append(d)
+        return out
+
+    def add_browser_login(self, url: str, label: str, *, mode: str = "playwright") -> dict[str, Any]:
+        from ..browser_logins import BrowserLoginEntry, make_id, safe_id
+
+        if not url:
+            return {"ok": False, "error": "url is required"}
+        login_id = safe_id(make_id(url))
+        entry = BrowserLoginEntry(id=login_id, url=url, label=label or url, mode=mode)
+        self.browser_logins.add(entry)
+        # Tell the caller whether Playwright is available so the frontend can pick the
+        # right capture flow (headed window vs cookie paste) without a separate probe.
+        from ..browser_login_capture import try_playwright_available
+
+        return {"ok": True, "id": login_id, "entry": entry.to_dict(),
+                "playwright_available": try_playwright_available()}
+
+    def begin_browser_login_capture(self, login_id: str) -> dict[str, Any]:
+        from ..browser_logins import safe_id
+        from ..browser_login_capture import begin_playwright_capture, try_playwright_available
+
+        login = self.browser_logins.get(safe_id(login_id))
+        if login is None:
+            return {"ok": False, "error": f"login {login_id!r} not found"}
+        if not try_playwright_available():
+            return {"ok": False, "fallback": "cookies", "id": login.id}
+        return begin_playwright_capture(login.url, login.id)
+
+    def confirm_browser_login_capture(self, login_id: str) -> dict[str, Any]:
+        from ..browser_logins import safe_id
+        from ..browser_login_capture import confirm_playwright_capture
+
+        login = self.browser_logins.get(safe_id(login_id))
+        if login is None:
+            return {"ok": False, "error": f"login {login_id!r} not found"}
+        result = confirm_playwright_capture(self._browser_profiles_dir, login.id)
+        if result.get("ok"):
+            self.browser_logins.update(login.id, {
+                "mode": "playwright",
+                "storage_state_path": result.get("storage_state_path", ""),
+                "has_state": True,
+                "captured_at": result.get("captured_at", ""),
+            })
+        return result
+
+    def cancel_browser_login_capture(self) -> dict[str, Any]:
+        from ..browser_login_capture import cancel_playwright_capture
+
+        return cancel_playwright_capture()
+
+    def browser_login_capture_state(self) -> dict[str, Any]:
+        from ..browser_login_capture import capture_session_state
+
+        return capture_session_state()
+
+    def save_browser_login_cookies(self, login_id: str, cookie_json: str) -> dict[str, Any]:
+        from ..browser_logins import safe_id
+        from ..browser_login_capture import capture_via_cookies
+
+        login = self.browser_logins.get(safe_id(login_id))
+        if login is None:
+            return {"ok": False, "error": f"login {login_id!r} not found"}
+        result = capture_via_cookies(login.id, cookie_json, self._browser_profiles_dir)
+        if result.get("ok"):
+            self.browser_logins.update(login.id, {
+                "mode": "cookies",
+                "cookie_path": result.get("cookie_path", ""),
+                "has_state": True,
+                "captured_at": result.get("captured_at", ""),
+            })
+        return result
+
+    def remove_browser_login(self, login_id: str) -> dict[str, Any]:
+        from ..browser_logins import safe_id
+        import shutil
+
+        login = self.browser_logins.get(safe_id(login_id))
+        if login is None:
+            return {"ok": False, "error": f"login {login_id!r} not found"}
+        # Delete the profile dir (storageState.json + cookies.json).
+        profile = self._browser_profiles_dir / login.id
+        if profile.is_dir():
+            shutil.rmtree(profile, ignore_errors=True)
+        self.browser_logins.remove(login.id)
+        return {"ok": True}
+
+    def export_browser_logins(self) -> dict[str, Any]:
+        """Export all login entries + their persisted state files as a single JSON blob.
+
+        The result is a portable backup: registry entries (id/url/label/mode/...) plus the
+        inlined contents of each entry's storageState.json / cookies.json. The frontend
+        triggers a file download of this. ``version`` tags the format so future importers
+        can migrate.
+        """
+        import json
+
+        base = state_dir()
+        entries = []
+        for l in self.browser_logins.list():
+            entry = l.to_dict()
+            files: dict[str, str] = {}
+            for rel in (l.storage_state_path, l.cookie_path):
+                if not rel:
+                    continue
+                p = Path(base) / rel
+                if p.is_file():
+                    try:
+                        files[rel] = p.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+            entry["_files"] = files
+            entries.append(entry)
+        return {"version": 1, "logins": entries}
+
+    def import_browser_logins(self, payload: str) -> dict[str, Any]:
+        """Import a previously-exported login backup. Restores registry entries + state files.
+
+        Existing entries with the same id are overwritten (same overwrite-on-add semantics as
+        the registry). State files are written under ``browser_profiles/<id>/`` before the
+        registry entry is added, so has_state is truthful from the moment of import.
+        """
+        import json
+
+        from ..browser_logins import BrowserLoginEntry, safe_id
+
+        try:
+            data = json.loads(payload) if isinstance(payload, str) else payload
+        except Exception as exc:
+            return {"ok": False, "error": f"invalid JSON: {exc}"}
+        if not isinstance(data, dict) or not isinstance(data.get("logins"), list):
+            return {"ok": False, "error": "expected {version, logins: [...]}"}
+
+        base = state_dir()
+        imported = 0
+        for raw in data["logins"]:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                login_id = safe_id(str(raw.get("id") or ""))
+            except ValueError:
+                continue
+            files = raw.get("_files") or {}
+            # Write state files first.
+            for rel, content in files.items():
+                if not isinstance(rel, str) or not isinstance(content, str):
+                    continue
+                # Guard against path traversal in the stored rel paths.
+                try:
+                    dest = (Path(base) / rel).resolve()
+                    if not str(dest).startswith(str(Path(base).resolve())):
+                        continue
+                except Exception:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+            # Rebuild the registry entry (drop the _files key).
+            entry_raw = {k: v for k, v in raw.items() if k != "_files"}
+            entry = BrowserLoginEntry.from_dict(entry_raw)
+            self.browser_logins.add(entry)
+            imported += 1
+        return {"ok": True, "imported": imported}
+
+    def dhp_logins_health(self, slug: str) -> dict[str, Any]:
+        """For each site-login the spec requires, report whether a captured session exists."""
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        logins = self.browser_logins.list()
+        # Match by host: a spec browser_login entry {url,label} is satisfied if any
+        # captured login's host matches.
+        from ..browser_logins import match_login_for_url
+        from ..browser_login_capture import inspect_login_expiry
+
+        base = state_dir()
+        out = []
+        for entry in spec.browser_login:
+            url = str((entry or {}).get("url") or "")
+            label = str((entry or {}).get("label") or url)
+            match = match_login_for_url(url, logins) if url else None
+            out.append({
+                "url": url,
+                "label": label,
+                "logged_in": bool(match and match.has_state),
+                "expiry": inspect_login_expiry(match, base) if (match and match.has_state) else {"status": "no_state"},
+            })
+        return {"ok": True, "items": out}
+
     def list_artifacts(self, session_id: str) -> list[dict[str, Any]]:
         record = self.session_store.load(session_id)
         workspace = record.workspace if record else self.default_workspace
@@ -1484,7 +1790,11 @@ class SessionManager:
         elif sys.platform == "win32":
             # WinForms folder dialog via PowerShell — no extra deps. -STA is required
             # (the dialog silently fails in the default MTA apartment).
+            # Output as UTF-8 so non-ASCII paths (e.g. Chinese folders) survive the
+            # subprocess pipe; the default cp1252/codepage decode mangles them and the
+            # path arrives empty/garbled in the browser GUI's input field.
             ps = (
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                 "Add-Type -AssemblyName System.Windows.Forms; "
                 "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
                 "$f.Description = 'Give the coworker access to a folder'; "
@@ -1496,7 +1806,9 @@ class SessionManager:
             # Linux: zenity when present; otherwise the GUI's paste-a-path input remains.
             cmd = ["zenity", "--file-selection", "--directory"]
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            out = subprocess.run(
+                cmd, capture_output=True, timeout=300, encoding="utf-8", errors="replace"
+            )
         except (OSError, subprocess.TimeoutExpired):
             return {"ok": False, "error": "no native folder picker available"}
         path = (out.stdout or "").strip()
@@ -2712,6 +3024,12 @@ class SessionManager:
             # Scheduled runs respect the same per-session connection hierarchy as live sessions:
             # expose only the persona's effective-enabled connectors' tools (§4.3).
             connector_filter=self.effective_connectors(session_id, task.agent),
+            # User-facing permission rules (E2): allow/deny/ask takes precedence over
+            # risk classification in the permission engine.
+            rule_resolver=self.rule_store.resolver(),
+            # Persona delegation (E3) + slash commands (E3).
+            persona_registry=self.personas,
+            command_loader=self._engine_command_loader(),
         )
         self._seed_task_permissions(engine, task)
         return engine
@@ -3118,6 +3436,23 @@ class SessionManager:
         # Each run is a real, persisted conversation thread: it runs the instructions under its
         # own session id, then saves the transcript. The user can reopen that session and ask a
         # follow-up — the scheduled agent is no longer fire-and-forget.
+        # pre_run hooks (E2): fire before the engine is built. A hook may request a skip by
+        # writing {"skip": true} to stdout — if any hook does, abort the run as "skipped".
+        hook_ctx = {
+            "event": "pre_run",
+            "task_id": task.id,
+            "task_name": task.title,
+            "session_id": run.session_id,
+            "workspace": task.workspace,
+            "agent": task.agent,
+            "trigger": trigger,
+        }
+        pre_results = self.hooks.fire("pre_run", hook_ctx)
+        if any(r.get("skip") for r in pre_results):
+            run.status, run.error = "skipped", "aborted by pre_run hook"
+            run.finished_at = _epoch()
+            self.task_store.add_run(run)
+            return run
         engine = self._build_task_engine(task, session_id=run.session_id)
         # Register the live engine up-front: a parked approval persists the session
         # mid-run (durable suspend), and resolving from the Inbox must find this engine.
@@ -3143,6 +3478,26 @@ class SessionManager:
             run.status, run.error = "error", str(exc)
         finally:
             run.finished_at = _epoch()
+            # post_run hooks (E2): fire after run.status is determined. Best-effort —
+            # results are ignored (a hook can't change the run outcome post-hoc), but a
+            # failing hook is recorded, not propagated. Mirrors NotifyRouter.dispatch_run.
+            try:
+                self.hooks.fire(
+                    "post_run",
+                    {
+                        "event": "post_run",
+                        "task_id": task.id,
+                        "task_name": task.title,
+                        "session_id": run.session_id,
+                        "workspace": task.workspace,
+                        "agent": task.agent,
+                        "run_status": run.status,
+                        "error": run.error,
+                        "result_text": (run.result_text or "")[:1000],
+                    },
+                )
+            except Exception:
+                pass
             # Persist the run as a continuable session + keep the live engine for an immediate
             # follow-up; record the run (now carrying its session_id).
             try:
@@ -3353,6 +3708,9 @@ class SessionManager:
             "requires_consent": {
                 "mcps": [m.to_dict() for m in spec.requires_mcps],
                 "skills": [s.to_dict() for s in spec.requires_skills],
+                "plugins": [p.to_dict() for p in spec.requires_plugins],
+                "commands": [c.to_dict() for c in spec.requires_commands],
+                "subagents": [s.to_dict() for s in spec.requires_subagents],
                 "permissions": list(spec.permissions),
                 "browser_login": list(spec.browser_login),
                 "has_schedule": spec.primary_schedule is not None,
@@ -3360,13 +3718,35 @@ class SessionManager:
         }
 
     def install_digital_human(self, slug: str, config: dict[str, Any]) -> dict[str, Any]:
-        """Install a digital human as an automation (spec → ScheduledTask + instance record)."""
+        """Install a digital human as an automation (spec → ScheduledTask + instance record).
+
+        Before installing, auto-install any missing ``requires_plugins`` from the default
+        marketplace source (core rule 2: the digital human is a consumer of customize — a
+        missing plugin dependency should be one-click resolvable, not a dead-end).
+        """
         from ..digital_human import install_digital_human, SpecError
 
         try:
             spec = self.dhp_registry.get_spec(slug)
         except SpecError as e:
             return {"ok": False, "error": str(e)}
+
+        # Auto-install missing plugin dependencies from the default marketplace source.
+        if spec.requires_plugins:
+            installed_plugins = {p["name"] for p in self.list_plugins() if p.get("name")}
+            missing = [d for d in spec.requires_plugins if d.id not in installed_plugins]
+            for dep in missing:
+                # Find the plugin in the default source's catalog, then install it.
+                default_src = next((s for s in self.plugin_sources.list() if s.is_default), None)
+                if default_src is None:
+                    break
+                catalog = self.list_plugin_catalog(default_src.id)
+                if not catalog.get("ok"):
+                    break
+                cat_names = {c["name"] for c in catalog.get("plugins", [])}
+                if dep.id in cat_names:
+                    self.install_plugin(default_src.id, dep.id)
+
         result = install_digital_human(
             spec,
             dict(config or {}),
@@ -3395,6 +3775,202 @@ class SessionManager:
         return uninstall_digital_human(
             instance_id, instances=self.dhp_instances, task_store=self.task_store
         )
+
+    # -- DHP source management (批次 D2) ----------------------------------------
+    def list_dhp_sources(self) -> dict[str, Any]:
+        return {"ok": True, "sources": [s.to_dict() for s in self.dhp_sources.list()]}
+
+    def add_dhp_source(self, name: str, url: str, *, source_type: str = "dhp") -> dict[str, Any]:
+        from ..digital_human import DhpRegistry
+
+        try:
+            src = self.dhp_sources.add(name, url, source_type=source_type)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        # Rebuild the registry so the new source is live without a restart.
+        self.dhp_registry = DhpRegistry(self.dhp_sources.list(enabled_only=True))
+        return {"ok": True, "source": src.to_dict()}
+
+    def update_dhp_source(self, source_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        from ..digital_human import DhpRegistry
+
+        src = self.dhp_sources.update(source_id, changes or {})
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        self.dhp_registry = DhpRegistry(self.dhp_sources.list(enabled_only=True))
+        return {"ok": True, "source": src.to_dict()}
+
+    def remove_dhp_source(self, source_id: str) -> dict[str, Any]:
+        from ..digital_human import DhpRegistry
+
+        ok = self.dhp_sources.remove(source_id)
+        if not ok:
+            return {"ok": False, "error": "source not found or is builtin (disable instead)"}
+        self.dhp_registry = DhpRegistry(self.dhp_sources.list(enabled_only=True))
+        return {"ok": True}
+
+    # -- DHP instance edit (批次 D2) -------------------------------------------
+    def update_digital_human(self, instance_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        """Edit an installed digital human's config / prompt / schedule / notify.
+
+        Rebuilds the task instructions from the spec + new config (preserving the ``## 用户配置``
+        preamble), then patches the linked ScheduledTask via :meth:`update_automation` (no separate
+        task-patch logic). Secrets are routed to SecretStore; non-secret config to the instance.
+        """
+        from ..digital_human import reinstall_instructions, validate_config, split_config
+        from ..digital_human.instances import SECRET_PROFILE_PREFIX
+
+        inst = self.dhp_instances.get(instance_id)
+        if inst is None:
+            return {"ok": False, "error": "instance not found"}
+        try:
+            spec = self.dhp_registry.get_spec(inst.slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        changes = changes or {}
+        task_changes: dict[str, Any] = {}
+        user_config = changes.get("user_config")
+        system_prompt = changes.get("system_prompt")
+
+        # Only rebuild instructions when config or prompt actually changed.
+        if user_config is not None or system_prompt is not None:
+            merged = self.dhp_instances.resolve_config(inst)  # current non-secret + secret values
+            if user_config is not None:
+                merged.update(user_config)
+            # Re-validate + default-fill against the schema (mutates merged in place).
+            validate_config(spec, merged)
+            non_secret, secret, secret_keys = split_config(spec, merged)
+            if secret_keys and self.dhp_instances.secrets is not None:
+                self.dhp_instances.secrets.put(f"{SECRET_PROFILE_PREFIX}{inst.id}", secret)
+            inst.config = non_secret
+            inst.secret_keys = secret_keys
+            # The prompt preamble needs the resolved full config (secrets included — they're in
+            # the static instructions, same as install).
+            full_config = dict(non_secret)
+            full_config.update(secret)
+            task_changes["instructions"] = reinstall_instructions(
+                spec, full_config, system_prompt=system_prompt
+            )
+
+        for key in ("cron", "notify_channels", "notify_level", "title", "enabled"):
+            if key in changes:
+                task_changes[key] = changes[key]
+
+        if task_changes:
+            result = self.update_automation(inst.task_id, task_changes)
+            if not result.get("ok"):
+                return result
+
+        self.dhp_instances.put(inst)
+        task = self.task_store.get(inst.task_id)
+        return {"ok": True, "instance": dict(inst.to_dict(), task=task.public() if task else None)}
+
+    # -- DHP dependency health (批次 D2) ---------------------------------------
+    def dhp_mcp_health(self, slug: str) -> dict[str, Any]:
+        """For each MCP the spec requires, report whether it's configured + connected."""
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        # list_mcp() returns a list[dict] directly (the /v1/mcp HTTP wrapper
+        # is what wraps it in {"servers": [...]}).
+        by_name = {m.get("name"): m for m in self.list_mcp()}
+        out = []
+        for dep in spec.requires_mcps:
+            m = by_name.get(dep.name)
+            out.append(
+                {
+                    "name": dep.name,
+                    "reason": dep.reason,
+                    "configured": m is not None,
+                    "status": (m or {}).get("status", "missing"),
+                    "tool_count": (m or {}).get("tool_count", 0),
+                }
+            )
+        return {"ok": True, "items": out}
+
+    def dhp_skills_health(self, slug: str) -> dict[str, Any]:
+        """For each skill the spec requires, report whether it's installed."""
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        # list_skills() returns a list[dict] with a "name" key (the /v1/skills
+        # HTTP wrapper is what wraps it in {"skills": [...]}).
+        installed = {s["name"] for s in self.list_skills() if s.get("name")}
+        out = []
+        for dep in spec.requires_skills:
+            out.append(
+                {
+                    "id": dep.id,
+                    "reason": dep.reason,
+                    "installed": dep.id in installed,
+                }
+            )
+        return {"ok": True, "items": out}
+
+    def dhp_plugins_health(self, slug: str) -> dict[str, Any]:
+        """For each plugin the spec requires, report whether it's installed."""
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        installed = {p["name"] for p in self.list_plugins() if p.get("name")}
+        out = []
+        for dep in spec.requires_plugins:
+            out.append({
+                "id": dep.id,
+                "reason": dep.reason,
+                "installed": dep.id in installed,
+            })
+        return {"ok": True, "items": out}
+
+    def dhp_commands_health(self, slug: str) -> dict[str, Any]:
+        """For each command the spec requires, report whether it's available."""
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        installed = {c["name"] for c in self.list_commands() if c.get("name")}
+        out = []
+        for dep in spec.requires_commands:
+            out.append({
+                "id": dep.id,
+                "reason": dep.reason,
+                "installed": dep.id in installed,
+            })
+        return {"ok": True, "items": out}
+
+    def dhp_subagents_health(self, slug: str) -> dict[str, Any]:
+        """For each subagent persona the spec requires, report whether it's available."""
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        available = {p.get("id") for p in self.personas.list_all() if p.get("id")}
+        out = []
+        for dep in spec.requires_subagents:
+            out.append({
+                "id": dep.id,
+                "reason": dep.reason,
+                "installed": dep.id in available,
+            })
+        return {"ok": True, "items": out}
+
+    def dhp_upgrade_check(self, instance_id: str) -> dict[str, Any]:
+        """Compare an instance's installed spec_version against the registry's current version."""
+        inst = self.dhp_instances.get(instance_id)
+        if inst is None:
+            return {"ok": False, "error": "instance not found"}
+        entry = self.dhp_registry.get(inst.slug)
+        current = entry.version if entry else ""
+        return {
+            "ok": True,
+            "installed_version": inst.spec_version,
+            "latest_version": current,
+            "up_to_date": bool(current) and inst.spec_version == current,
+        }
 
     def prepare_manual_run(self, task_id: str) -> dict[str, Any]:
         """Create a 'running' manual run and return its session, so the GUI can open it and
@@ -3863,8 +4439,360 @@ class SessionManager:
         return _list_agents()
 
     def list_skills(self) -> list[dict[str, Any]]:
-        loader = SkillLoader([state_dir() / "skills"])
+        loader = SkillLoader([state_dir() / "skills", *self._plugin_skill_dirs()])
         return loader.catalog()
+
+    def _plugin_skill_dirs(self) -> list[Path]:
+        """Skill subfolders contributed by installed plugins (state_dir()/plugins/<n>/skills)."""
+        dirs: list[Path] = []
+        plugins_root = state_dir() / "plugins"
+        if not plugins_root.is_dir():
+            return dirs
+        for sub in sorted(plugins_root.iterdir()):
+            sd = sub / "skills"
+            if sd.is_dir():
+                dirs.append(sd)
+        return dirs
+
+    def _plugin_command_dirs(self) -> list[Path]:
+        """Command subfolders contributed by installed plugins (state_dir()/plugins/<n>/commands)."""
+        dirs: list[Path] = []
+        plugins_root = state_dir() / "plugins"
+        if not plugins_root.is_dir():
+            return dirs
+        for sub in sorted(plugins_root.iterdir()):
+            cd = sub / "commands"
+            if cd.is_dir():
+                dirs.append(cd)
+        return dirs
+
+    def _engine_command_loader(self):
+        """Build a CommandLoader that scans both standalone commands and plugin-contributed ones.
+
+        Used by build_engine so the agent's instructions include commands that shipped inside
+        an installed plugin (state_dir()/plugins/<n>/commands/). Built fresh each call so a
+        newly-installed plugin's commands are visible without a restart.
+        """
+        from ..commands import CommandLoader
+
+        return CommandLoader([state_dir() / "commands", *self._plugin_command_dirs()])
+
+    # -- skill sources + install/uninstall (批次 E1) -----------------------------
+    # Mirrors the DHP source-management surface: list/add/update/remove sources, browse a
+    # source's catalog, install a named skill (copies SKILL.md folder into state_dir()/skills),
+    # and uninstall by name. Errors surface as {"ok": False, "error": ...} for the UI.
+
+    def list_skill_sources(self) -> list[dict[str, Any]]:
+        return [s.to_dict() for s in self.skill_sources.list()]
+
+    def add_skill_source(self, name: str, url: str, *, source_type: str = "http") -> dict[str, Any]:
+        try:
+            src = self.skill_sources.add(name, url, source_type=source_type)
+            return {"ok": True, "source": src.to_dict()}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_skill_source(self, source_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        src = self.skill_sources.update(source_id, changes)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        return {"ok": True, "source": src.to_dict()}
+
+    def remove_skill_source(self, source_id: str) -> dict[str, Any]:
+        if not self.skill_sources.remove(source_id):
+            return {"ok": False, "error": "source not found or is built-in (disable it instead)"}
+        return {"ok": True, "id": source_id}
+
+    def list_skill_catalog(self, source_id: str) -> dict[str, Any]:
+        """Browse installable skills from one source (fetches/clones on demand)."""
+        from ..skills import list_catalog as _list_catalog
+
+        src = self.skill_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            items = _list_catalog(src, self._skill_cache_root)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        installed = {s["name"] for s in self.list_skills() if s.get("name")}
+        return {
+            "ok": True,
+            "source": src.to_dict(),
+            "skills": [{**it, "installed": it["name"] in installed} for it in items],
+        }
+
+    def install_skill(self, source_id: str, name: str) -> dict[str, Any]:
+        from ..skills import install_skill as _install, SkillInstallError
+
+        src = self.skill_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            return _install(src, name, skills_dir=state_dir() / "skills", cache_root=self._skill_cache_root)
+        except SkillInstallError as e:
+            return {"ok": False, "error": str(e)}
+
+    def uninstall_skill(self, name: str) -> dict[str, Any]:
+        from ..skills import uninstall_skill as _uninstall, SkillInstallError
+
+        try:
+            return _uninstall(name, skills_dir=state_dir() / "skills")
+        except SkillInstallError as e:
+            return {"ok": False, "error": str(e)}
+
+    # -- Plugins (marketplace install/uninstall, 批次 E4) -----------------------
+    # Claude-Code-format plugins installed from marketplace sources. The official
+    # claude-plugins-official marketplace is built in. Plugins land under
+    # state_dir()/plugins/<name>/; their skills/commands subfolders are picked up by the
+    # existing loaders (see _plugin_skill_dirs / _plugin_command_dirs). MCP servers
+    # declared in .mcp.json or plugin.json's mcpServers are registered on install and
+    # unregistered on uninstall (tracked in the plugin registry).
+    def list_plugins(self) -> list[dict[str, Any]]:
+        from ..plugins import list_installed as _list_installed
+
+        return _list_installed(state_dir() / "plugins", self.plugin_registry)
+
+    def list_plugin_sources(self) -> list[dict[str, Any]]:
+        return [s.to_dict() for s in self.plugin_sources.list()]
+
+    def add_plugin_source(self, name: str, url: str, *, source_type: str = "git") -> dict[str, Any]:
+        try:
+            src = self.plugin_sources.add(name, url, source_type=source_type)
+            return {"ok": True, "source": src.to_dict()}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_plugin_source(self, source_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        src = self.plugin_sources.update(source_id, changes)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        return {"ok": True, "source": src.to_dict()}
+
+    def remove_plugin_source(self, source_id: str) -> dict[str, Any]:
+        if not self.plugin_sources.remove(source_id):
+            return {"ok": False, "error": "source not found or is built-in (disable it instead)"}
+        return {"ok": True, "id": source_id}
+
+    def list_plugin_catalog(self, source_id: str) -> dict[str, Any]:
+        """Browse installable plugins from one marketplace (clones on demand)."""
+        from ..plugins import list_catalog as _list_catalog
+
+        src = self.plugin_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            items = _list_catalog(src, self._plugin_cache_root)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        installed = {p.name for p in self.plugin_registry.list()}
+        categories = sorted({i["category"] for i in items if i.get("category")})
+        return {
+            "ok": True,
+            "source": src.to_dict(),
+            "plugins": [{**it, "installed": it["name"] in installed} for it in items],
+            "categories": categories,
+        }
+
+    def install_plugin(self, source_id: str, name: str) -> dict[str, Any]:
+        from ..plugins import install_plugin as _install, PluginInstallError, InstalledPlugin
+
+        src = self.plugin_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            result = _install(
+                src, name,
+                plugins_dir=state_dir() / "plugins",
+                cache_root=self._plugin_cache_root,
+                mcp_register=self._register_plugin_mcp,
+            )
+        except PluginInstallError as e:
+            return {"ok": False, "error": str(e)}
+        # Record in the registry so uninstall can reverse the MCP registrations + the
+        # loader-scan picks up the plugin's skills/commands.
+        import datetime as _dt
+
+        self.plugin_registry.add(InstalledPlugin(
+            name=result["name"],
+            version=result.get("version") or "",
+            description=result.get("description") or "",
+            source_id=source_id,
+            source_info=result.get("source_info") or {},
+            components=result.get("components") or {},
+            installed_at=_dt.datetime.now().isoformat(timespec="seconds"),
+            sha=result.get("sha") or "",
+        ))
+        return result
+
+    def _register_plugin_mcp(self, server_name: str, config: dict[str, Any]) -> None:
+        """Register an MCP server contributed by a plugin (called during install)."""
+        self.add_mcp(server_name, config)
+
+    def uninstall_plugin(self, name: str) -> dict[str, Any]:
+        from ..plugins import uninstall_plugin as _uninstall, PluginInstallError
+
+        try:
+            return _uninstall(
+                name,
+                plugins_dir=state_dir() / "plugins",
+                registry=self.plugin_registry,
+                mcp_unregister=self.delete_mcp,
+            )
+        except PluginInstallError as e:
+            return {"ok": False, "error": str(e)}
+
+    def check_plugin_updates(self) -> dict[str, Any]:
+        """Check all installed plugins against their marketplace's latest sha."""
+        from ..plugins import check_updates as _check_updates
+
+        out: list[dict[str, Any]] = []
+        for src in self.plugin_sources.list(enabled_only=True):
+            out.extend(_check_updates(src, self.plugin_registry, self._plugin_cache_root))
+        return {"ok": True, "items": out}
+
+    def update_plugin(self, name: str) -> dict[str, Any]:
+        """Re-install a plugin from its source to pull the latest version."""
+        entry = self.plugin_registry.get(name)
+        if entry is None:
+            return {"ok": False, "error": "plugin not installed"}
+        src = self.plugin_sources.get(entry.source_id)
+        if src is None:
+            return {"ok": False, "error": "source no longer configured"}
+        # Uninstall (clears registry + MCP), then re-install (pulls latest sha).
+        self.uninstall_plugin(name)
+        return self.install_plugin(entry.source_id, name)
+
+    # -- Persona marketplace sources (批次 E4 后续) ---------------------------
+    # Git repos of *.md persona manifests the user can browse + install from. Mirrors
+    # plugin_sources / skill_sources. Installing reuses PersonaRegistry.install_from_dir
+    # (consent summary + snapshot + disabled-pending-approval), so the marketplace never
+    # changes the trust model — no executable code, lands disabled pending consent.
+    def list_persona_sources(self) -> list[dict[str, Any]]:
+        return [s.to_dict() for s in self.persona_sources.list()]
+
+    def add_persona_source(self, name: str, url: str, *, source_type: str = "git") -> dict[str, Any]:
+        try:
+            src = self.persona_sources.add(name, url, source_type=source_type)
+            return {"ok": True, "source": src.to_dict()}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_persona_source(self, source_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        src = self.persona_sources.update(source_id, changes)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        return {"ok": True, "source": src.to_dict()}
+
+    def remove_persona_source(self, source_id: str) -> dict[str, Any]:
+        if not self.persona_sources.remove(source_id):
+            return {"ok": False, "error": "source not found or is built-in (disable it instead)"}
+        return {"ok": True, "id": source_id}
+
+    def list_persona_catalog(self, source_id: str) -> dict[str, Any]:
+        """Browse installable personas from one marketplace (clones on demand)."""
+        from ..personas import list_catalog as _list_catalog, PersonaMarketplaceError
+
+        src = self.persona_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            items = _list_catalog(src, self._persona_cache_root)
+        except PersonaMarketplaceError as e:
+            return {"ok": False, "error": str(e)}
+        installed = {p["id"] for p in self.personas.list_all() if p.get("id")}
+        return {
+            "ok": True,
+            "source": src.to_dict(),
+            "personas": [{**it, "installed": it["id"] in installed} for it in items],
+        }
+
+    def install_persona_from_source(self, source_id: str, persona_id: str) -> dict[str, Any]:
+        """Install one persona from a marketplace source. Returns the consent summary
+        the registry produces; the persona lands disabled pending the user's approval."""
+        from ..personas import install_persona as _install, PersonaMarketplaceError
+
+        src = self.persona_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            result = _install(src, persona_id, registry=self.personas, cache_root=self._persona_cache_root)
+        except PersonaMarketplaceError as e:
+            return {"ok": False, "error": str(e)}
+        # Refresh the catalog's `installed` flags + return the full persona list so the
+        # caller can refresh its UI in one round-trip (mirrors install_plugin).
+        return {**result, "personas": self.personas.list_all()}
+
+    # -- Rules (allow/deny/ask permission layer, 批次 E2) --------------------
+    def list_rules(self) -> list[dict[str, Any]]:
+        return self.rule_store.list()
+
+    def add_rule(self, pattern: str, action: str, *, reason: str = "") -> dict[str, Any]:
+        try:
+            r = self.rule_store.add(pattern, action, reason=reason)
+            return {"ok": True, "rule": r}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_rule(self, rule_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        try:
+            r = self.rule_store.update(rule_id, changes)
+            if r is None:
+                return {"ok": False, "error": "rule not found"}
+            return {"ok": True, "rule": r}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def remove_rule(self, rule_id: str) -> dict[str, Any]:
+        return {"ok": self.rule_store.remove(rule_id)}
+
+    # -- Hooks (pre_run/post_run, 批次 E2) -----------------------------------
+    def list_hooks(self) -> list[dict[str, Any]]:
+        return self.hooks.list()
+
+    def add_hook(
+        self, name: str, event: str, command: str, *, match: str = "*"
+    ) -> dict[str, Any]:
+        try:
+            h = self.hooks.add(name, event, command, match=match)
+            return {"ok": True, "hook": h}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_hook(self, hook_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        try:
+            h = self.hooks.update(hook_id, changes)
+            if h is None:
+                return {"ok": False, "error": "hook not found"}
+            return {"ok": True, "hook": h}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def remove_hook(self, hook_id: str) -> dict[str, Any]:
+        return {"ok": self.hooks.remove(hook_id)}
+
+    # -- Commands (slash templates, 批次 E3) ---------------------------------
+    # Read-only: command files live under state_dir()/commands/<name>/COMMAND.md and are
+    # hand-authored or installed via E4 plugin packaging. The frontend lists them for the
+    # Composer "/" autocomplete and fetches the full template on selection.
+    def list_commands(self) -> list[dict[str, Any]]:
+        from ..commands import CommandLoader
+
+        loader = CommandLoader([state_dir() / "commands", *self._plugin_command_dirs()])
+        return loader.catalog()
+
+    def get_command(self, name: str) -> Optional[dict[str, Any]]:
+        from ..commands import CommandLoader
+
+        loader = CommandLoader([state_dir() / "commands", *self._plugin_command_dirs()])
+        c = loader.get(name)
+        if c is None:
+            return None
+        return {
+            "name": c.name,
+            "description": c.description,
+            "prompt_template": c.prompt_template,
+            "allowed_tools": c.allowed_tools,
+        }
 
     def list_memory(self) -> list[dict[str, Any]]:
         return [
