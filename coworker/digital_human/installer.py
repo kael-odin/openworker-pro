@@ -1,0 +1,184 @@
+"""DHP → openworker installer.
+
+Turns a parsed :class:`~coworker.digital_human.spec.DigitalHumanSpec` into a live
+:class:`~coworker.automation.models.ScheduledTask` and records an
+:class:`~coworker.digital_human.instances.DigitalHumanInstance` linking the two.
+
+The mapping is the heart of the DHP bridge — DHP's declarative spec is a *recipe* for an openworker
+automation, and this module is the *cook*:
+
+* ``system_prompt`` → ``instructions``, with a ``## 用户配置`` preamble prepended carrying the
+  resolved user config (so the agent reads its parameters from the prompt, exactly as DHP specs
+  expect — most prompts already say "从 User Configuration 读取").
+* ``subscriptions[0]`` schedule → ``Schedule.cron`` (already resolved by the parser). A spec with no
+  schedule produces a manual-run task (``fire_at`` far future, ``enabled=False``) — installable but
+  only runs on demand.
+* ``output.notify.channels`` → ``notify_channels``; if the spec declares channels, the level defaults
+  to ``all`` (the author opted into push); otherwise ``important``.
+* secret-marked config fields → SecretStore; the rest → the instance record.
+
+Installing does **not** run the task — it creates it (disabled if manual-run) and returns the
+instance + task so the GUI can open it. The user (or a schedule) starts runs.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any, Optional
+
+from ..automation.models import ScheduledTask, Schedule
+from .instances import DigitalHumanInstance, InstanceStore, SECRET_PROFILE_PREFIX
+from .spec import DigitalHumanSpec, SpecError
+
+# A manual-run automation needs *some* schedule to satisfy the ScheduledTask contract. Use a cron
+# that never fires (February 30th is impossible) and keep the task disabled — runs are manual only.
+_NEVER_CRON = "0 0 30 2 *"
+
+
+def build_instructions(spec: DigitalHumanSpec, config: dict[str, Any]) -> str:
+    """Prepend a ``## 用户配置`` preamble (the resolved userConfig JSON) to the system prompt.
+
+    DHP prompts reference ``userConfig[<key>]``; openworker has no separate config channel, so the
+    values are injected into the prompt itself. Missing required keys are caught earlier by
+    :func:`validate_config`; here we trust the config is complete."""
+    preamble_lines = [
+        "## 用户配置 (userConfig)",
+        "以下是本次运行的配置参数，请按此配置执行：",
+        "```json",
+        json.dumps(config, ensure_ascii=False, indent=2),
+        "```",
+    ]
+    return "\n".join(preamble_lines) + "\n\n" + spec.system_prompt
+
+
+def validate_config(spec: DigitalHumanSpec, config: dict[str, Any]) -> list[str]:
+    """Return a list of missing-required config keys (empty = valid). Also coerces types where
+    possible (number/boolean) and fills defaults — mutates ``config`` in place."""
+    errors: list[str] = []
+    for f in spec.config_schema:
+        val = config.get(f.key)
+        if val is None or (isinstance(val, str) and val.strip() == ""):
+            if f.default is not None:
+                config[f.key] = f.default
+                continue
+            if f.required:
+                errors.append(f.key)
+            continue
+        # Coerce: DHP config values often arrive as strings from a form.
+        if f.type == "number":
+            try:
+                config[f.key] = int(val) if str(val).isdigit() else float(val)
+            except (TypeError, ValueError):
+                errors.append(f.key)
+        elif f.type == "boolean":
+            if isinstance(val, str):
+                config[f.key] = val.strip().lower() in ("1", "true", "yes", "on")
+    return errors
+
+
+def split_config(
+    spec: DigitalHumanSpec, config: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Split resolved config into (non_secret, secret, secret_keys) per the field heuristic."""
+    non_secret: dict[str, Any] = {}
+    secret: dict[str, Any] = {}
+    secret_keys: list[str] = []
+    secret_keyset = {f.key for f in spec.config_schema if f.is_secret}
+    for k, v in config.items():
+        if k in secret_keyset:
+            secret[k] = v
+            secret_keys.append(k)
+        else:
+            non_secret[k] = v
+    return non_secret, secret, secret_keys
+
+
+def install_digital_human(
+    spec: DigitalHumanSpec,
+    config: dict[str, Any],
+    *,
+    task_store,
+    scratch_provider,
+    instances: InstanceStore,
+) -> dict[str, Any]:
+    """Install a parsed spec as an openworker automation.
+
+    Args:
+        spec: the parsed DHP spec.
+        config: the user's config values (will be validated + defaulted in place).
+        task_store: a :class:`~coworker.automation.store.TaskStore` (``.save(task)``).
+        scratch_provider: callable ``(task_session_id) -> workspace_path`` (manager._provision_scratch).
+        instances: the :class:`InstanceStore` to record the link in.
+
+    Returns ``{"ok": True, "instance": ..., "task": ...}`` or ``{"ok": False, "error": ...}``.
+    """
+    missing = validate_config(spec, config)
+    if missing:
+        return {"ok": False, "error": f"missing required config: {', '.join(missing)}"}
+
+    non_secret, secret, secret_keys = split_config(spec, config)
+
+    # Resolve the schedule. A spec with no schedule (manual-run) gets a never-firing cron + disabled.
+    sub = spec.primary_schedule
+    if sub is not None and sub.cron:
+        cron = sub.cron
+        enabled = True
+    else:
+        cron = _NEVER_CRON
+        enabled = False
+
+    # Secret config goes to SecretStore before the task is created, so a run can resolve it.
+    instance_id = "dh-" + uuid.uuid4().hex[:10]
+    if secret_keys and instances.secrets is not None:
+        instances.secrets.put(f"{SECRET_PROFILE_PREFIX}{instance_id}", secret)
+
+    # The merged config (non-secret + secret placeholders) for the prompt. At run time the engine
+    # resolves the secret profile; for the prompt preamble we inject the resolved values directly
+    # — they're already in hand here, and the instructions are static text.
+    full_config = dict(non_secret)
+    full_config.update(secret)
+    instructions = build_instructions(spec, full_config)
+
+    task = ScheduledTask(
+        title=spec.name,
+        instructions=instructions,
+        schedule=Schedule(kind="cron", cron=cron),
+        workspace="",  # set below via scratch_provider
+        origin_surface="digital-human",
+        agent="cowork",
+        notify_channels=list(spec.notify_channels),
+        notify_level="all" if spec.notify_channels else "important",
+        enabled=enabled,
+    )
+    task.workspace = scratch_provider(task.task_session_id)
+    task_store.save(task)
+
+    inst = DigitalHumanInstance(
+        id=instance_id,
+        slug=spec.slug,
+        name=spec.name,
+        task_id=task.id,
+        config=non_secret,
+        secret_keys=secret_keys,
+        spec_version=spec.version,
+    )
+    instances.put(inst)
+
+    return {"ok": True, "instance": inst.to_dict(), "task": task.public()}
+
+
+def uninstall_digital_human(
+    instance_id: str,
+    *,
+    instances: InstanceStore,
+    task_store,
+) -> dict[str, Any]:
+    """Remove an installed digital human: delete the linked task + the instance record (and its
+    secret profile, handled by InstanceStore.delete)."""
+    inst = instances.get(instance_id)
+    if inst is None:
+        return {"ok": False, "error": "instance not found"}
+    task_store.delete(inst.task_id)
+    instances.delete(instance_id)
+    return {"ok": True, "id": instance_id}

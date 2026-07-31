@@ -1515,6 +1515,30 @@ def create_app(manager: SessionManager) -> FastAPI:
         )
         return result.to_dict()
 
+    # -- digital humans (DHP bridge, 批次 B) ------------------------------------
+    @app.get("/v1/digital-humans")
+    def digital_humans_list(category: Optional[str] = None) -> dict[str, Any]:
+        return manager.list_digital_humans(category=category)
+
+    # Fixed-path routes registered BEFORE the {slug} route so FastAPI doesn't match
+    # "instances" as a slug.
+    @app.get("/v1/digital-humans/instances")
+    def digital_human_instances() -> dict[str, Any]:
+        return manager.list_dh_instances()
+
+    @app.delete("/v1/digital-humans/instances/{instance_id}")
+    def digital_human_uninstall(instance_id: str) -> dict[str, Any]:
+        return manager.uninstall_digital_human(instance_id)
+
+    @app.get("/v1/digital-humans/{slug}")
+    def digital_human_detail(slug: str) -> dict[str, Any]:
+        return manager.get_digital_human(slug)
+
+    @app.post("/v1/digital-humans/{slug}/install")
+    def digital_human_install(slug: str, body: dict) -> dict[str, Any]:
+        config = body.get("config") or {}
+        return manager.install_digital_human(slug, config)
+
     @app.websocket("/ws/session/{session_id}")
     async def ws_session(ws: WebSocket, session_id: str) -> None:
         if not _websocket_authenticated(ws):

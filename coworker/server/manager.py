@@ -190,6 +190,14 @@ class SessionManager:
         # process singleton so agents.get_agent resolves persona ids (incl. third-party) here.
         self.personas = PersonaRegistry(state_path=base / "personas.json")
         set_persona_registry(self.personas)
+        # DHP digital-human registry + installed instances (批次 B). The registry resolves specs
+        # from a local DHP repo clone (OPENWORKER_DHP_REPO env, or a sibling dir at dev time).
+        from ..digital_human import DhpRegistry, InstanceStore
+        import os as _os
+
+        _dhp_repo = _os.environ.get("OPENWORKER_DHP_REPO") or str(base / "digital-human-protocol")
+        self.dhp_registry = DhpRegistry(_dhp_repo if Path(_dhp_repo).is_dir() else None)
+        self.dhp_instances = InstanceStore(base / "digital-humans.json", secrets=self.secrets)
         # Inbox (cross-session human-attention queue), routing (named inboxes + Slack/Telegram
         # bindings), the Unattended toggle, and self-wake records.
         self.inbox = InboxStore(base / "inbox.json")
@@ -3317,6 +3325,76 @@ class SessionManager:
 
     def delete_automation(self, task_id: str) -> dict[str, Any]:
         return {"ok": self.task_store.delete(task_id), "id": task_id}
+
+    # -- digital humans (DHP bridge, 批次 B) ------------------------------------
+    def list_digital_humans(self, category: Optional[str] = None) -> dict[str, Any]:
+        """Catalog listing from the DHP registry (index.json entries, no full specs)."""
+        entries = self.dhp_registry.list(category=category)
+        installed = {i.slug for i in self.dhp_instances.list()}
+        return {
+            "ok": True,
+            "humans": [dict(e.to_dict(), installed=e.slug in installed) for e in entries],
+            "categories": self.dhp_registry.categories(),
+        }
+
+    def get_digital_human(self, slug: str) -> dict[str, Any]:
+        """Full spec for one digital human (catalog entry + parsed spec + config_schema form)."""
+        entry = self.dhp_registry.get(slug)
+        if entry is None:
+            return {"ok": False, "error": f"digital human {slug!r} not found"}
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:  # SpecError or file error
+            return {"ok": False, "error": str(e)}
+        return {
+            "ok": True,
+            "entry": entry.to_dict(),
+            "spec": spec.to_dict(),
+            "requires_consent": {
+                "mcps": [m.to_dict() for m in spec.requires_mcps],
+                "skills": [s.to_dict() for s in spec.requires_skills],
+                "permissions": list(spec.permissions),
+                "browser_login": list(spec.browser_login),
+                "has_schedule": spec.primary_schedule is not None,
+            },
+        }
+
+    def install_digital_human(self, slug: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Install a digital human as an automation (spec → ScheduledTask + instance record)."""
+        from ..digital_human import install_digital_human, SpecError
+
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except SpecError as e:
+            return {"ok": False, "error": str(e)}
+        result = install_digital_human(
+            spec,
+            dict(config or {}),
+            task_store=self.task_store,
+            scratch_provider=self._provision_scratch,
+            instances=self.dhp_instances,
+        )
+        return result
+
+    def list_dh_instances(self) -> dict[str, Any]:
+        insts = self.dhp_instances.list()
+        out = []
+        for inst in insts:
+            task = self.task_store.get(inst.task_id)
+            out.append(
+                dict(
+                    inst.to_dict(),
+                    task=task.public() if task else None,
+                )
+            )
+        return {"ok": True, "instances": out}
+
+    def uninstall_digital_human(self, instance_id: str) -> dict[str, Any]:
+        from ..digital_human import uninstall_digital_human
+
+        return uninstall_digital_human(
+            instance_id, instances=self.dhp_instances, task_store=self.task_store
+        )
 
     def prepare_manual_run(self, task_id: str) -> dict[str, Any]:
         """Create a 'running' manual run and return its session, so the GUI can open it and
