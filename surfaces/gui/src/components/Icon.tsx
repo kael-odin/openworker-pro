@@ -41,6 +41,7 @@ export type IconName =
   | "table"
   | "mic"
   | "stop"
+  | "bell"
   | "x";
 
 export function Icon({
@@ -230,6 +231,13 @@ export function Icon({
       return (
         <svg {...s}>
           <path d="M14.6 6.4a3.8 3.8 0 0 0-5 4.9l-6 6a1.6 1.6 0 0 0 2.3 2.3l6-6a3.8 3.8 0 0 0 4.9-5l-2.4 2.4-2-.5-.5-2 2.7-2.1z" />
+        </svg>
+      );
+    case "bell":
+      return (
+        <svg {...s}>
+          <path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+          <path d="M13.7 21a2 2 0 0 1-3.4 0" />
         </svg>
       );
     case "search":

@@ -1907,3 +1907,62 @@ export class Session {
     this.ws.close();
   }
 }
+
+// -- notify channels (钉钉/飞书/企微/webhook/邮件) ----------------------------
+export interface NotifyChannelInfo {
+  channel: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  configured: boolean;
+}
+
+export interface NotifyChannelsResponse {
+  channels: NotifyChannelInfo[];
+  meta: Record<string, { label: string; description: string }>;
+}
+
+export async function getNotifyChannels(): Promise<NotifyChannelsResponse> {
+  const res = await fetch(`${httpBase()}/v1/notify/channels`);
+  return res.json();
+}
+
+export async function getNotifyChannelConfig(
+  channel: string,
+): Promise<{ channel: string; config: Record<string, unknown> }> {
+  const res = await fetch(`${httpBase()}/v1/notify/channels/${encodeURIComponent(channel)}`);
+  return res.json();
+}
+
+export async function saveNotifyChannelConfig(
+  channel: string,
+  config: Record<string, unknown>,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/notify/channels/${encodeURIComponent(channel)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  });
+  return res.json();
+}
+
+export async function deleteNotifyChannelConfig(
+  channel: string,
+): Promise<{ ok: boolean }> {
+  const res = await fetch(`${httpBase()}/v1/notify/channels/${encodeURIComponent(channel)}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function testNotifyChannel(
+  channel: string,
+  config: Record<string, unknown>,
+): Promise<{ ok: boolean; results?: Array<{ ok: boolean; channel: string; error: string | null }> }> {
+  const res = await fetch(`${httpBase()}/v1/notify/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channel, config }),
+  });
+  return res.json();
+}

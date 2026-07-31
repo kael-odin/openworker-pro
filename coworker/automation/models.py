@@ -125,6 +125,9 @@ class ScheduledTask:
     model: Optional[str] = None
     notify_on_completion: bool = True
     notify_target: Optional[str] = None  # extra messaging target ("telegram:123")
+    # 多渠道通知（批次 A）：推哪些 notify 渠道 + 级别。空 list = 走全局已启用渠道。
+    notify_channels: list[str] = field(default_factory=list)
+    notify_level: str = "important"  # all | important | none
     always_allowed_tools: list[str] = field(default_factory=list)
     always_allowed_commands: list[str] = field(default_factory=list)
     enabled: bool = True
@@ -202,6 +205,8 @@ class ScheduledTask:
             "last_status": self.last_status,
             "run_count": self.run_count,
             "notify_on_completion": self.notify_on_completion,
+            "notify_channels": list(self.notify_channels),
+            "notify_level": self.notify_level,
             # UX-023: lets the detail freeze the pre-open mark for its "new" pills.
             "seen_runs_at": self.seen_runs_at,
             # Structured for the task page's revoke list; `entry` is the revoke handle.

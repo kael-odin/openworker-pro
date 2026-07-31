@@ -1472,6 +1472,49 @@ def create_app(manager: SessionManager) -> FastAPI:
     def automation_run_finalize(task_id: str, run_id: str) -> dict[str, Any]:
         return manager.finalize_manual_run(task_id, run_id)
 
+    # -- notify channels (钉钉/飞书/企微/webhook/邮件) --------------------------
+    @app.get("/v1/notify/channels")
+    def notify_channels_list() -> dict[str, Any]:
+        from ..notify.config import CHANNEL_META
+
+        channels = manager.notify_router.store.list_channels()
+        return {"channels": channels, "meta": CHANNEL_META}
+
+    @app.get("/v1/notify/channels/{channel}")
+    def notify_channel_get(channel: str) -> dict[str, Any]:
+        cfg = manager.notify_router.store.get_config(channel)
+        from ..notify.config import CHANNEL_META
+
+        if channel not in CHANNEL_META:
+            return {"ok": False, "error": f"未知渠道 {channel!r}"}
+        return {"channel": channel, "config": manager.notify_router.store.mask(cfg)}
+
+    @app.post("/v1/notify/channels/{channel}")
+    def notify_channel_save(channel: str, body: dict) -> dict[str, Any]:
+        from ..notify.config import CHANNEL_META
+
+        if channel not in CHANNEL_META:
+            return {"ok": False, "error": f"未知渠道 {channel!r}"}
+        manager.notify_router.store.save_config(channel, body.get("config") or {})
+        return {"ok": True}
+
+    @app.delete("/v1/notify/channels/{channel}")
+    def notify_channel_delete(channel: str) -> dict[str, Any]:
+        ok = manager.notify_router.store.delete_config(channel)
+        return {"ok": ok}
+
+    @app.post("/v1/notify/test")
+    async def notify_test(body: dict) -> dict[str, Any]:
+        # 用 body 里的 config（前端表单当前值）即时测试，不必先保存。
+        channel = (body.get("channel") or "").strip()
+        config = body.get("config") or {}
+        if not channel:
+            return {"ok": False, "error": "channel is required"}
+        result = await asyncio.to_thread(
+            lambda: manager.notify_router.test_send(channel, config)
+        )
+        return result.to_dict()
+
     @app.websocket("/ws/session/{session_id}")
     async def ws_session(ws: WebSocket, session_id: str) -> None:
         if not _websocket_authenticated(ws):

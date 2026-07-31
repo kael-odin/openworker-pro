@@ -179,6 +179,10 @@ class SessionManager:
         # Automation: scheduled tasks store + the tick scheduler (started in the lifespan).
         # The scheduler also resumes self-wake'd sessions each tick (extra_tick).
         self.task_store = TaskStore(base / "automation.db")
+        # 多渠道通知（钉钉/飞书/企微/webhook/邮件）—— 配置存 secrets，调度完成时分发。
+        from ..notify import NotifyRouter, NotifyConfigStore
+
+        self.notify_router = NotifyRouter(NotifyConfigStore(self.secrets))
         self.scheduler = Scheduler(
             self.task_store, self._run_scheduled_task, extra_tick=self.resume_due_wakes
         )
@@ -3174,6 +3178,22 @@ class SessionManager:
                     )
             except Exception:
                 pass
+        # 多渠道通知（钉钉/飞书/企微/webhook/邮件）：按 task.notify_channels + notify_level 分发。
+        # 与 notify_target 的单平台推送并存 —— 后者是 messaging 连接器，这里是通知渠道层。
+        # 是否真的发送由 router 依 level + run.status 决定（none/important 时可能 no-op）。
+        try:
+            await asyncio.to_thread(
+                lambda: self.notify_router.dispatch_run(
+                    task_name=task.title,
+                    run_status=run.status,
+                    result_text=run.result_text,
+                    error=run.error,
+                    channels=task.notify_channels or None,
+                    level=task.notify_level,
+                )
+            )
+        except Exception:
+            pass
 
     # -- automation REST --------------------------------------------------------
     def list_automations(self) -> dict[str, Any]:
@@ -3253,6 +3273,8 @@ class SessionManager:
             # rendered the grants, the submit IS the consent. Same validation as the
             # agent tool — only target-bound write grants survive.
             always_allowed_tools=grant_entries(payload.get("permissions")),
+            notify_channels=list(payload.get("notify_channels") or []),
+            notify_level=str(payload.get("notify_level") or "important"),
         )
         task.workspace = self._provision_scratch(task.task_session_id)
         self.task_store.save(task)
@@ -3276,6 +3298,10 @@ class SessionManager:
             if not croniter.is_valid(changes["cron"]):
                 return {"ok": False, "error": "invalid cron"}
             task.schedule.cron, task.schedule.kind = changes["cron"], "cron"
+        if changes.get("notify_channels") is not None:
+            task.notify_channels = list(changes["notify_channels"] or [])
+        if changes.get("notify_level") is not None:
+            task.notify_level = str(changes["notify_level"])
         if changes.get("revoke"):
             # Revocation from the task detail page ("Allowed without asking … · Revoke").
             # Human-only, like minting; the agent-facing update tool has no such field.

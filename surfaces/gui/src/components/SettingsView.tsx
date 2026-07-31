@@ -45,6 +45,7 @@ import { PanelHead } from "./IntegrationsView";
 import { ModelsTab } from "./ManageTabs";
 import { GalleryModal } from "./GalleryModal";
 import { PersonasTab } from "./PersonasTab";
+import { NotifyChannelsSection } from "./NotifyChannelsSection";
 import { showPersonas } from "../flags";
 
 type Dict = Record<string, string>;
@@ -64,7 +65,7 @@ function tt(key: string, params?: Record<string, string | number>): string {
 // Models + Personas host the existing tab components inside the page shell (field re-skin to follow).
 // "appearance" is the General tab's stable key — callers deep-link with it, so the
 // rename (UX-021) changed only the label. "files" folded into General as a card.
-type SetTab = "appearance" | "models" | "voice" | "personas";
+type SetTab = "appearance" | "models" | "voice" | "personas" | "notify";
 
 const CARD = "rounded-xl2 border border-line bg-panel";
 const FIELD_LABEL = "text-[12.5px] font-medium text-ink";
@@ -75,10 +76,11 @@ const BTN_ACCENT = "text-[12.5px] px-3 py-2 rounded-lg bg-accent text-white shri
 const BTN_BORDERED =
   "text-[12.5px] px-3 py-2 rounded-lg border border-line bg-paper hover:border-lineStrong shrink-0";
 
-const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" | "sparkle" }[] = [
+const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" | "sparkle" | "bell" }[] = [
   { key: "appearance", label: "settings.tab_general", icon: "sliders" },
   { key: "models", label: "settings.tab_models", icon: "code" },
   { key: "voice", label: "settings.tab_voice", icon: "mic" },
+  { key: "notify", label: "settings.tab_notify", icon: "bell" },
   { key: "personas", label: "settings.tab_personas", icon: "sparkle" },
 ];
 
@@ -141,6 +143,14 @@ export function SettingsView({
             </section>
           ) : tab === "voice" ? (
             <VoiceInputSection />
+          ) : tab === "notify" ? (
+            <section>
+              <PanelHead
+                title={t("settings.notify_title")}
+                sub={t("settings.notify_sub")}
+              />
+              <NotifyChannelsSection />
+            </section>
           ) : (
             <PersonasSection onOpenPersona={onOpenPersona} />
           )}
