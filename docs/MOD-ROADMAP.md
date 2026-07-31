@@ -159,12 +159,13 @@
 功能3a (spec解析) → 功能3b (store) → 功能3c (UI)
 ```
 
-**建议执行批次**：
-1. **批次 A**：功能 1（notify）— 独立、最小、立刻有用。验证魔改→汉化→发布流水线。
-2. **批次 B**：功能 3a + 3b（spec 解析 + store 对接）— 数字人能装能跑，先无 UI（命令行/配置文件）。
-3. **批次 C**：功能 3c（配置面板 UI）— 用户最眼馋的部分，建立在 3a/3b 和功能 1 之上。
-4. **批次 D**：功能 2（企微）— 依赖功能 1，回调依赖功能 4（可临时 ngrok）。
-5. **批次 E**：功能 4（远程访问）— 收尾，移动端。
+## 建议执行批次（按实际执行顺序）
+
+1. ✅ **批次 A**（commit `32cb35f`，2026-07-31）：功能 1（notify）— 5 渠道（钉钉/飞书/企微群机器人/generic webhook/email SMTP）+ router 按 level 分发 + SecretStore 存密钥 + scheduler 钩子 + `/v1/notify/*` 端点 + `NotifyChannelsSection` 面板。19 测试全绿，端到端实测通过。
+2. ✅ **批次 B**（commit `fb27c06`，2026-07-31）：功能 3a + 3b（spec 解析 + store）— `coworker/digital_human/` 包（spec.py 纯解析器全字段覆盖 / store.py DhpRegistry / instances.py InstanceStore / installer.py 桥接 ScheduledTask）。映射：DHP spec → ScheduledTask 工厂，不另起运行时。43 测试全绿（含 34 真实 spec 回归），curl 实测通过。
+3. ✅ **批次 C**（commit `6d411ed`，2026-07-31）：功能 3c（配置面板 UI）— `DigitalHumansSection` 商店面板（分类/搜索/动态配置表单/安装/实例管理）+ `bot` 图标 + Settings「数字人」tab + i18n。tsc 0 错误，端到端浏览器验证通过（ai-daily-news 安装/卸载全链路）。
+4. ✅ **批次 D**（commit `<TBD>`，2026-07-31）：功能 2（企微自建应用）— `coworker/connectors/wecom_app/` 包（crypto.py AES-256-CBC 加解密 + SHA1 签名 + PKCS#7 / provider.py WeComAppClient access_token 缓存 + 消息解析 / adapter.py handle_callback GET 验证 + POST 接收）。接入 BasePlatformAdapter 契约，零改 gateway/_dispatch_inbound。回调走 tokenless webhook `/v1/connectors/wecom/callback`（GET echostr + POST 解密）。descriptor 驱动连接表单（corpid/secret/agent_id/token/encoding_aes_key/allowed_users 五件套 + 白名单），密钥字段走 SecretStore。`WecomDetail` 详情页（回调 URL + 加密模式 + 工具 + 白名单）+ WecomLogo + i18n。pycryptodome 加入 messaging extras。27 测试全绿，tsc 0 错误，端到端浏览器验证通过（列表 + 连接表单全字段）。
+5. ⏳ **批次 E**：功能 4（远程访问）— 收尾，移动端。
 
 这样把"眼馋的 3"拆成 B+C 两步，C 不会卡在没基础；功能 1 先行让 3c 的 notify 配置有东西可复用。
 

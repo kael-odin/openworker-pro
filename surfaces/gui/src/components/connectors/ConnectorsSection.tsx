@@ -18,6 +18,7 @@ import { GithubDetail } from "./GithubDetail";
 import { GmailDetail } from "./GmailDetail";
 import { HubSpotDetail } from "./HubSpotDetail";
 import { SlackDetail } from "./SlackDetail";
+import { WecomDetail } from "./WecomDetail";
 import { GRP } from "./ui";
 import { useT, currentLang } from "../../i18n/I18nProvider";
 import zh from "../../i18n/zh.json";
@@ -50,6 +51,7 @@ const DETAIL_PAGES: Record<string, (p: DetailProps) => JSX.Element> = {
   google_calendar: (p) => <CalendarDetail {...p} />,
   hubspot: (p) => <HubSpotDetail {...p} />,
   github: (p) => <GithubDetail {...p} />,
+  wecom: (p) => <WecomDetail {...p} />,
   // Generic multi-account connectors (accounts.py layer) share one page.
   notion: (p) => <AccountsDetail {...p} />,
   attio: (p) => <AccountsDetail {...p} />,

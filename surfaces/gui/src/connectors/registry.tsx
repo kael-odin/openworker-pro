@@ -181,6 +181,14 @@ const HunterLogo = strokeLogo(
   </>,
 );
 
+// 企业微信 — 双气泡（一大一小叠加），近似官方 logo 的对话形态。
+const WecomLogo = strokeLogo(
+  <>
+    <path d="M12 3a9 9 0 0 0-3.8 17.2c-.1 1-.5 2.3-1.2 3.3 1.5-.2 2.9-.7 4-1.4A9 9 0 1 0 12 3Z" />
+    <path d="M8.5 11.5h7M8.5 14.5h4" />
+  </>,
+);
+
 const PlugLogo = strokeLogo(
   <>
     <path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-10 0V7zM12 16v5" />
@@ -232,6 +240,7 @@ export const CONNECTORS: Record<string, ConnectorRegistryEntry> = {
   amplitude: { label: "Amplitude", logo: AmplitudeLogo },
   apollo: { label: "Apollo.io", logo: ApolloLogo },
   hunter: { label: "Hunter", logo: HunterLogo },
+  wecom: { label: "企业微信", logo: WecomLogo },
   // Non-brand utilities.
   email: { label: "Email", logo: EmailLogo },
   browser: { label: "Browser", logo: BrowserLogo },

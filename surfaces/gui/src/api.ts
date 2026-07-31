@@ -1806,6 +1806,26 @@ export async function getSlackStatus(): Promise<SlackStatus> {
   return res.json();
 }
 
+// 企微自建应用健康：连接状态 + corpid/agent_id + 加密模式（来自 WeComAppAdapter.status()）。
+export interface WecomStatus {
+  connected: boolean;
+  configured?: boolean;
+  corpid?: string;
+  agent_id?: string;
+  has_token?: boolean;
+  has_aes_key?: boolean;
+  encrypted?: boolean;
+}
+
+export async function getWecomStatus(): Promise<WecomStatus> {
+  try {
+    const res = await fetch(`${httpBase()}/v1/connectors/wecom/status`);
+    return res.json();
+  } catch {
+    return { connected: false };
+  }
+}
+
 export type Handlers = {
   onEvent: (event: WsEvent) => void;
   onOpen?: () => void;

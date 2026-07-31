@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # Origins allowed to talk to the local sidecar. It binds to 127.0.0.1, but a page in the
 # user's own browser can still reach loopback — so without an origin gate, any website they
@@ -185,6 +185,8 @@ def create_app(manager: SessionManager) -> FastAPI:
         "/auth/callback",
         "/mcp/oauth/callback",
         "/oauth/callback",
+        # 企微回调由企业微信服务器发起，无法携带本应用 token —— 单独校验签名。
+        "/v1/connectors/wecom/callback",
     }
 
     def _request_authenticated(request: Request) -> bool:
@@ -816,6 +818,46 @@ def create_app(manager: SessionManager) -> FastAPI:
     async def github_status() -> dict[str, Any]:
         """GitHub health: relay socket / cloud sign-in / per-installation tokens."""
         return manager.github_status()
+
+    # -- WeCom app callback (inbound webhook from 企业微信 servers) ---------------
+    # 企微回调由企业微信服务器发起，无法携带本应用 token —— 路由已加入 tokenless_paths，
+    # 安全靠回调签名校验（WeComAppClient.verify_and_decrypt 里做 SHA1 签名 + corpid 校验）。
+    @app.get("/v1/connectors/wecom/callback")
+    async def wecom_callback_get(request: Request) -> Response:
+        """企微 URL 验证（GET）：校验签名后回 echostr 明文。"""
+        return await _wecom_callback(request)
+
+    @app.post("/v1/connectors/wecom/callback")
+    async def wecom_callback_post(request: Request) -> Response:
+        """企微消息接收（POST）：解密 + 解析 + 路由到 agent。"""
+        return await _wecom_callback(request)
+
+    async def _wecom_callback(request: Request) -> Response:
+        adapter = (
+            manager.gateway._adapters.get("wecom") if manager.gateway else None
+        )
+        if adapter is None:
+            return PlainTextResponse("wecom not connected", status_code=503)
+        query = dict(request.query_params)
+        body = await request.body()
+        try:
+            status, payload = await adapter.handle_callback(query, body)
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            return PlainTextResponse("error", status_code=500)
+        return PlainTextResponse(payload, status_code=status)
+
+    @app.get("/v1/connectors/wecom/status")
+    async def wecom_status() -> dict[str, Any]:
+        """企微应用健康：连接状态 + corpid/agent_id + 加密模式。"""
+        adapter = (
+            manager.gateway._adapters.get("wecom") if manager.gateway else None
+        )
+        if adapter is None:
+            return {"connected": False, "configured": bool(manager.secrets.get("wecom:default"))}
+        return {"connected": True, **adapter.status()}
 
     @app.post("/v1/connectors/gmail/accounts/{email}/disconnect")
     async def gmail_account_disconnect(email: str) -> dict[str, Any]:

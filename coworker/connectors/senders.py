@@ -86,6 +86,39 @@ def _send_slack(
     return SendResult(False, error=err)
 
 
+def _send_wecom(
+    token: str, chat_id: str, text: str, thread_id: Optional[str] = None
+) -> SendResult:
+    """企微自建应用出站发送。
+
+    `token` 是 _resolve_token 编码的 profile JSON 串（corpid/secret/agent_id/...），
+    不是单一 token —— 企微凭证是三件套，sender 无状态只能通过 token 参数传。
+    `chat_id` = 用户 userid（企微应用消息 1v1 私聊）。thread_id 忽略（企微无 thread）。
+    """
+    import json as _json
+
+    from .wecom_app.provider import WeComAppClient
+
+    try:
+        profile = _json.loads(token)
+    except (ValueError, TypeError):
+        return SendResult(False, error="企微凭证解析失败")
+    client = WeComAppClient(
+        corpid=profile.get("corpid", ""),
+        secret=profile.get("secret", ""),
+        agent_id=profile.get("agent_id", ""),
+        token=profile.get("token", ""),
+        encoding_aes_key=profile.get("encoding_aes_key", ""),
+    )
+    data = client.send_text(chat_id, text)
+    if data.get("errcode") == 0:
+        return SendResult(True, message_id=str(data.get("msgid", "")))
+    return SendResult(
+        False,
+        error=f"企微发送失败: {data.get('errmsg')} (code={data.get('errcode')})",
+    )
+
+
 def _slack_blocks(text: str, buttons) -> list[dict]:
     """A Block Kit message: a text section + a row of action buttons (action_id `ocw_<i>`,
     value = the encoded item id + resolution)."""
@@ -141,6 +174,7 @@ def _send_slack_interactive(
 DEFAULT_SENDERS: dict[str, Sender] = {
     "telegram": _send_telegram,
     "slack": _send_slack,
+    "wecom": _send_wecom,
 }
 
 

@@ -137,6 +137,31 @@ def _validate_slack(creds: dict) -> ValidationResult:
     return ValidationResult(False, error=data.get("error") or "机器人令牌无效")
 
 
+def _validate_wecom(creds: dict) -> ValidationResult:
+    """企微自建应用凭证校验：用 corpid + secret 能否获取 access_token。"""
+    from .wecom_app.provider import WeComAppClient
+
+    corpid = creds.get("corpid", "")
+    secret = creds.get("secret", "")
+    agent_id = creds.get("agent_id", "")
+    if not (corpid and secret and agent_id):
+        return ValidationResult(False, error="corpid / secret / agent_id 不能为空")
+    try:
+        client = WeComAppClient(
+            corpid=corpid,
+            secret=secret,
+            agent_id=agent_id,
+            token=creds.get("token", ""),
+            encoding_aes_key=creds.get("encoding_aes_key", ""),
+        )
+        result = client.validate_credentials()
+        if result.get("ok"):
+            return ValidationResult(True, identity=f"企微应用 {agent_id}")
+        return ValidationResult(False, error=result.get("error") or "凭证无效")
+    except Exception as exc:
+        return ValidationResult(False, error=str(exc))
+
+
 def _validate_whoami(
     method: str,
     url: str,
@@ -487,6 +512,63 @@ DESCRIPTORS: list[ConnectorDescriptor] = [
             "将两个令牌都粘贴到下方并连接，然后邀请机器人到某个频道或私信它。",
         ],
         validate=_validate_slack,
+    ),
+    ConnectorDescriptor(
+        name="wecom",
+        title="企业微信",
+        icon="💬",
+        blurb="通过企业微信自建应用进行双向消息通信——合规官方 API，不走个人微信逆向协议。",
+        auth="token",
+        two_way=True,
+        channels=False,  # 企微应用消息是 1v1 私聊，无频道订阅语义
+        brand_color="#07c160",
+        logo="wecom",
+        fields=[
+            Field(
+                "corpid",
+                "企业 ID",
+                secret=False,
+                help="企业微信管理后台 ▸ 我的企业 ▸ 企业信息 ▸ 企业 ID。",
+            ),
+            Field(
+                "secret",
+                "应用 Secret",
+                secret=True,
+                help="自建应用的 Secret（应用管理 ▸ 自建 ▸ 你的应用 ▸ Secret）。",
+            ),
+            Field(
+                "agent_id",
+                "应用 AgentId",
+                secret=False,
+                help="自建应用的 AgentId（同一页面顶部）。",
+            ),
+            Field(
+                "token",
+                "回调 Token",
+                secret=True,
+                required=False,
+                help="接收消息 ▸ API 接收 ▸ Token（设置 API 接收后生成）。留空则明文模式；建议配置以启用加密。",
+                placeholder="随机字符串",
+            ),
+            Field(
+                "encoding_aes_key",
+                "回调 EncodingAESKey",
+                secret=True,
+                required=False,
+                help="与 Token 同页生成。配置后回调消息走 AES-256-CBC 加密（推荐）。",
+                placeholder="43 字符",
+            ),
+            _ALLOWED_FIELD,
+        ],
+        instructions=[
+            "在企业微信管理后台（work.weixin.qq.com）创建一个自建应用。",
+            "复制企业 ID（我的企业）、应用 Secret 和 AgentId（应用管理 ▸ 你的应用）。",
+            "在「接收消息」▸「API 接收」里设置回调 URL 和 Token/EncodingAESKey（推荐启用加密）。",
+            "回调 URL 填：https://你的公网地址/v1/connectors/wecom/callback（需公网可达；本地开发可用 ngrok/cloudflare tunnel）。",
+            "把企业 ID、Secret、AgentId、Token、EncodingAESKey 粘贴到下方并连接。",
+            "连接后，先在企微里给应用发一条消息，再到「捕获」获取你的用户 ID 加入白名单。",
+        ],
+        validate=_validate_wecom,
     ),
     ConnectorDescriptor(
         name="email",

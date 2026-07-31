@@ -14,7 +14,7 @@ from typing import Optional
 from ..secrets import SecretStore
 from .base import SessionSource
 
-PLATFORMS = ("telegram", "slack", "github")
+PLATFORMS = ("telegram", "slack", "github", "wecom")
 
 
 @dataclass
@@ -89,6 +89,11 @@ def load_settings(
             enabled = bool(profile.get("enabled", True))
         elif platform == "github":
             enabled = False
+        elif platform == "wecom":
+            # 企微自建应用：启用条件是 corpid + secret + agent_id 三件套（非 bot_token）。
+            enabled = bool(
+                profile.get("corpid") and profile.get("secret") and profile.get("agent_id")
+            ) and profile.get("enabled", True)
         else:
             enabled = bool(token) and profile.get("enabled", True)
         teams: dict[str, TeamAuth] = {}

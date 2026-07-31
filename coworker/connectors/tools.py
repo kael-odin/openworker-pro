@@ -119,6 +119,10 @@ def _resolve_token(secrets: SecretStore, platform: str, chat_id: str) -> Optiona
     selects that team's bot token from its `slack:team:<team_id>` profile. Manual
     Socket-Mode (single workspace, bare "C…") uses `slack:default`. Non-Slack
     platforms always use `<platform>:default`.
+
+    企微特殊：凭证是 corpid+secret+agent_id 三件套，不是单一 bot_token。这里把
+    profile 整体 JSON 编码返回，_send_wecom 解析后构造 client（sender 是无状态的，
+    只能通过 token 参数传凭证）。
     """
     if platform == "slack":
         from .slack_addr import split
@@ -128,6 +132,12 @@ def _resolve_token(secrets: SecretStore, platform: str, chat_id: str) -> Optiona
             per_team = secrets.get(f"slack:team:{team}") or {}
             return per_team.get("bot_token")
     creds = secrets.get(f"{platform}:default") or {}
+    if platform == "wecom":
+        import json as _json
+
+        if creds.get("corpid") and creds.get("secret") and creds.get("agent_id"):
+            return _json.dumps(creds)
+        return None
     return creds.get("bot_token")
 
 

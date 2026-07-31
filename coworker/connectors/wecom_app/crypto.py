@@ -1,0 +1,191 @@
+"""企业微信消息加解密 —— 企微自建应用回调消息体的 AES-256-CBC 解密 + SHA1 签名校验。
+
+企微「接收消息」加解密协议（官方 @WXMP/msg-crypt）:
+  1. EncodingAESKey（43 字符 base64）→ base64 解码得 32 字节 AES key。
+  2. IV = key 前 16 字节。
+  3. 密文 base64 解码 → AES-256-CBC 解密 → 去掉 PKCS#7 填充。
+  4. 明文布局：16B 随机串 + 4B 网络字节序 msg_len + msg_body + corpid。
+  5. 签名：sha1(排序后 [token, timestamp, nonce, encrypt] 拼接) == msg_signature。
+
+纯函数，无 I/O。pycryptodome 提供 AES（messaging 可选依赖）。
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import struct
+from typing import Optional
+
+
+def _decode_aes_key(encoding_aes_key: str) -> bytes:
+    """43 字符 base64 → 32 字节 AES key（企微约定：key 本身是 base64，补 = 再解码）。"""
+    key = encoding_aes_key + "="
+    return base64.b64decode(key)
+
+
+def _pkcs7_unpad(data: bytes) -> bytes:
+    """去 PKCS#7 填充。末字节即填充长度，校验后剥离。"""
+    if not data:
+        return data
+    pad_len = data[-1]
+    if pad_len < 1 or pad_len > 32:
+        # 不是合法 PKCS#7 填充 —— 当作无填充返回（容错，明文模式可能走到这里）。
+        return data
+    if data[-pad_len:] != bytes([pad_len]) * pad_len:
+        return data
+    return data[:-pad_len]
+
+
+def verify_signature(
+    token: str,
+    timestamp: str,
+    nonce: str,
+    encrypt: str,
+    signature: str,
+) -> bool:
+    """校验企微回调签名。
+
+    signature = sha1( sorted([token, timestamp, nonce, encrypt]).join("") )
+    """
+    parts = sorted([token, timestamp, nonce, encrypt])
+    raw = "".join(parts).encode("utf-8")
+    digest = hashlib.sha1(raw).hexdigest()
+    # 企微签名是 hex 小写；常量时间比较避免时序攻击。
+    return _const_eq(digest, signature or "")
+
+
+def _const_eq(a: str, b: str) -> bool:
+    """常量时间字符串比较（hmac.compare_digest 的等价，避免 import 开销）。"""
+    if len(a) != len(b):
+        return False
+    result = 0
+    for x, y in zip(a, b):
+        result |= ord(x) ^ ord(y)
+    return result == 0
+
+
+def decrypt_message(
+    encrypt: str,
+    encoding_aes_key: str,
+    expected_corpid: Optional[str] = None,
+) -> tuple[str, str]:
+    """解密企微回调密文，返回 (message_xml, corpid)。
+
+    - encrypt: 回调里的密文（base64 字符串）。
+    - encoding_aes_key: 43 字符 base64 串。
+    - expected_corpid: 可选，校验解出的 corpid 是否匹配（防伪造）。
+
+    返回明文 XML 和解出的 corpid。解密失败抛 ValueError。
+    """
+    if not encrypt:
+        raise ValueError("空密文")
+    if not encoding_aes_key or len(encoding_aes_key) != 43:
+        raise ValueError("EncodingAESKey 长度应为 43 字符")
+
+    key = _decode_aes_key(encoding_aes_key)
+    iv = key[:16]
+    ciphertext = base64.b64decode(encrypt)
+
+    # 延迟导入：pycryptodome 是 messaging 可选依赖，不装的用户走明文模式不会触发。
+    from Crypto.Cipher import AES
+
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    plain = cipher.decrypt(ciphertext)
+    plain = _pkcs7_unpad(plain)
+
+    # 明文布局：16B 随机 + 4B msg_len(网络字节序) + msg + corpid
+    if len(plain) < 20:
+        raise ValueError("解密后明文过短，格式异常")
+    msg_len = struct.unpack(">I", plain[16:20])[0]
+    if 20 + msg_len > len(plain):
+        raise ValueError("msg_len 超出明文长度，格式异常")
+    msg = plain[20 : 20 + msg_len].decode("utf-8", errors="replace")
+    corpid = plain[20 + msg_len :].decode("utf-8", errors="replace").strip()
+
+    if expected_corpid and corpid != expected_corpid:
+        raise ValueError(f"corpid 不匹配：期望 {expected_corpid}，实际 {corpid}")
+
+    return msg, corpid
+
+
+def encrypt_message(
+    reply_xml: str,
+    encoding_aes_key: str,
+    corpid: str,
+    token: Optional[str] = None,
+    timestamp: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> dict[str, str]:
+    """加密企微回复消息，返回回调应答所需的 {encrypt, msg_signature, timestamp, nonce}。
+
+    用于被动回复（加密模式）：收到用户消息后，回复也要加密。
+    timestamp/nonce 缺省用当前时间戳 + 随机串（本模块不引入时间源，由调用方注入；
+    若不注入则用 socket.gethostname 做熵源凑数 —— 生产场景调用方应注入真随机）。
+    """
+    if not encoding_aes_key or len(encoding_aes_key) != 43:
+        raise ValueError("EncodingAESKey 长度应为 43 字符")
+
+    key = _decode_aes_key(encoding_aes_key)
+    iv = key[:16]
+
+    # 16B 随机串 + 4B msg_len + msg + corpid
+    import os
+
+    random_bytes = os.urandom(16)
+    msg_bytes = reply_xml.encode("utf-8")
+    corp_bytes = corpid.encode("utf-8")
+    msg_len = struct.pack(">I", len(msg_bytes))
+    plain = random_bytes + msg_len + msg_bytes + corp_bytes
+
+    # PKCS#7 填充到 32 字节倍数（AES block = 16，企微要求 32 倍数）。
+    block = 32
+    pad_len = block - (len(plain) % block)
+    if pad_len == 0:
+        pad_len = block
+    plain += bytes([pad_len]) * pad_len
+
+    from Crypto.Cipher import AES
+
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ciphertext = cipher.encrypt(plain)
+    encrypt_b64 = base64.b64encode(ciphertext).decode("ascii")
+
+    if timestamp is None or nonce is None:
+        # 调用方应注入；这里只做兜底，不引入 time/random 全局。
+        import time
+        import secrets
+
+        timestamp = timestamp or str(int(time.time()))
+        nonce = nonce or secrets.token_hex(8)
+
+    sig = ""
+    if token:
+        parts = sorted([token, timestamp, nonce or "", encrypt_b64])
+        sig = hashlib.sha1("".join(parts).encode("utf-8")).hexdigest()
+
+    return {
+        "encrypt": encrypt_b64,
+        "msg_signature": sig,
+        "timestamp": timestamp,
+        "nonce": nonce or "",
+    }
+
+
+# XML 解析 —— 企微回调是 XML（明文模式或加密模式外层都是 XML）。
+# 用标准库 xml.etree，不做外部 DTD/实体（防 XXE，企微是可信源但默认安全）。
+def parse_callback_xml(body: bytes | str) -> dict[str, str]:
+    """解析企微回调 XML body，返回字段 dict。
+
+    典型字段：ToUserName / Encrypt / MsgType / Event / Content / FromUserName / CreateTime。
+    顶层仅一层，值统一取文本。
+    """
+    import xml.etree.ElementTree as ET
+
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    root = ET.fromstring(body)
+    out: dict[str, str] = {}
+    for child in root:
+        out[child.tag] = (child.text or "").strip()
+    return out
