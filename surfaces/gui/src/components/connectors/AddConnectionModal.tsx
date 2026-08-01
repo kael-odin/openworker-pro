@@ -9,6 +9,7 @@ import {
 } from "../../api";
 import { ConnectorBadge } from "../../connectors/ConnectorIcon";
 import { ConnectSetup } from "../ManageTabs";
+import { WeChatIlinkQrFlow } from "./WeChatIlinkQrFlow";
 import { CloudSignInInline, CloudStatusPending } from "./CloudSignIn";
 import { PILL_ACCENT, PILL_LINE, TAG_ACCENT } from "./ui";
 import { useT } from "../../i18n/I18nProvider";
@@ -73,7 +74,14 @@ export function AddConnectionModal({
           </button>
         </div>
 
-        {twoModes ? (
+        {c.name === "wechat_ilink" ? (
+          <WeChatIlinkQrFlow
+            onConfirmed={() => {
+              onChanged();
+              onClose();
+            }}
+          />
+        ) : twoModes ? (
           <>
             <div className="px-5 pt-4">
               <div className="inline-flex rounded-full p-0.5 bg-paper text-[12.5px] font-medium">

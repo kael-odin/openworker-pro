@@ -94,6 +94,38 @@ def test_send_message_unknown_platform(tmp_path):
     assert "unknown platform" in tool(target="discord:1", text="x")["error"]
 
 
+def test_send_message_wechat_ilink_uses_only_live_delivery(tmp_path):
+    secrets = SecretStore(tmp_path / "secrets.json")
+    stateless_calls = []
+    live_calls = []
+
+    def live(target, text):
+        live_calls.append((target, text))
+        return SendResult(True, message_id="live-1")
+
+    tool = make_send_message_tool(
+        secrets,
+        senders={**_fake_senders(stateless_calls), "wechat_ilink": _fake_senders([])["telegram"]},
+        live_delivery=live,
+    )
+    out = tool(target="wechat_ilink:Account-A/User-1", text="hello")
+    assert out == {
+        "ok": True,
+        "message_id": "live-1",
+        "target": "wechat_ilink:Account-A/User-1",
+    }
+    assert live_calls == [("wechat_ilink:Account-A/User-1", "hello")]
+    assert stateless_calls == []
+
+
+def test_send_message_wechat_ilink_requires_live_delivery(tmp_path):
+    tool = make_send_message_tool(
+        SecretStore(tmp_path / "secrets.json"), senders=_fake_senders([])
+    )
+    out = tool(target="wechat_ilink:A/U", text="x")
+    assert out == {"error": "wechat_ilink live connection is unavailable"}
+
+
 def test_send_message_bad_target(tmp_path):
     tool = make_send_message_tool(
         SecretStore(tmp_path / "secrets.json"), senders=_fake_senders([])
@@ -139,6 +171,62 @@ def test_load_settings_env_allowlist(tmp_path, monkeypatch):
         "coworker.connectors.config", fromlist=["load_settings"]
     ).load_settings(secrets)
     assert settings["telegram"].allowed_users == {"a", "b", "c"}
+
+
+def test_load_settings_wechat_ilink_accounts_are_team_scoped(tmp_path):
+    from coworker.connectors.config import load_settings
+    from coworker.connectors.wechat_ilink.profiles import save_confirmation
+
+    secrets = SecretStore(tmp_path / "secrets.json")
+    for account_id, allowed, allow_all in (
+        ("Account-A", ["friend"], False),
+        ("Account-B", [], True),
+    ):
+        saved = save_confirmation(
+            secrets,
+            account_id=account_id,
+            bot_token="token-" + account_id,
+            base_url="https://ilinkai.weixin.qq.com",
+        )
+        profile = saved.canonical()
+        profile["allowed_users"] = allowed
+        profile["allow_all"] = allow_all
+        secrets.put(f"wechat_ilink:account:{account_id}", profile)
+
+    setting = load_settings(secrets)["wechat_ilink"]
+    assert setting.enabled is True
+    assert setting.teams["Account-A"].allowed_users == {"friend"}
+    assert setting.teams["Account-B"].allow_all is True
+    assert is_authorized(
+        setting,
+        SessionSource(
+            "wechat_ilink",
+            "Account-A/friend",
+            user_id="friend",
+            team_id="Account-A",
+        ),
+    )
+    assert not is_authorized(
+        setting,
+        SessionSource(
+            "wechat_ilink",
+            "Account-A/stranger",
+            user_id="stranger",
+            team_id="Account-A",
+        ),
+    )
+    # Account-B's allow_all applies only when the inbound event is explicitly
+    # scoped to Account-B; the account encoded in chat_id is routing metadata,
+    # while team_id is the authorization boundary supplied by the adapter.
+    assert is_authorized(
+        setting,
+        SessionSource(
+            "wechat_ilink",
+            "Account-B/stranger",
+            user_id="stranger",
+            team_id="Account-B",
+        ),
+    )
 
 
 # -- gateway inbound loop (FakeAdapter) ----------------------------------------
@@ -320,6 +408,12 @@ def test_connector_list_descriptors(tmp_path):
         by_name["github"]["available"] is True
         and by_name["github"]["connected"] is False
     )
+    assert by_name["wechat_ilink"]["available"] is True
+    assert by_name["wechat_ilink"]["experimental"] is False
+    assert by_name["wechat_ilink"]["auth"] == "qr"
+    assert by_name["wechat_ilink"]["two_way"] is True
+    assert by_name["wechat_ilink"]["channels"] is False
+    assert by_name["wechat_ilink"]["fields"] == []
     assert any(
         t["name"] == "browser_open_url" and t["requires_approval"]
         for t in by_name["browser"]["tools"]
@@ -350,6 +444,42 @@ def test_connector_list_pre_connect_copy(tmp_path):
         if d.available and not d.experimental and d.name not in ACCESS
     ]
     assert not missing, f"connectors missing curated access copy: {missing}"
+
+
+def test_connector_list_wechat_ilink_accounts_are_public_and_disconnect_all(tmp_path):
+    from coworker.connectors import connector_list, disconnect_connector
+    from coworker.connectors.wechat_ilink.profiles import save_confirmation
+
+    secrets = SecretStore(tmp_path / "secrets.json")
+    save_confirmation(
+        secrets,
+        account_id="Account-A",
+        bot_token="super-secret-token",
+        base_url="https://ilinkai.weixin.qq.com",
+        user_id="wx-private-id",
+        display_name="My WeChat",
+    )
+
+    entry = next(c for c in connector_list(secrets) if c["name"] == "wechat_ilink")
+    assert entry["connected"] is True
+    assert entry["account"] == "My WeChat"
+    assert entry["accounts"] == [
+        {
+            "account_id": "Account-A",
+            "display_name": "My WeChat",
+            "enabled": True,
+            "default": True,
+            "allowed_users": [],
+            "allow_all": False,
+            "needs_reauth": False,
+        }
+    ]
+    assert "super-secret-token" not in repr(entry)
+    assert "wx-private-id" not in repr(entry)
+    assert "base_url" not in repr(entry)
+
+    assert disconnect_connector(secrets, "wechat_ilink")["ok"] is True
+    assert not [m for m in secrets.status() if m["profile"].startswith("wechat_ilink:")]
 
 
 def test_connector_list_connected_for_required_profiles(tmp_path):
@@ -606,8 +736,9 @@ def test_slack_event_mapper_and_loop_guard():
     )
 
 
-def test_make_adapter():
+def test_make_adapter(tmp_path):
     from coworker.connectors import SlackAdapter, TelegramAdapter, make_adapter
+    from coworker.connectors.wechat_ilink import WeChatIlinkAdapter
 
     assert isinstance(make_adapter("telegram", {"bot_token": "T"}), TelegramAdapter)
     assert isinstance(
@@ -615,6 +746,11 @@ def test_make_adapter():
     )
     assert make_adapter("slack", {"bot_token": "x"}) is None  # app_token missing
     assert make_adapter("telegram", {}) is None
+    secrets = SecretStore(tmp_path / "secrets.json")
+    assert isinstance(
+        make_adapter("wechat_ilink", {}, secrets=secrets), WeChatIlinkAdapter
+    )
+    assert make_adapter("wechat_ilink", {}, secrets=None) is None
 
 
 async def test_slack_resolves_and_caches_display_name():

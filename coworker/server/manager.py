@@ -44,6 +44,7 @@ from ..automation import Schedule, ScheduledTask, Scheduler, TaskRun, TaskStore
 from ..connectors import (
     Gateway,
     MessageSource,
+    SendResult,
     connect_connector,
     connector_list,
     disconnect_connector,
@@ -146,6 +147,14 @@ class SessionManager:
         self._autotitle_attempts: dict[str, int] = {}
         self.workspace_trust = WorkspaceTrustStore()
         self.secrets = SecretStore()
+        # Personal-WeChat QR attempts own short-lived polling clients and never
+        # expose the polling transaction or confirmed credentials. A successful
+        # scan hot-reloads the one shared messaging gateway.
+        from ..connectors.wechat_ilink.auth import QrAttemptRegistry
+
+        self.wechat_ilink_qr = QrAttemptRegistry(
+            self.secrets, on_confirm=self._wechat_ilink_confirmed
+        )
         # No explicit provider injected → route by the model's `provider:` prefix (OpenAI default,
         # Ollama, …). Tests inject a provider directly and bypass the router. The same router is
         # shared by every engine and the `/v1/chat/completions` proxy.
@@ -159,6 +168,7 @@ class SessionManager:
         self._mcp_authorizing: set[str] = set()
         self._mcp_errors: dict[str, str] = {}
         self.gateway: Optional[Gateway] = None
+        self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._data_base = base
         # Desktop/UI prefs (default model, onboarding state) — not secrets; a plain JSON file.
         self._prefs = self._load_prefs()
@@ -540,6 +550,7 @@ class SessionManager:
             # delegate subtasks to any installed persona, and surface available /commands.
             persona_registry=self.personas,
             command_loader=self._engine_command_loader(),
+            live_delivery=self._live_delivery,
         )
         # An automation run rebuilt here (manual "Run now" over WS, durable resume) still
         # carries its task's standing allowances — the rules live on the task record.
@@ -1210,6 +1221,132 @@ class SessionManager:
         return {"ok": True}
 
     # -- connectors -------------------------------------------------------------
+    async def _wechat_ilink_confirmed(self, _account_id: str) -> None:
+        """Best-effort hot refresh after QR confirmation saves an account."""
+        await self.refresh_gateway()
+
+    def _wechat_ilink_runtime_status(self) -> dict[str, dict[str, Any]]:
+        adapter = (
+            self.gateway._adapters.get("wechat_ilink")
+            if self.gateway is not None
+            else None
+        )
+        snapshot = getattr(adapter, "status", None)
+        if not callable(snapshot):
+            return {}
+        status = snapshot()
+        accounts = status.get("accounts") if isinstance(status, dict) else None
+        return accounts if isinstance(accounts, dict) else {}
+
+    async def create_wechat_ilink_qr(
+        self, *, reauth_account_id: str = ""
+    ) -> dict[str, Any]:
+        if reauth_account_id:
+            from ..connectors.wechat_ilink.profiles import (
+                ProfileError,
+                get_account,
+            )
+
+            try:
+                if get_account(self.secrets, reauth_account_id) is None:
+                    return {"ok": False, "error": "account not connected"}
+            except ProfileError:
+                return {"ok": False, "error": "invalid account id"}
+        try:
+            return {
+                "ok": True,
+                **await self.wechat_ilink_qr.create(
+                    reauth_account_id=reauth_account_id
+                ),
+            }
+        except Exception:
+            return {"ok": False, "error": "wechat_ilink QR code unavailable"}
+
+    async def get_wechat_ilink_qr(self, attempt_id: str) -> dict[str, Any]:
+        attempt = await self.wechat_ilink_qr.get(str(attempt_id).strip())
+        if attempt is None:
+            return {"ok": False, "error": "unknown QR attempt"}
+        return {"ok": True, **attempt}
+
+    async def cancel_wechat_ilink_qr(self, attempt_id: str) -> dict[str, Any]:
+        if not await self.wechat_ilink_qr.cancel(str(attempt_id).strip()):
+            return {"ok": False, "error": "unknown QR attempt"}
+        return {"ok": True}
+
+    def wechat_ilink_accounts(self) -> dict[str, Any]:
+        from ..connectors.wechat_ilink.profiles import account_rows
+
+        runtime = self._wechat_ilink_runtime_status()
+        accounts: list[dict[str, Any]] = []
+        for row in account_rows(self.secrets):
+            live = runtime.get(row["account_id"], {})
+            state = str(live.get("state") or "")
+            if not state:
+                state = "auth_required" if row.get("needs_reauth") else "offline"
+            accounts.append(
+                {
+                    **row,
+                    "state": state,
+                    "retry_count": int(live.get("retry_count") or 0),
+                    "last_event_at": live.get("last_event_at"),
+                    "last_error": str(live.get("last_error") or ""),
+                    "needs_reauth": bool(
+                        row.get("needs_reauth")
+                        or live.get("needs_reauth")
+                        or state == "auth_required"
+                    ),
+                }
+            )
+        return {"ok": True, "accounts": accounts}
+
+    def wechat_ilink_status(self) -> dict[str, Any]:
+        accounts = self.wechat_ilink_accounts()["accounts"]
+        states = {str(a.get("state") or "offline") for a in accounts}
+        if "live" in states:
+            state = "live"
+        elif "reconnecting" in states or "connecting" in states:
+            state = "reconnecting"
+        elif "auth_required" in states:
+            state = "auth_required"
+        else:
+            state = "offline"
+        return {"ok": True, "state": state, "accounts": accounts}
+
+    async def disconnect_wechat_ilink_all(self) -> dict[str, Any]:
+        """Cancel QR workers before deleting every local iLink credential."""
+        await self.wechat_ilink_qr.aclose()
+        result = disconnect_connector(self.secrets, "wechat_ilink")
+        await self.refresh_gateway()
+        return result
+
+    async def disconnect_wechat_ilink_account(
+        self, account_id: str
+    ) -> dict[str, Any]:
+        from ..connectors.wechat_ilink.profiles import ProfileError, delete_account
+
+        account_id = str(account_id).strip()
+        try:
+            await self.wechat_ilink_qr.cancel_for_account(account_id)
+            deleted = delete_account(self.secrets, account_id)
+        except ProfileError:
+            return {"ok": False, "error": "invalid account id"}
+        if not deleted:
+            return {"ok": False, "error": "account not connected"}
+        await self.refresh_gateway()
+        return {
+            "ok": True,
+            "remaining_accounts": len(self.wechat_ilink_accounts()["accounts"]),
+        }
+
+    async def set_wechat_ilink_default(self, account_id: str) -> dict[str, Any]:
+        from ..connectors.wechat_ilink.profiles import ProfileError, set_default
+
+        try:
+            changed = set_default(self.secrets, str(account_id).strip())
+        except ProfileError:
+            return {"ok": False, "error": "invalid account id"}
+        return {"ok": changed, **({} if changed else {"error": "account not connected"})}
+
     def list_connectors(self) -> list[dict[str, Any]]:
         # Enrich two-way connectors with the live gateway's recently-seen senders, so the Connectors
         # tab can manage the allow-list inline (each recent sender flagged authorized or not).
@@ -1218,11 +1355,31 @@ class SessionManager:
             if not (c.get("two_way") and c.get("connected")):
                 continue
             allowed = set(c.get("allowed_users") or [])
-            # Per-workspace allow-lists (managed relay) — a sender is judged against
-            # ITS workspace's list; the flat list only governs team-less (socket) events.
+            # Per-workspace/account allow-lists — a sender is judged against ITS
+            # tenant's list; the flat list only governs team-less events.
+            team_rows = list(c.get("workspaces") or [])
+            if c.get("name") == "wechat_ilink":
+                runtime = {
+                    a["account_id"]: a
+                    for a in self.wechat_ilink_accounts()["accounts"]
+                }
+                for account in c.get("accounts") or []:
+                    account.update(runtime.get(account.get("account_id"), {}))
+                    account["allowed_user_names"] = {
+                        u: self._people.get(f"{c['name']}:{u}")
+                        for u in (account.get("allowed_users") or [])
+                    }
+                    team_rows.append(
+                        {
+                            **account,
+                            "team_id": account.get("account_id"),
+                        }
+                    )
+                c["status"] = self.wechat_ilink_status()
             team_allowed = {
-                w["team_id"]: set(w.get("allowed_users") or [])
-                for w in (c.get("workspaces") or [])
+                row["team_id"]: set(row.get("allowed_users") or [])
+                for row in team_rows
+                if row.get("team_id")
             }
             recent = self.gateway.recent_senders(c["name"]) if self.gateway else []
             for r in recent:
@@ -1245,15 +1402,16 @@ class SessionManager:
                 u: self._people.get(f"{c['name']}:{u}")
                 for u in (c.get("approval_owner_ids") or [])
             }
-            for w in c.get("workspaces") or []:
-                w["allowed_user_names"] = {
+            for row in team_rows:
+                row["allowed_user_names"] = {
                     u: self._people.get(f"{c['name']}:{u}")
-                    for u in (w.get("allowed_users") or [])
+                    for u in (row.get("allowed_users") or [])
                 }
-                w["approval_owner_names"] = {
-                    u: self._people.get(f"{c['name']}:{u}")
-                    for u in (w.get("approval_owner_ids") or [])
-                }
+                if row in (c.get("workspaces") or []):
+                    row["approval_owner_names"] = {
+                        u: self._people.get(f"{c['name']}:{u}")
+                        for u in (row.get("approval_owner_ids") or [])
+                    }
         return connectors
 
     def connect_connector(
@@ -1435,10 +1593,15 @@ class SessionManager:
         inlined contents of each entry's storageState.json / cookies.json. The frontend
         triggers a file download of this. ``version`` tags the format so future importers
         can migrate.
+
+        Security: only reads the canonical ``storageState.json`` / ``cookies.json`` files
+        derived from the registry's ``safe_id``. Containment uses ``is_relative_to`` on the
+        resolved path (not string ``startswith``) and rejects symlinks, so a tampered entry
+        whose stored path points outside the state dir can't exfiltrate arbitrary files.
         """
         import json
 
-        base = state_dir()
+        base = Path(state_dir()).resolve()
         entries = []
         for l in self.browser_logins.list():
             entry = l.to_dict()
@@ -1446,7 +1609,14 @@ class SessionManager:
             for rel in (l.storage_state_path, l.cookie_path):
                 if not rel:
                     continue
-                p = Path(base) / rel
+                # Resolve and verify containment: the file must live under the state dir.
+                try:
+                    p = (base / rel).resolve()
+                    p.relative_to(base)  # reject path escape
+                except (ValueError, OSError):
+                    continue  # entry points outside state dir — skip, don't read it
+                if p.is_symlink():
+                    continue  # reparse-point escape — don't follow
                 if p.is_file():
                     try:
                         files[rel] = p.read_text(encoding="utf-8")
@@ -1462,10 +1632,23 @@ class SessionManager:
         Existing entries with the same id are overwritten (same overwrite-on-add semantics as
         the registry). State files are written under ``browser_profiles/<id>/`` before the
         registry entry is added, so has_state is truthful from the moment of import.
+
+        Security: imported paths are NOT trusted. The canonical filenames
+        (``storageState.json`` / ``cookies.json``) under ``browser_profiles/<safe_id>/`` are
+        the only files written, derived from the validated ``safe_id`` — not from the
+        backup's ``_files`` keys. Containment uses ``Path.is_relative_to()`` (not string
+        ``startswith``, which a same-prefix sibling can bypass), symlinks/reparse points are
+        rejected, and writes are atomic + user-private via ``write_private_text``.
         """
         import json
 
         from ..browser_logins import BrowserLoginEntry, safe_id
+        from ..secrets import write_private_text
+
+        # Bounds: a backup with thousands of files or a single oversized state is either
+        # corrupt or an attempt to exhaust disk / memory during parse.
+        _MAX_FILES_PER_LOGIN = 2  # storageState.json + cookies.json — nothing else is canonical
+        _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MiB per state file (cookies/state are small JSON)
 
         try:
             data = json.loads(payload) if isinstance(payload, str) else payload
@@ -1474,7 +1657,7 @@ class SessionManager:
         if not isinstance(data, dict) or not isinstance(data.get("logins"), list):
             return {"ok": False, "error": "expected {version, logins: [...]}"}
 
-        base = state_dir()
+        base = Path(state_dir()).resolve()
         imported = 0
         for raw in data["logins"]:
             if not isinstance(raw, dict):
@@ -1484,19 +1667,39 @@ class SessionManager:
             except ValueError:
                 continue
             files = raw.get("_files") or {}
-            # Write state files first.
+            if not isinstance(files, dict) or len(files) > _MAX_FILES_PER_LOGIN:
+                continue  # too many files — refuse rather than write the overflow
+            # Write state files first. The ONLY canonical destinations are under
+            # browser_profiles/<safe_id>/, derived from the validated id — never from the
+            # backup's rel-path keys (those are display-only metadata from the export).
+            profile_root = (base / "browser_profiles" / login_id).resolve()
+            try:
+                profile_root.relative_to(base)  # containment: profile dir must stay under state
+            except ValueError:
+                continue
+            if profile_root.is_symlink():  # reject reparse-point escape
+                continue
+            # Accept only the two canonical filenames regardless of what _files claims.
+            canonical = {"storageState.json", "cookies.json"}
             for rel, content in files.items():
                 if not isinstance(rel, str) or not isinstance(content, str):
                     continue
-                # Guard against path traversal in the stored rel paths.
+                # The basename must be one of the canonical files; ignore any other path.
+                name = Path(rel).name
+                if name not in canonical:
+                    continue
+                if len(content.encode("utf-8")) > _MAX_FILE_BYTES:
+                    continue  # oversized — skip, don't write a partial/malicious blob
+                dest = (profile_root / name).resolve()
+                # Final containment + symlink check on the resolved destination.
                 try:
-                    dest = (Path(base) / rel).resolve()
-                    if not str(dest).startswith(str(Path(base).resolve())):
-                        continue
-                except Exception:
+                    dest.relative_to(base)
+                except ValueError:
+                    continue
+                if dest.is_symlink():
                     continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(content, encoding="utf-8")
+                write_private_text(dest, content)  # atomic + user-private (0600/ACL)
             # Rebuild the registry entry (drop the _files key).
             entry_raw = {k: v for k, v in raw.items() if k != "_files"}
             entry = BrowserLoginEntry.from_dict(entry_raw)
@@ -2528,8 +2731,11 @@ class SessionManager:
         user_id = str(user_id).strip()
         if not user_id:
             return {"ok": False, "error": "user_id required"}
-        scope = "install" if name == "github" else "team"
-        profile_key = f"{name}:{scope}:{team_id}" if team_id else f"{name}:default"
+        if name == "wechat_ilink" and team_id:
+            profile_key = f"wechat_ilink:account:{team_id}"
+        else:
+            scope = "install" if name == "github" else "team"
+            profile_key = f"{name}:{scope}:{team_id}" if team_id else f"{name}:default"
         profile = self.secrets.get(profile_key)
         if not profile:
             return {
@@ -2708,6 +2914,7 @@ class SessionManager:
         return started
 
     async def _build_and_start_gateway(self) -> list[str]:
+        self._gateway_loop = asyncio.get_running_loop()
         settings = load_settings(self.secrets)
         self.gateway = Gateway(
             secrets=self.secrets,
@@ -2765,6 +2972,22 @@ class SessionManager:
         if self.gateway is not None:
             await self.gateway.stop()
             self.gateway = None
+        self._gateway_loop = None
+
+    def _live_delivery(self, target: str, text: str) -> SendResult:
+        """Bridge a sync tool call in a worker thread onto the live Gateway loop."""
+        gateway = self.gateway
+        loop = self._gateway_loop
+        if gateway is None or loop is None or loop.is_closed() or not loop.is_running():
+            return SendResult(False, error="live messaging gateway is unavailable")
+        try:
+            future = asyncio.run_coroutine_threadsafe(gateway.deliver(target, text), loop)
+            return future.result(timeout=55.0)
+        except TimeoutError:
+            future.cancel()
+            return SendResult(False, error="live messaging delivery timed out")
+        except Exception:
+            return SendResult(False, error="live messaging delivery failed")
 
     # -- unauthorized inbound (parked, §19) --------------------------------------
     def _note_person(
@@ -2873,6 +3096,7 @@ class SessionManager:
 
     async def aclose(self) -> None:
         await self.scheduler.stop()
+        await self.wechat_ilink_qr.aclose()
         await self.stop_gateway()
         await self.mcp.aclose()
         self.audit_store.close()
@@ -3030,6 +3254,7 @@ class SessionManager:
             # Persona delegation (E3) + slash commands (E3).
             persona_registry=self.personas,
             command_loader=self._engine_command_loader(),
+            live_delivery=self._live_delivery,
         )
         self._seed_task_permissions(engine, task)
         return engine
@@ -3039,8 +3264,17 @@ class SessionManager:
         """Mirror an Inbox item to its bound channel. Discrete choices (approve/deny, ask_user
         options) render as BUTTONS — the item id rides in each, so a click resolves it
         unambiguously. Free-text answers aren't offered over messaging (open the app).
+
+        Independent of the messaging-channel mirror: a pending decision item (approval/plan/
+        directory) from an automation run also fans out through the NotifyRouter so a user who
+        stepped away — and who may have NO messaging connector bound, only notify channels like
+        钉钉/飞书/企微 — still gets told "your automation needs you." The two paths coexist:
+        the binding mirror offers one-tap resolution; the notify ping just raises the alarm.
         """
         from ..interactions import buttons_for
+
+        # Notify-channel fan-out first (best-effort, never blocks the binding mirror).
+        await self._notify_inbox_action_needed(item)
 
         binding = self.inbox_routing.binding_for(item.inbox)
         if not (binding.channel and self.gateway is not None):
@@ -3182,7 +3416,8 @@ class SessionManager:
         await self.deliver_to_session(wake.session_id, self._wake_message(wake))
 
     async def deliver_to_session(
-        self, session_id: str, message: str, *, source: Optional[dict[str, Any]] = None
+        self, session_id: str, message: str, *, source: Optional[dict[str, Any]] = None,
+        reply_target: str = "",
     ) -> None:
         """Deliver an out-of-band message to a (durable) session — the agent stays resumable
         forever, so this works with no live socket. Busy (mid tool-loop): steer it into the live
@@ -3190,10 +3425,33 @@ class SessionManager:
         (results persist; if the session is Unattended, any approvals route to the Inbox). Shared
         by self-wake and channel-subscription delivery. `source` is the display-only MessageSource
         sidecar for connector messages (framed `message` stays the model-facing text).
+
+        `reply_target` is the exact send_message target a reply should land on (e.g.
+        ``wechat_ilink:<account>/<user>`` for a personal-WeChat DM). When set, a task-scoped
+        standing rule is seeded so the agent's reply to THAT contact is pre-approved — a DM that
+        just arrived should not park its own answer behind a per-call approval prompt (the user
+        already opted into the conversation by designating this session as the DM route). The
+        rule is target-pinned, so it never covers a different contact or platform.
         """
         engine = self.get_engine(session_id)
         if engine is None:
             return
+        # Seed a target-pinned standing allowance so the reply doesn't wait on an approval
+        # prompt (which a background/DM turn has no live user watching to grant). Same mechanism
+        # as the mention-thread grant; exact-target binding is what keeps it safe.
+        if reply_target:
+            engine.permissions.task_rules.setdefault("send_message", set()).add(reply_target)
+            # Per-turn directive, prepended to the delivered message: the static system-prompt
+            # guidance is necessary but not always sufficient — models default to answering in
+            # plain text and skip the tool call unless the instruction is co-located with the
+            # inbound message. This block sits next to the user's text so the model can't miss it.
+            message = (
+                f"{message}\n\n"
+                f"[system] The sender above is on a messaging channel and cannot see your "
+                f"assistant text in this app. You MUST reply by calling the send_message tool "
+                f'with target "{reply_target}" and your answer as the text. Do not answer only '
+                f"in this conversation — that reaches no one. Call send_message now."
+            )
         if not self.try_mark_running(session_id):
             engine.queue_steering(message, source)
             return
@@ -3287,7 +3545,9 @@ class SessionManager:
         # DM (or any non-channel): route to the designated session, else park it for visibility.
         dm = self.dm_session()
         if dm and self._inbound_connector_allowed(dm, src.platform):
-            await self.deliver_to_session(dm, event.tagged_text(), source=ms.to_dict())
+            await self.deliver_to_session(
+                dm, event.tagged_text(), source=ms.to_dict(), reply_target=src.target
+            )
         elif dm:
             # Designated, but this session has muted the connector → park rather than deliver.
             self.unrouted.record(
@@ -3523,6 +3783,36 @@ class SessionManager:
                 },
             },
         )
+        # UX-026: app-wide "automation finished" toast. Pairs with automation_run_started —
+        # a user who stepped away (or is in another section) learns the run completed, with a
+        # View-run link. broadcast_session only reaches sockets already on this session; this
+        # reaches every open window via /ws/events.
+        await self.broadcast_event(
+            {
+                "type": "automation_run_done",
+                "data": {
+                    "task_id": task.id,
+                    "task_title": task.title,
+                    "session_id": run.session_id,
+                    "workspace": task.workspace,
+                    "agent": task.agent,
+                    "run_id": run.run_id,
+                    "status": run.status,
+                    "summary": summary,
+                },
+            }
+        )
+        # Messaging-target + multi-channel notify fan-out (sync core, shared with manual runs).
+        self._dispatch_run_notify(task, run)
+
+    def _dispatch_run_notify(self, task, run: TaskRun) -> None:
+        """Sync core of run-completion notification: the single messaging target (if set) +
+        the NotifyRouter multi-channel fan-out (钉钉/飞书/企微/webhook/邮件). Shared by the
+        headless scheduled path (``_notify_task_done``) and the synchronous manual-run
+        finalizer (``finalize_manual_run``), which can't await. Best-effort: a failing channel
+        is logged inside the router, never raised. Whether anything actually sends is gated by
+        ``task.notify_level`` + ``run.status`` inside the router (none/important may no-op)."""
+        summary = (run.result_text or "").strip()[:280]
         if task.notify_target:
             from ..connectors.base import parse_target
             from ..connectors.senders import DEFAULT_SENDERS
@@ -3532,27 +3822,60 @@ class SessionManager:
                 sender = DEFAULT_SENDERS.get(platform)
                 creds = self.secrets.get(f"{platform}:default") or {}
                 if sender and creds.get("bot_token"):
-                    await asyncio.to_thread(
-                        sender,
-                        creds["bot_token"],
-                        chat_id,
-                        f"✓ {task.title}\n\n{summary}",
-                        thread,
-                    )
+                    sender(creds["bot_token"], chat_id, f"✓ {task.title}\n\n{summary}", thread)
             except Exception:
                 pass
-        # 多渠道通知（钉钉/飞书/企微/webhook/邮件）：按 task.notify_channels + notify_level 分发。
-        # 与 notify_target 的单平台推送并存 —— 后者是 messaging 连接器，这里是通知渠道层。
-        # 是否真的发送由 router 依 level + run.status 决定（none/important 时可能 no-op）。
+        try:
+            self.notify_router.dispatch_run(
+                task_name=task.title,
+                run_status=run.status,
+                result_text=run.result_text,
+                error=run.error,
+                channels=task.notify_channels or None,
+                level=task.notify_level,
+            )
+        except Exception:
+            pass
+
+    async def _notify_inbox_action_needed(self, item) -> None:
+        """Fan a pending decision (approval/plan/directory) from an automation run out through
+        the NotifyRouter. This is the "your automation is blocked and needs you" alarm — it runs
+        INDEPENDENTLY of the messaging-channel mirror, so a user with only notify channels
+        (钉钉/飞书/企微) and no bound Slack/Telegram still gets pinged when they're away.
+
+        Scope rules:
+          - Only protected decision kinds (approval/plan/directory). Questions (ask_user) are
+            lower-stakes and usually have a live socket; skip to avoid noise.
+          - Only items carrying task context (``data.task_title``) — i.e. a scheduled/unattended
+            run. Interactive sessions have the user in-app; no alarm needed.
+          - Respect ``task.notify_level``: ``none`` stays silent; ``important``/``all`` sends.
+            A pending decision IS the important event, so we bypass the router's status filter
+            (which would suppress non-error) and decide here instead.
+        """
+        if item.state != "pending":
+            return  # durable resume re-raised an already-resolved prompt — no alarm
+        if item.kind not in {"approval", "plan", "directory"}:
+            return
+        data = getattr(item, "data", None) or {}
+        task_title = data.get("task_title")
+        task_id = data.get("task_id")
+        if not task_title:
+            return  # no automation context → user is in an interactive session, in-app already
+        task = self.task_store.get(task_id) if task_id else None
+        level = (task.notify_level if task else "important")
+        if level == "none":
+            return
+        # Compose a body that names the tool/decision and points back to the app.
+        body = "\n".join(p for p in (item.title, item.body) if p).strip()[:1500]
+        body = f"{body}\n\n打开 OpenWorker 处理。"
         try:
             await asyncio.to_thread(
-                lambda: self.notify_router.dispatch_run(
-                    task_name=task.title,
-                    run_status=run.status,
-                    result_text=run.result_text,
-                    error=run.error,
-                    channels=task.notify_channels or None,
-                    level=task.notify_level,
+                lambda: self.notify_router.dispatch(
+                    title=f"[{task_title}] 需要你处理",
+                    body=body,
+                    status="ok",  # not a run-status; level gate already decided above
+                    channels=(task.notify_channels if task and task.notify_channels else None),
+                    level=level,
                 )
             )
         except Exception:
@@ -3717,12 +4040,92 @@ class SessionManager:
             },
         }
 
-    def install_digital_human(self, slug: str, config: dict[str, Any]) -> dict[str, Any]:
+    def preflight_digital_human(self, slug: str, config: dict[str, Any]) -> dict[str, Any]:
+        """Compute the dependency/capability manifest + an approval digest BEFORE installing.
+
+        The GUI shows this manifest (source, version, requires plugins/mcps/skills/...,
+        capabilities, permissions) and asks the user to confirm. The install endpoint must
+        receive the matching approval digest back; a digest mismatch (spec changed between
+        preflight and install) re-runs preflight and refuses the stale approval. Plugins that
+        register an MCP server are called out for SEPARATE confirmation — they are not
+        auto-installed under the single install approval.
+        """
+        from ..digital_human import validate_config
+        import hashlib
+
+        try:
+            spec = self.dhp_registry.get_spec(slug)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        cfg = dict(config or {})
+        missing = validate_config(spec, cfg)
+        if missing:
+            return {"ok": False, "error": f"missing required config: {', '.join(missing)}"}
+
+        entry = self.dhp_registry.get(slug)
+        source = ""
+        version = spec.version
+        if entry is not None:
+            # The registry entry records which source it came from (provenance).
+            source = getattr(entry, "source_id", "") or ""
+
+        # Dependency/capability manifest: every external thing this spec pulls in.
+        manifest = {
+            "source": source,
+            "version": version,
+            "spec_version": spec.spec_version,
+            "requires_plugins": [p.to_dict() for p in spec.requires_plugins],
+            "requires_mcps": [m.to_dict() for m in spec.requires_mcps],
+            "requires_skills": [s.to_dict() for s in spec.requires_skills],
+            "requires_commands": [c.to_dict() for c in spec.requires_commands],
+            "requires_subagents": [s.to_dict() for s in spec.requires_subagents],
+            "permissions": list(spec.permissions),
+            "browser_login": list(spec.browser_login),
+            "config_secret_keys": [f.key for f in spec.config_schema if f.is_secret],
+        }
+        # Plugins that register an MCP server need a SEPARATE explicit confirmation — they
+        # expand the agent's tool surface at runtime, which is a higher-risk action than a
+        # plain plugin install. Surface them so the GUI can collect a second ack.
+        mcp_registering_plugins = []
+        for dep in spec.requires_plugins:
+            # We can't know without the plugin manifest whether it registers an MCP server;
+            # flag any plugin whose id suggests MCP (heuristic) or all of them for separate
+            # confirmation if the spec also declares requires_mcps.
+            if spec.requires_mcps:
+                mcp_registering_plugins.append(dep.id)
+
+        # Stable approval digest: binds (slug, version, manifest) so a spec that changed
+        # between preflight and install is caught. SHA-256 over the canonical JSON.
+        digest_payload = json.dumps(
+            {"slug": slug, "version": version, "manifest": manifest},
+            sort_keys=True, ensure_ascii=False,
+        )
+        digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+        return {
+            "ok": True,
+            "manifest": manifest,
+            "approval_digest": digest,
+            "mcp_confirmation_required": mcp_registering_plugins,
+            "missing_required_config": missing,
+        }
+
+    def install_digital_human(
+        self,
+        slug: str,
+        config: dict[str, Any],
+        *,
+        approval_digest: str = "",
+        mcp_confirmed: bool = False,
+    ) -> dict[str, Any]:
         """Install a digital human as an automation (spec → ScheduledTask + instance record).
 
-        Before installing, auto-install any missing ``requires_plugins`` from the default
-        marketplace source (core rule 2: the digital human is a consumer of customize — a
-        missing plugin dependency should be one-click resolvable, not a dead-end).
+        Requires an ``approval_digest`` matching the current preflight manifest; a stale or
+        absent digest is refused (dependency plan changed since the user approved). Plugins
+        that register an MCP server require a separate ``mcp_confirmed`` ack — they are not
+        auto-installed under the single install approval. Missing non-MCP plugins from the
+        default marketplace source ARE auto-installed (one-click dependency resolution), but
+        only after the digest check passes.
         """
         from ..digital_human import install_digital_human, SpecError
 
@@ -3731,10 +4134,36 @@ class SessionManager:
         except SpecError as e:
             return {"ok": False, "error": str(e)}
 
-        # Auto-install missing plugin dependencies from the default marketplace source.
+        # Approval boundary: recompute the preflight digest and require a match. Without this,
+        # a spec that gained a new plugin/MCP dependency between the user viewing the manifest
+        # and clicking install would silently pull in the new capability.
+        preflight = self.preflight_digital_human(slug, dict(config or {}))
+        if not preflight.get("ok"):
+            return preflight
+        current_digest = preflight["approval_digest"]
+        if not approval_digest or approval_digest != current_digest:
+            return {
+                "ok": False,
+                "error": "dependency plan changed; review and re-approve the manifest",
+                "approval_digest": current_digest,
+                "manifest": preflight["manifest"],
+            }
+        if preflight.get("mcp_confirmation_required") and not mcp_confirmed:
+            return {
+                "ok": False,
+                "error": "this digital human registers MCP-backed plugins; confirm the MCP registration separately",
+                "mcp_confirmation_required": preflight["mcp_confirmation_required"],
+            }
+
+        # Auto-install missing non-MCP plugin dependencies from the default marketplace source.
+        # MCP-registering plugins are NOT auto-installed here — they need their own confirmation.
         if spec.requires_plugins:
             installed_plugins = {p["name"] for p in self.list_plugins() if p.get("name")}
-            missing = [d for d in spec.requires_plugins if d.id not in installed_plugins]
+            mcp_plugin_ids = set(preflight.get("mcp_confirmation_required") or [])
+            missing = [
+                d for d in spec.requires_plugins
+                if d.id not in installed_plugins and d.id not in mcp_plugin_ids
+            ]
             for dep in missing:
                 # Find the plugin in the default source's catalog, then install it.
                 default_src = next((s for s in self.plugin_sources.list() if s.is_default), None)
@@ -3845,13 +4274,14 @@ class SessionManager:
                 self.dhp_instances.secrets.put(f"{SECRET_PROFILE_PREFIX}{inst.id}", secret)
             inst.config = non_secret
             inst.secret_keys = secret_keys
-            # The prompt preamble needs the resolved full config (secrets included — they're in
-            # the static instructions, same as install).
-            full_config = dict(non_secret)
-            full_config.update(secret)
+            # Instructions carry only non-secret config + typed ``<configured>`` markers for
+            # secret keys — the values never enter the static task prompt/API/audit. Same
+            # boundary as the install path.
             task_changes["instructions"] = reinstall_instructions(
-                spec, full_config, system_prompt=system_prompt
+                spec, non_secret, system_prompt=system_prompt, secret_keys=secret_keys
             )
+            # The rewrite produces a clean (no-plaintext-secret) preamble; clear the legacy flag.
+            inst.needs_secret_migration = False
 
         for key in ("cron", "notify_channels", "notify_level", "title", "enabled"):
             if key in changes:
@@ -4019,6 +4449,13 @@ class SessionManager:
             task.last_run, task.last_status = run.finished_at, "ok"
             task.run_count += 1
             self.task_store.save(task)
+            # Manual-run completion notification. Unlike the headless scheduled path, the user
+            # drove this run over a live WS so we skip the socket broadcast — but a user who
+            # stepped away mid-run still gets told it finished via their notify channels (and
+            # messaging target, if set). Level-gated same as scheduled runs: ``important``
+            # (default) stays silent on success, ``all`` pings every time.
+            if task.notify_on_completion:
+                self._dispatch_run_notify(task, run)
         return {"ok": True, "run": run.to_dict()}
 
     def save(self, session_id: str, engine: TurnEngine) -> None:

@@ -36,20 +36,55 @@ from .spec import DigitalHumanSpec, SpecError
 _NEVER_CRON = "0 0 30 2 *"
 
 
-def build_instructions(spec: DigitalHumanSpec, config: dict[str, Any]) -> str:
-    """Prepend a ``## 用户配置`` preamble (the resolved userConfig JSON) to the system prompt.
+_SECRET_MARKER = "<configured>"  # typed marker for a secret value held in SecretStore only
 
-    DHP prompts reference ``userConfig[<key>]``; openworker has no separate config channel, so the
-    values are injected into the prompt itself. Missing required keys are caught earlier by
-    :func:`validate_config`; here we trust the config is complete."""
+
+def _preamble(non_secret: dict[str, Any], secret_keys: list[str]) -> str:
+    """Build the ``## 用户配置`` preamble from non-secret values + typed secret markers.
+
+    Secret values are NEVER serialized into the instructions: each secret key is rendered as
+    ``<configured>`` so the model sees the key is set, but the value lives only in the
+    SecretStore profile (``SECRET_PROFILE_PREFIX<id>``) and never enters the prompt, the task
+    API response, or the audit log. The runtime resolves a secret at the tool/capability
+    boundary, not from the static instructions."""
+    safe_config: dict[str, Any] = dict(non_secret)
+    for key in secret_keys:
+        safe_config[key] = _SECRET_MARKER
     preamble_lines = [
         "## 用户配置 (userConfig)",
         "以下是本次运行的配置参数，请按此配置执行：",
         "```json",
-        json.dumps(config, ensure_ascii=False, indent=2),
+        json.dumps(safe_config, ensure_ascii=False, indent=2),
         "```",
     ]
-    return "\n".join(preamble_lines) + "\n\n" + spec.system_prompt
+    return "\n".join(preamble_lines)
+
+
+def build_instructions(
+    spec: DigitalHumanSpec,
+    config: dict[str, Any],
+    *,
+    secret_keys: Optional[list[str]] = None,
+) -> str:
+    """Prepend a ``## 用户配置`` preamble (the resolved userConfig JSON) to the system prompt.
+
+    DHP prompts reference ``userConfig[<key>]``; openworker has no separate config channel, so the
+    values are injected into the prompt itself. Missing required keys are caught earlier by
+    :func:`validate_config`; here we trust the config is complete.
+
+    ``secret_keys`` names config fields whose values must NOT appear in the instructions. For
+    each such key the preamble carries a ``<configured>`` marker; the real value stays in the
+    SecretStore and is resolved at the capability boundary at run time. Passing the secret
+    values in ``config`` is a caller bug — this function drops them defensively, but callers
+    should pass non-secret config only."""
+    non_secret, _secret, declared_secret_keys = split_config(spec, config)
+    # Merge any caller-declared secret keys (the install/edit path already split them out
+    # before calling here, so config carries only non-secret values; declared_secret_keys is
+    # empty in that path). Union so a key flagged secret on either side is masked.
+    all_secret_keys = sorted(set((secret_keys or []) + declared_secret_keys))
+    # Defensive: strip any secret value that slipped through in `config` despite the caller
+    # having split it — a secret value in the instructions is the exact leak we prevent.
+    return _preamble(non_secret, all_secret_keys) + "\n\n" + spec.system_prompt
 
 
 def reinstall_instructions(
@@ -57,24 +92,18 @@ def reinstall_instructions(
     config: dict[str, Any],
     *,
     system_prompt: Optional[str] = None,
+    secret_keys: Optional[list[str]] = None,
 ) -> str:
     """Rebuild task instructions for an already-installed instance (the edit path).
 
     Mirrors :func:`build_instructions`, but lets the caller override the spec's system prompt with
     a user-edited value (from the Developer block). When ``system_prompt`` is None, the spec's own
-    prompt is used unchanged — the same as a fresh install."""
-    if system_prompt is None:
-        return build_instructions(spec, config)
-    # Build a throwaway spec view with the edited prompt, reusing build_instructions so the
-    # ``## 用户配置`` preamble format stays identical across install and edit.
-    preamble_lines = [
-        "## 用户配置 (userConfig)",
-        "以下是本次运行的配置参数，请按此配置执行：",
-        "```json",
-        json.dumps(config, ensure_ascii=False, indent=2),
-        "```",
-    ]
-    return "\n".join(preamble_lines) + "\n\n" + (system_prompt or "")
+    prompt is used unchanged — the same as a fresh install. Secret values are masked the same way
+    as in :func:`build_instructions`; pass ``secret_keys`` to declare them."""
+    non_secret, _secret, declared_secret_keys = split_config(spec, config)
+    all_secret_keys = sorted(set((secret_keys or []) + declared_secret_keys))
+    body = system_prompt if system_prompt is not None else spec.system_prompt
+    return _preamble(non_secret, all_secret_keys) + "\n\n" + (body or "")
 
 
 def validate_config(spec: DigitalHumanSpec, config: dict[str, Any]) -> list[str]:
@@ -158,12 +187,10 @@ def install_digital_human(
     if secret_keys and instances.secrets is not None:
         instances.secrets.put(f"{SECRET_PROFILE_PREFIX}{instance_id}", secret)
 
-    # The merged config (non-secret + secret placeholders) for the prompt. At run time the engine
-    # resolves the secret profile; for the prompt preamble we inject the resolved values directly
-    # — they're already in hand here, and the instructions are static text.
-    full_config = dict(non_secret)
-    full_config.update(secret)
-    instructions = build_instructions(spec, full_config)
+    # The merged config (non-secret + secret placeholders) for the prompt. Secret values live
+    # only in the SecretStore profile; the instructions carry a typed ``<configured>`` marker for
+    # each secret key so the model sees the key is set without ever receiving the value.
+    instructions = build_instructions(spec, non_secret, secret_keys=secret_keys)
 
     task = ScheduledTask(
         title=spec.name,
@@ -187,6 +214,9 @@ def install_digital_human(
         config=non_secret,
         secret_keys=secret_keys,
         spec_version=spec.version,
+        # Fresh installs never leak: instructions carry typed ``<configured>`` markers, not values.
+        needs_secret_migration=False,
+        unreviewed=False,
     )
     instances.put(inst)
 

@@ -106,6 +106,19 @@ def connector_list(secrets: SecretStore) -> list[dict[str, Any]]:
             # "relay" for the managed cloud path; empty for manual/token connect.
             "mode": profile.get("mode") or "",
         }
+        if d.name == "wechat_ilink":
+            # Personal WeChat is QR-backed and multi-account, but deliberately not
+            # part of the generic token-form accounts layer.  Public rows come from
+            # its credential-redacting profile helper; live state is overlaid by the
+            # SessionManager when an adapter is running.
+            from .wechat_ilink.profiles import account_rows
+
+            accounts = account_rows(secrets)
+            entry["accounts"] = accounts
+            entry["connected"] = bool(accounts)
+            entry["enabled"] = bool(profile.get("enabled", True)) and bool(accounts)
+            default_row = next((a for a in accounts if a.get("default")), None)
+            entry["account"] = (default_row or {}).get("display_name") or None
         if d.name == "slack":
             # Managed relay is multi-workspace: each `slack:team:*` profile is one
             # connected workspace with its OWN allow-list (ids are workspace-scoped).
@@ -481,6 +494,12 @@ def disconnect_connector(secrets: SecretStore, name: str) -> dict[str, Any]:
             dropped_accounts = (
                 secrets.delete(_accounts.prefix(name) + account_id) or dropped_accounts
             )
+    if name == "wechat_ilink":
+        # QR credentials live in per-account profiles; a full connector disconnect
+        # removes all local credentials and the token-free default pointer.
+        from .wechat_ilink.profiles import delete_all
+
+        dropped_accounts = bool(delete_all(secrets)) or dropped_accounts
     if name == "gmail":
         # Whole-connector disconnect drops every mailbox (per-account removal
         # lives on the Gmail page); filters go too — an explicit full reset.

@@ -64,18 +64,12 @@
 
 **目标**：从微信/企微触发 agent、接收通知、双向对话。中文用户场景刚需。
 
-**可选**：Halo 的 `weixin-ilink.provider.ts` / `ilink-api.ts` 连接个人微信
-- **企微群机器人 webhook**（已在功能 1 覆盖，此处复用）。
-- **企微自建应用 API**（需企业 corpid/secret，正规 OAuth，合规）：收消息（回调）+ 发消息 + 通讯录。
+**✅ 已交付**：
+- **企业微信自建应用 API**（`coworker/connectors/wecom_app/`，批次 D）：收消息（加密回调）+ 发消息 + 通讯录；接入 gateway 作为 inbound listener，复用 inbox_routing 与 notify router。
+- **个人微信 iLink 连接器**（`coworker/connectors/wechat_ilink/`）：扫码登录、多账号、私聊长轮询、文本入站/回复、媒体占位、运行期 context 主动发送、断线重连。基于已观察协议行为的独立 Python 实现，不复制任何上游源码；凭据仅存后端，传输层强制 HTTPS + vendor hostname 校验。详见 `docs/WECHAT_ILINK_CONNECTOR.md`。
+- **企微群机器人 webhook**（功能 1 覆盖，此处复用）。
 
-
-**后端**（`coworker/connectors/wecom_app/`，新建）：
-- `provider.py`：企微应用 API 封装（access_token 管理、消息加解密、回调校验）。
-- 接入 `connectors/gateway.py` 作为 inbound listener（参考现有 slack/github relay 模式）。
-- 接入 `inbox_routing.py`：企微消息 → agent 会话 → 回复到企微。
-- 复用功能 1 的 notify router 做出站通知。
-
-**前端**：`connectors/wecom/` 配置面板（corpId/secret/agentId/回调 URL 校验）。
+**前端**：`connectors/wecom/` 配置面板（corpId/secret/agentId/回调 URL 校验）；iLink 走专用 QR modal + 多账号详情页。
 
 **风险**：企微回调需要公网可达 URL —— 与功能 4（远程访问）有依赖耦合。可先用 ngrok/cloudflare tunnel 手动验证，功能 4 落地后正式集成。
 

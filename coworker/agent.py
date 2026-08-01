@@ -83,6 +83,18 @@ to the user as live progress. Don't narrate trivial single-call follow-ups, don'
 the previous line, and never let narration replace your final answer."""
 
 
+_MESSAGING_REPLY_GUIDANCE = """\
+Replying on messaging platforms: when an inbound message arrives tagged with a reply handle \
+(its text starts like "[… | reply→platform:chat]"), the sender is on a messaging channel \
+(WeChat / Slack / Telegram / …), NOT reading this app. Your plain assistant text does NOT \
+reach them — it is invisible to the sender. To reply, you MUST call the send_message tool with \
+the exact target from the reply→ marker and your answer as the text — that is the ONLY way they \
+receive your reply. This is mandatory for every inbound message you answer on a messaging \
+channel: produce your answer as the send_message text argument, not as a conversational reply. \
+Do not write the answer in the conversation and skip the tool call; do not ask whether to send — \
+just send it."""
+
+
 def _enabled_connector_tools(secrets: SecretStore) -> tuple[set[str], set[str]]:
     connectors = {c["name"]: c for c in connector_list(secrets)}
     enabled_connectors = {
@@ -137,6 +149,7 @@ def build_engine(
     rule_resolver: Optional[Any] = None,
     persona_registry: Optional[Any] = None,
     command_loader: Optional[CommandLoader] = None,
+    live_delivery: Optional[Any] = None,
 ) -> TurnEngine:
     ws = Path(workspace).expanduser().resolve() if workspace else None
     if agent.needs_workspace and ws is None:
@@ -171,7 +184,7 @@ def build_engine(
     # the reply path for inbound Telegram/Slack super-agent sessions.
     secrets = secrets or SecretStore()
     if agent.messaging and any(s.enabled for s in load_settings(secrets).values()):
-        registry.register(make_send_message_tool(secrets))
+        registry.register(make_send_message_tool(secrets, live_delivery=live_delivery))
         # send_file (§34): hand deliverables into the chat — same targets, but its OWN
         # approval surface (a thread's standing send_message grant never covers uploads).
         registry.register(
@@ -258,6 +271,8 @@ def build_engine(
         registry.register_all(selfwake_tools(wake_store, session_id))
 
     instructions = f"{agent.system_prompt}\n\n{_NARRATION_GUIDANCE}"
+    if agent.messaging:
+        instructions = f"{instructions}\n\n{_MESSAGING_REPLY_GUIDANCE}"
     if ws is not None:
         instructions = f"{instructions}\n\n{environment_context(ws)}"
         conventions = load_agents_md(ws)

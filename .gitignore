@@ -7,3 +7,12 @@ build/
 dist/
 .coverage
 .dev-state/
+
+# Playwright test output (never track run artifacts)
+test-results/
+playwright-report/
+
+# Stray root node files (tooling side-effects; the real frontend is under surfaces/gui/)
+/package.json
+/package-lock.json
+/node_modules/

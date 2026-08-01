@@ -48,7 +48,7 @@ class ConnectorDescriptor:
     title: str
     icon: str
     blurb: str
-    auth: str  # "bot_token" | "socket_app" | "oauth" | "token" | "api_token" | "none"
+    auth: str  # "bot_token" | "socket_app" | "oauth" | "token" | "api_token" | "qr" | "none"
     two_way: bool
     fields: list[Field]
     instructions: list[str]
@@ -146,13 +146,19 @@ def _validate_wecom(creds: dict) -> ValidationResult:
     agent_id = creds.get("agent_id", "")
     if not (corpid and secret and agent_id):
         return ValidationResult(False, error="corpid / secret / agent_id 不能为空")
+    token = (creds.get("token") or "").strip()
+    encoding_aes_key = (creds.get("encoding_aes_key") or "").strip()
+    if bool(token) != bool(encoding_aes_key):
+        return ValidationResult(
+            False, error="回调 Token 与 EncodingAESKey 必须同时配置"
+        )
     try:
         client = WeComAppClient(
             corpid=corpid,
             secret=secret,
             agent_id=agent_id,
-            token=creds.get("token", ""),
-            encoding_aes_key=creds.get("encoding_aes_key", ""),
+            token=token,
+            encoding_aes_key=encoding_aes_key,
         )
         result = client.validate_credentials()
         if result.get("ok"):
@@ -514,6 +520,25 @@ DESCRIPTORS: list[ConnectorDescriptor] = [
         validate=_validate_slack,
     ),
     ConnectorDescriptor(
+        name="wechat_ilink",
+        title="个人微信",
+        icon="微",
+        blurb="扫码连接个人微信私聊——接收消息并在当前会话上下文内回复文本。",
+        auth="qr",
+        two_way=True,
+        channels=False,
+        brand_color="#07c160",
+        logo="wechat_ilink",
+        aliases=("微信", "wechat", "weixin", "ilink"),
+        fields=[],
+        instructions=[
+            "点击连接后，用微信扫描二维码。",
+            "扫码确认后，凭据只保存在本机；前端不会收到机器人令牌。",
+            "先让联系人给该微信连接发一条私聊消息，再在账号详情里允许该发送者。",
+            "文本回复依赖当前进程收到的会话上下文；重启后需先收到新消息才能再次发送。",
+        ],
+    ),
+    ConnectorDescriptor(
         name="wecom",
         title="企业微信",
         icon="💬",
@@ -547,7 +572,7 @@ DESCRIPTORS: list[ConnectorDescriptor] = [
                 "回调 Token",
                 secret=True,
                 required=False,
-                help="接收消息 ▸ API 接收 ▸ Token（设置 API 接收后生成）。留空则明文模式；建议配置以启用加密。",
+                help="接收消息 ▸ API 接收 ▸ Token。必须与 EncodingAESKey 同时填写；两者都留空时仅支持出站发送。",
                 placeholder="随机字符串",
             ),
             Field(
@@ -555,7 +580,7 @@ DESCRIPTORS: list[ConnectorDescriptor] = [
                 "回调 EncodingAESKey",
                 secret=True,
                 required=False,
-                help="与 Token 同页生成。配置后回调消息走 AES-256-CBC 加密（推荐）。",
+                help="与 Token 同页生成，必须成对配置。有效回调仅接受 AES-256-CBC 加密消息。",
                 placeholder="43 字符",
             ),
             _ALLOWED_FIELD,

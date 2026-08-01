@@ -14,7 +14,7 @@ from typing import Optional
 from ..secrets import SecretStore
 from .base import SessionSource
 
-PLATFORMS = ("telegram", "slack", "github", "wecom")
+PLATFORMS = ("telegram", "slack", "github", "wecom", "wechat_ilink")
 
 
 @dataclass
@@ -75,6 +75,7 @@ def load_settings(
     out: dict[str, ConnectorSettings] = {}
     for platform in PLATFORMS:
         profile = secrets.get(f"{platform}:default") or {}
+        account_profiles = []
         token = profile.get("bot_token")
         allowed = set(profile.get("allowed_users") or [])
         allowed |= _csv(os.environ.get(f"{platform.upper()}_ALLOWED_USERS"))
@@ -94,6 +95,23 @@ def load_settings(
             enabled = bool(
                 profile.get("corpid") and profile.get("secret") and profile.get("agent_id")
             ) and profile.get("enabled", True)
+        elif platform == "wechat_ilink":
+            # Personal WeChat is composite: credentials and authorization live on
+            # case-preserving `wechat_ilink:account:<id>` profiles. The token-free
+            # default profile only controls connector-wide enablement/default account.
+            from .wechat_ilink.profiles import default_settings, iter_accounts
+
+            account_profiles = list(iter_accounts(secrets))
+            enabled = bool(
+                default_settings(secrets)["enabled"]
+                and any(
+                    account.enabled
+                    and not account.needs_reauth
+                    and account.bot_token
+                    and account.base_url
+                    for account in account_profiles
+                )
+            )
         else:
             enabled = bool(token) and profile.get("enabled", True)
         teams: dict[str, TeamAuth] = {}
@@ -110,6 +128,12 @@ def load_settings(
                 teams[installation_id] = TeamAuth(
                     allowed_users=set(install_profile.get("allowed_users") or []),
                     allow_all=bool(install_profile.get("allow_all")),
+                )
+        if platform == "wechat_ilink":
+            for account in account_profiles:
+                teams[account.account_id] = TeamAuth(
+                    allowed_users=set(account.allowed_users),
+                    allow_all=account.allow_all,
                 )
         out[platform] = ConnectorSettings(
             platform=platform,

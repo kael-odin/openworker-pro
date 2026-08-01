@@ -96,6 +96,7 @@ def test_wait_then_deliver_resolves():
     async def run():
         task = asyncio.create_task(mcp_oauth._wait_for_callback())
         await asyncio.sleep(0)  # let the waiter install its future
+        mcp_oauth._expected_state = "st4te"  # client-generated state bound to this flow
         assert mcp_oauth.deliver_callback("c0de", "st4te") is True
         return await task
 
@@ -124,6 +125,38 @@ def test_deliver_rejects_mismatched_state_without_consuming_flow():
         return await task
 
     assert asyncio.run(run()) == ("c0de", "good-state")
+
+
+def test_deliver_rejects_when_no_state_bound_to_flow():
+    """P1-02: a flow with no client-generated state must NOT accept any callback — the
+    old accept-any fallback is gone. State is always client-generated now."""
+    async def run():
+        task = asyncio.create_task(mcp_oauth._wait_for_callback())
+        await asyncio.sleep(0)
+        # _expected_state stays None (no authorize URL opened). Even a plausible-looking
+        # state must not resolve the flow.
+        assert mcp_oauth._expected_state is None
+        assert mcp_oauth.deliver_callback("c0de", "whatever") is False
+        assert not task.done()
+        task.cancel()
+        return None
+
+    asyncio.run(run())
+
+
+def test_inject_state_appends_when_absent():
+    """P1-02: an authorize URL with no state gets a client-generated one."""
+    url = mcp_oauth._inject_state("https://idp.example/authorize?client_id=x&scope=y")
+    state = mcp_oauth._state_from_url(url)
+    assert state is not None and len(state) >= 20
+
+
+def test_inject_state_preserves_existing_state():
+    """P1-02: a URL that already carries a state keeps it (the SDK also checks it)."""
+    url = mcp_oauth._inject_state(
+        "https://idp.example/authorize?client_id=x&state=keep-me&scope=y"
+    )
+    assert mcp_oauth._state_from_url(url) == "keep-me"
 
 
 # -- status surfacing over REST ---------------------------------------------------
@@ -193,6 +226,7 @@ def test_callback_route(tmp_path, monkeypatch):
     try:
         future = loop.create_future()
         mcp_oauth._pending = future
+        mcp_oauth._expected_state = "s1"  # client-generated state (P1-02)
         r = client.get("/mcp/oauth/callback", params={"code": "c1", "state": "s1"})
         assert r.status_code == 200 and "close this tab" in r.text.lower()
         assert future.result() == ("c1", "s1")

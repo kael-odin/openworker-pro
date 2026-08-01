@@ -152,7 +152,7 @@ def test_dispatch_fans_out_to_subscribers(tmp_path, monkeypatch):
     _connect_slack(mgr)
     delivered: list[tuple[str, str]] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=None, **kw):
         delivered.append((session_id, message))
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
@@ -240,7 +240,7 @@ def test_unauthorized_messages_park_and_resolve(tmp_path, monkeypatch):
     _connect_slack(mgr)
     delivered: list[tuple[str, str]] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=None, **kw):
         delivered.append((session_id, message))
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
@@ -316,6 +316,37 @@ def test_parked_store_persists_and_caps(tmp_path):
     popped = reloaded.pop(reloaded.list()[0]["id"])
     assert popped is not None and popped.text == "three"
     assert ParkedStore(path, cap=2).list() == [{**i} for i in reloaded.list()]
+
+
+def test_live_delivery_bridge_uses_gateway_loop(tmp_path):
+    from coworker.connectors.base import SendResult
+
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+
+    class _Gateway:
+        async def deliver(self, target, text):
+            assert target == "wechat_ilink:A/U" and text == "hello"
+            return SendResult(True, message_id="m1")
+
+    async def run():
+        mgr.gateway = _Gateway()
+        mgr._gateway_loop = asyncio.get_running_loop()
+        result = await asyncio.to_thread(
+            mgr._live_delivery, "wechat_ilink:A/U", "hello"
+        )
+        assert result.ok and result.message_id == "m1"
+
+    asyncio.run(run())
+    mgr.gateway = None
+    mgr._gateway_loop = None
+    asyncio.run(mgr.aclose())
+
+
+def test_live_delivery_bridge_fails_without_gateway(tmp_path):
+    mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    result = mgr._live_delivery("wechat_ilink:A/U", "hello")
+    assert not result.ok and "unavailable" in result.error
+    asyncio.run(mgr.aclose())
 
 
 def test_refresh_gateway_replaces_listeners(tmp_path):

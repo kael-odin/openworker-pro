@@ -14,12 +14,14 @@ test("thinking streams live, then persists as a collapsed disclosure on the answ
   await box.press("Enter");
 
   // Live phase: the Thinking… block is up while deltas tick in; expanding shows the trace.
-  await expect(page.getByText("Thinking…").first()).toBeVisible({ timeout: 10_000 });
+  // 15s (not the 5s default): the scripted trace streams on a 120ms interval and under CI's
+  // 6-worker load the first tick can land late.
+  await expect(page.getByText("Thinking…").first()).toBeVisible({ timeout: 15_000 });
   await page.getByTestId("thinking-toggle").click();
   await expect(page.getByTestId("thinking-body")).toContainText("Weighing options.");
 
   // Finalized: the answer bubble carries a collapsed "Thought process" disclosure.
-  await expect(page.getByText("Decision made.").first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Decision made.").first()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText("Thinking…")).toHaveCount(0);
   const toggle = page.getByTestId("thinking-toggle");
   await expect(toggle).toHaveText(/Thought process/);

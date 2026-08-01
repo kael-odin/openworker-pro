@@ -37,6 +37,33 @@ function kindFromPath(path: string): string {
   return "text";
 }
 
+// Restrictive CSP injected before any untrusted artifact HTML. Defense-in-depth on top of
+// sandbox="": even in a scriptless document this blocks <img src="http://localhost:8765/…">,
+// external CSS/font fetches, and form submissions that could beacon data out or probe the
+// sidecar. 'none' for every network-fetch directive; only inline styles and data:/blob:
+// images are allowed so static visual content still renders. See P0-01.
+const ARTIFACT_CSP = [
+  "default-src 'none'",
+  "style-src 'unsafe-inline'",
+  "img-src data: blob:",
+  "font-src data:",
+  "form-action 'none'",
+  "base-uri 'none'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+export function sandboxedSrcDoc(html: string): string {
+  const body = html || "";
+  // If the document already has a <head>, inject the meta right after it; otherwise wrap.
+  if (/<head[^>]*>/i.test(body)) {
+    return body.replace(/<head([^>]*)>/i, `<head$1>\n<meta http-equiv="Content-Security-Policy" content="${ARTIFACT_CSP}">`);
+  }
+  if (/<html[^>]*>/i.test(body)) {
+    return body.replace(/<html([^>]*)>/i, `<html$1><head><meta http-equiv="Content-Security-Policy" content="${ARTIFACT_CSP}"></head>`);
+  }
+  return `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="${ARTIFACT_CSP}"></head><body>${body}</body></html>`;
+}
+
 interface Props {
   active: boolean;
   sessionId: string;
@@ -370,9 +397,14 @@ function ArtifactViewer({
         ) : content.kind === "html" ? (
           <iframe
             key={`${artifact.path}-${reloadKey}`}
-            sandbox="allow-scripts allow-same-origin"
+            // Static safety: NO allow-scripts, NO allow-same-origin. The iframe renders
+            // untrusted HTML as a static document only — scripts in the artifact cannot run,
+            // and without allow-same-origin the content is treated as a unique opaque origin
+            // that cannot read the parent window's globals (including the sidecar token
+            // injected into window.__COWORKER_API_TOKEN__ by the Tauri shell). See P0-01.
+            sandbox=""
             className="artifact-frame"
-            srcDoc={content.content || ""}
+            srcDoc={sandboxedSrcDoc(content.content || "")}
           />
         ) : content.kind === "markdown" ? (
           <div className="artifact-md">
@@ -473,10 +505,8 @@ function CsvTable({ text }: { text: string }) {
   return <GridTable rows={rows} />;
 }
 
-// xlsx/xls preview via SheetJS (loaded on demand — it's a heavy module): sheet tabs + a capped
-// grid. Real spreadsheet work belongs in Numbers/Excel via "Open in default app".
 // WKWebView has no inline PDF plugin (<embed> shows a gray pane in the Tauri shell), so we
-// rasterize pages with pdf.js onto stacked canvases — same lazy-chunk pattern as SheetViewer.
+// rasterize pages with pdf.js onto stacked canvases.
 function PdfViewer({ dataUrl }: { dataUrl: string }) {
   const { t } = useT();
   const [error, setError] = useState("");
@@ -527,6 +557,13 @@ function PdfViewer({ dataUrl }: { dataUrl: string }) {
   );
 }
 
+// xlsx/xls preview: SheetJS's npm package is frozen at 0.18.5 with an unfixed prototype-
+// pollution CVE (GHSA-4r6h) and a ReDoS (GHSA-5pgg), and the maintainer moved to a private CDN
+// with no npm fix. Rather than ship a known-vulnerable dep for a *preview*, we read the workbook
+// ourselves: an .xlsx is a zip of XML, so JSZip (one small dep, no vulns) unpacks it and the
+// browser's DOMParser reads sheet names + cell values straight out of the OOXML. This covers the
+// shared-strings + inline-string + number/date cases a preview needs; exotic formulas render their
+// cached value or blank. Real spreadsheet work still belongs in Numbers/Excel via "Open in default app".
 function SheetViewer({ dataUrl }: { dataUrl: string }) {
   const { t } = useT();
   const [sheets, setSheets] = useState<{ name: string; rows: unknown[][] }[] | null>(null);
@@ -539,16 +576,9 @@ function SheetViewer({ dataUrl }: { dataUrl: string }) {
     setError("");
     setActive(0);
     const base64 = dataUrl.split(",")[1] || "";
-    import("xlsx")
-      .then((XLSX) => {
-        if (cancelled) return;
-        const wb = XLSX.read(base64, { type: "base64" });
-        setSheets(
-          wb.SheetNames.map((name) => ({
-            name,
-            rows: XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: "" }) as unknown[][],
-          })),
-        );
+    parseXlsx(base64)
+      .then((out) => {
+        if (!cancelled) setSheets(out);
       })
       .catch((e) => !cancelled && setError(String(e?.message || e)));
     return () => {
@@ -573,6 +603,105 @@ function SheetViewer({ dataUrl }: { dataUrl: string }) {
       {sheet.rows.length ? <GridTable rows={sheet.rows} /> : <div className="rail-muted artifact-table-note">{t("rightrail.empty_sheet")}</div>}
     </div>
   );
+}
+
+// Minimal OOXML reader for the SheetViewer preview. An .xlsx is a zip whose entries include
+// `xl/workbook.xml` (sheet names + r:id → file mapping via `xl/_rels/workbook.xml.rels`),
+// `xl/sharedStrings.xml` (the string table) and `xl/worksheets/sheetN.xml` (cells). Each <c> cell
+// carries an `r` ref like "B3" (column letter + row) and a `t` type; the value is in <v> (for
+// shared-string index, number, boolean) or inline <is><t>. We place values at their [row][col]
+// position, filling gaps with "" so the grid matches what a user sees in Excel — enough for a
+// preview without the weight or the CVEs of SheetJS.
+const COL_A = "A".charCodeAt(0);
+function colToIndex(ref: string): number {
+  let n = 0;
+  for (let i = 0; i < ref.length && /[A-Z]/.test(ref[i]); i++) n = n * 26 + (ref.charCodeAt(i) - COL_A + 1);
+  return n - 1;
+}
+function refRow(ref: string): number {
+  const m = ref.match(/\d+$/);
+  return m ? parseInt(m[0], 10) - 1 : 0;
+}
+
+export async function parseXlsx(base64: string): Promise<{ name: string; rows: unknown[][] }[]> {
+  const JSZip = (await import("jszip")).default;
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  const zip = await JSZip.loadAsync(bytes);
+  const parser = new DOMParser();
+  const text = (path: string) => zip.file(path)?.async("string") || "";
+
+  // shared strings table (optional — some workbooks inline strings instead).
+  const shared: string[] = [];
+  const sstXml = await text("xl/sharedStrings.xml");
+  if (sstXml) {
+    for (const si of parser.parseFromString(sstXml, "application/xml").getElementsByTagName("si")) {
+      // <t> may sit directly in <si> or nested in <r><t> (rich runs); join all runs.
+      const ts = si.getElementsByTagName("t");
+      shared.push(Array.from(ts).map((t) => t.textContent || "").join(""));
+    }
+  }
+
+  // sheet name → worksheet file path, via the workbook + its rels.
+  const wbXml = await text("xl/workbook.xml");
+  const relsXml = await text("xl/_rels/workbook.xml.rels");
+  const relById: Record<string, string> = {};
+  if (relsXml) {
+    for (const r of parser.parseFromString(relsXml, "application/xml").getElementsByTagName("Relationship")) {
+      relById[r.getAttribute("Id") || ""] = r.getAttribute("Target") || "";
+    }
+  }
+  const sheetsEl = parser.parseFromString(wbXml, "application/xml").getElementsByTagName("sheet");
+  const sheets: { name: string; path: string }[] = [];
+  for (const s of Array.from(sheetsEl)) {
+    const rid = s.getAttribute("r:id") || "";
+    let target = relById[rid] || "";
+    if (target && !target.startsWith("xl/")) target = "xl/" + target.replace(/^\/?/, "");
+    sheets.push({ name: s.getAttribute("name") || "", path: target });
+  }
+
+  const out: { name: string; rows: unknown[][] }[] = [];
+  for (const s of sheets) {
+    if (!s.path) {
+      out.push({ name: s.name, rows: [] });
+      continue;
+    }
+    const xml = await text(s.path);
+    const doc = parser.parseFromString(xml, "application/xml");
+    const rows: unknown[][] = [];
+    let maxCol = 0;
+    for (const c of doc.getElementsByTagName("c")) {
+      const ref = c.getAttribute("r") || "";
+      if (!ref) continue;
+      const r = refRow(ref);
+      const col = colToIndex(ref);
+      if (col > maxCol) maxCol = col;
+      const t = c.getAttribute("t") || "n";
+      let val: unknown = "";
+      if (t === "s") {
+        const v = c.getElementsByTagName("v")[0]?.textContent;
+        val = v != null ? shared[parseInt(v, 10)] ?? "" : "";
+      } else if (t === "inlineStr") {
+        val = c.getElementsByTagName("t")[0]?.textContent || "";
+      } else if (t === "b") {
+        val = c.getElementsByTagName("v")[0]?.textContent === "1";
+      } else {
+        // number, or a formula with a cached <v>; dates (t="n" + style) render as their serial —
+        // good enough for a preview; full date formatting belongs in a real spreadsheet app.
+        const v = c.getElementsByTagName("v")[0]?.textContent;
+        val = v != null && v !== "" ? Number(v) : "";
+      }
+      rows[r] ??= [];
+      while (rows[r].length < col) rows[r].push("");
+      rows[r][col] = val;
+    }
+    // normalize ragged rows to a uniform width so GridTable renders aligned columns.
+    for (let i = 0; i < rows.length; i++) {
+      rows[i] ??= [];
+      while (rows[i].length <= maxCol) rows[i].push("");
+    }
+    out.push({ name: s.name, rows: rows.filter((r) => r.some((c) => c !== "")) });
+  }
+  return out;
 }
 
 function formatBytes(bytes: number): string {

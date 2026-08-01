@@ -180,6 +180,12 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     app = FastAPI(title="coworker", version="0.0.0", lifespan=lifespan)
     api_token = os.environ.get("COWORKER_API_TOKEN", "")
+    # P1-01 fail-closed: an unset token never means "open to everyone on localhost". Only an
+    # explicit --insecure-local-dev opt-in (recorded here as an env flag by run.py) allows
+    # tokenless operation, and the startup log warns while it is active. Without the opt-in,
+    # a missing token rejects every authenticated request — the dev convenience is no longer
+    # a silent production fallback.
+    insecure_local_dev = os.environ.get("COWORKER_INSECURE_LOCAL_DEV") == "1"
     tokenless_paths = {
         "/v1/health",
         "/auth/callback",
@@ -191,15 +197,27 @@ def create_app(manager: SessionManager) -> FastAPI:
 
     def _request_authenticated(request: Request) -> bool:
         provided = request.headers.get("x-openworker-token", "")
-        return bool(
-            api_token
-            and provided
-            and secrets.compare_digest(provided, api_token)
-        )
+        if api_token and provided and secrets.compare_digest(provided, api_token):
+            return True
+        # Browser WebSocket upgrade requests cannot set custom headers; the GUI passes the
+        # sidecar token as a sec-websocket-protocol subprotocol (["openworker", token]). The
+        # HTTP middleware gates the upgrade handshake before _websocket_authenticated runs,
+        # so accept the subprotocol here too. Same constant-time compare; no token leak.
+        if api_token:
+            protocols = {
+                part.strip()
+                for part in request.headers.get("sec-websocket-protocol", "").split(",")
+                if part.strip()
+            }
+            return any(
+                secrets.compare_digest(part, api_token) for part in protocols
+            )
+        return False
 
     def _websocket_authenticated(ws: WebSocket) -> bool:
         if not api_token:
-            return True
+            # Fail-closed unless the dev opt-in is set (mirrors the HTTP middleware).
+            return insecure_local_dev
         protocols = {
             part.strip()
             for part in ws.headers.get("sec-websocket-protocol", "").split(",")
@@ -211,12 +229,17 @@ def create_app(manager: SessionManager) -> FastAPI:
     async def require_sidecar_token(request: Request, call_next):
         # Preflights carry the requested header name, not its value. CORS checks the
         # Origin; the actual state-changing request still must authenticate.
-        if (
-            not api_token
-            or request.method == "OPTIONS"
-            or request.url.path in tokenless_paths
-            or _request_authenticated(request)
-        ):
+        if request.method == "OPTIONS" or request.url.path in tokenless_paths:
+            return await call_next(request)
+        # No token configured: fail-closed unless the dev opt-in is active.
+        if not api_token:
+            if insecure_local_dev:
+                return await call_next(request)
+            return JSONResponse(
+                {"error": "sidecar token not configured; start with --insecure-local-dev for dev only"},
+                status_code=401,
+            )
+        if _request_authenticated(request):
             return await call_next(request)
         return JSONResponse(
             {"error": "missing or invalid OpenWorker sidecar token"},
@@ -1017,9 +1040,45 @@ def create_app(manager: SessionManager) -> FastAPI:
         await asyncio.to_thread(
             lambda: cloud.cloud_disconnect(manager.secrets, load_config(), name)
         )
+        if name == "wechat_ilink":
+            return await manager.disconnect_wechat_ilink_all()
         result = manager.disconnect_connector(name)
         await _refresh_listeners_if_two_way(name)
         return result
+
+    # -- Personal WeChat iLink (all routes keep sidecar-token auth) -------------
+    @app.post("/v1/connectors/wechat_ilink/qrcode")
+    async def wechat_ilink_qrcode_create(body: Optional[dict] = None) -> dict[str, Any]:
+        account_id = str((body or {}).get("reauth_account_id") or "").strip()
+        return await manager.create_wechat_ilink_qr(reauth_account_id=account_id)
+
+    @app.get("/v1/connectors/wechat_ilink/qrcode/{attempt_id}")
+    async def wechat_ilink_qrcode_get(attempt_id: str) -> dict[str, Any]:
+        return await manager.get_wechat_ilink_qr(attempt_id)
+
+    @app.delete("/v1/connectors/wechat_ilink/qrcode/{attempt_id}")
+    async def wechat_ilink_qrcode_cancel(attempt_id: str) -> dict[str, Any]:
+        return await manager.cancel_wechat_ilink_qr(attempt_id)
+
+    @app.get("/v1/connectors/wechat_ilink/accounts")
+    def wechat_ilink_accounts() -> dict[str, Any]:
+        return manager.wechat_ilink_accounts()
+
+    @app.get("/v1/connectors/wechat_ilink/status")
+    def wechat_ilink_status() -> dict[str, Any]:
+        return manager.wechat_ilink_status()
+
+    @app.post("/v1/connectors/wechat_ilink/accounts/{account_id}/reauth")
+    async def wechat_ilink_account_reauth(account_id: str) -> dict[str, Any]:
+        return await manager.create_wechat_ilink_qr(reauth_account_id=account_id)
+
+    @app.delete("/v1/connectors/wechat_ilink/accounts/{account_id}")
+    async def wechat_ilink_account_delete(account_id: str) -> dict[str, Any]:
+        return await manager.disconnect_wechat_ilink_account(account_id)
+
+    @app.post("/v1/connectors/wechat_ilink/accounts/{account_id}/default")
+    async def wechat_ilink_account_default(account_id: str) -> dict[str, Any]:
+        return await manager.set_wechat_ilink_default(account_id)
 
     @app.post("/v1/connectors/slack/workspaces/{team_id}/disconnect")
     async def slack_workspace_disconnect(team_id: str) -> dict[str, Any]:
@@ -1068,9 +1127,7 @@ def create_app(manager: SessionManager) -> FastAPI:
         try:
             status, payload = await adapter.handle_callback(query, body)
         except Exception:
-            import traceback
-
-            traceback.print_exc()
+            # 回调端点是公网入口；不打印 traceback，也不反射请求/密钥细节。
             return PlainTextResponse("error", status_code=500)
         return PlainTextResponse(payload, status_code=status)
 
@@ -1756,14 +1813,29 @@ def create_app(manager: SessionManager) -> FastAPI:
             return {"ok": False, "error": f"未知渠道 {channel!r}"}
         return {"channel": channel, "config": manager.notify_router.store.mask(cfg)}
 
-    @app.post("/v1/notify/channels/{channel}")
-    def notify_channel_save(channel: str, body: dict) -> dict[str, Any]:
+    @app.patch("/v1/notify/channels/{channel}")
+    def notify_channel_patch(channel: str, body: dict) -> dict[str, Any]:
         from ..notify.config import CHANNEL_META
 
         if channel not in CHANNEL_META:
             return {"ok": False, "error": f"未知渠道 {channel!r}"}
-        manager.notify_router.store.save_config(channel, body.get("config") or {})
+        try:
+            if "enabled" in body:
+                manager.notify_router.store.set_enabled(channel, body["enabled"])
+            else:
+                manager.notify_router.store.save_config(
+                    channel,
+                    body.get("config") or {},
+                    clear_fields=body.get("clear_fields") or [],
+                )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         return {"ok": True}
+
+    @app.post("/v1/notify/channels/{channel}")
+    def notify_channel_save(channel: str, body: dict) -> dict[str, Any]:
+        """兼容旧 POST 客户端，但按 patch/merge 而不是 replacement 保存。"""
+        return notify_channel_patch(channel, body)
 
     @app.delete("/v1/notify/channels/{channel}")
     def notify_channel_delete(channel: str) -> dict[str, Any]:
@@ -1777,9 +1849,12 @@ def create_app(manager: SessionManager) -> FastAPI:
         config = body.get("config") or {}
         if not channel:
             return {"ok": False, "error": "channel is required"}
-        result = await asyncio.to_thread(
-            lambda: manager.notify_router.test_send(channel, config)
-        )
+        try:
+            result = await asyncio.to_thread(
+                lambda: manager.notify_router.test_send(channel, config)
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         return result.to_dict()
 
     # -- digital humans (DHP bridge, 批次 B) ------------------------------------
@@ -1828,10 +1903,22 @@ def create_app(manager: SessionManager) -> FastAPI:
     def digital_human_detail(slug: str) -> dict[str, Any]:
         return manager.get_digital_human(slug)
 
+    @app.post("/v1/digital-humans/{slug}/preflight")
+    def digital_human_preflight(slug: str, body: dict) -> dict[str, Any]:
+        """Return the dependency/capability manifest + approval digest for the user to review."""
+        return manager.preflight_digital_human(slug, body.get("config") or {})
+
     @app.post("/v1/digital-humans/{slug}/install")
     def digital_human_install(slug: str, body: dict) -> dict[str, Any]:
         config = body.get("config") or {}
-        return manager.install_digital_human(slug, config)
+        approval_digest = str(body.get("approval_digest") or "")
+        mcp_confirmed = bool(body.get("mcp_confirmed"))
+        return manager.install_digital_human(
+            slug,
+            config,
+            approval_digest=approval_digest,
+            mcp_confirmed=mcp_confirmed,
+        )
 
     @app.get("/v1/digital-humans/{slug}/mcp-health")
     def digital_human_mcp_health(slug: str) -> dict[str, Any]:

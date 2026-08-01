@@ -5,6 +5,7 @@ dist/
 
 # Playwright
 /test-results/
+/test-results-baseline/
 /playwright-report/
 /e2e/_dbg.png
 

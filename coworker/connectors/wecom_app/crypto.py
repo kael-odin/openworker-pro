@@ -13,27 +13,35 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
+import hmac
 import struct
 from typing import Optional
 
 
 def _decode_aes_key(encoding_aes_key: str) -> bytes:
-    """43 字符 base64 → 32 字节 AES key（企微约定：key 本身是 base64，补 = 再解码）。"""
-    key = encoding_aes_key + "="
-    return base64.b64decode(key)
+    """43 字符 base64 → 32 字节 AES key；非法编码一律拒绝。"""
+    if not encoding_aes_key or len(encoding_aes_key) != 43:
+        raise ValueError("EncodingAESKey 长度应为 43 字符")
+    try:
+        key = base64.b64decode(encoding_aes_key + "=", validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("EncodingAESKey 格式无效") from exc
+    if len(key) != 32:
+        raise ValueError("EncodingAESKey 解码后长度无效")
+    return key
 
 
 def _pkcs7_unpad(data: bytes) -> bytes:
-    """去 PKCS#7 填充。末字节即填充长度，校验后剥离。"""
+    """严格去除企微使用的 32 字节 PKCS#7 填充。"""
     if not data:
-        return data
+        raise ValueError("PKCS#7 数据为空")
     pad_len = data[-1]
-    if pad_len < 1 or pad_len > 32:
-        # 不是合法 PKCS#7 填充 —— 当作无填充返回（容错，明文模式可能走到这里）。
-        return data
+    if pad_len < 1 or pad_len > 32 or pad_len > len(data):
+        raise ValueError("PKCS#7 填充长度无效")
     if data[-pad_len:] != bytes([pad_len]) * pad_len:
-        return data
+        raise ValueError("PKCS#7 填充无效")
     return data[:-pad_len]
 
 
@@ -56,13 +64,11 @@ def verify_signature(
 
 
 def _const_eq(a: str, b: str) -> bool:
-    """常量时间字符串比较（hmac.compare_digest 的等价，避免 import 开销）。"""
-    if len(a) != len(b):
+    """常量时间字符串比较。"""
+    try:
+        return hmac.compare_digest(a, b)
+    except TypeError:
         return False
-    result = 0
-    for x, y in zip(a, b):
-        result |= ord(x) ^ ord(y)
-    return result == 0
 
 
 def decrypt_message(
@@ -85,9 +91,14 @@ def decrypt_message(
 
     key = _decode_aes_key(encoding_aes_key)
     iv = key[:16]
-    ciphertext = base64.b64decode(encrypt)
+    try:
+        ciphertext = base64.b64decode(encrypt, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("密文不是合法 base64") from exc
+    if not ciphertext or len(ciphertext) % 16:
+        raise ValueError("密文长度无效")
 
-    # 延迟导入：pycryptodome 是 messaging 可选依赖，不装的用户走明文模式不会触发。
+    # 延迟导入：pycryptodome 是 messaging 可选依赖，不装的用户走纯出站不会触发。
     from Crypto.Cipher import AES
 
     cipher = AES.new(key, AES.MODE_CBC, iv)
@@ -100,11 +111,18 @@ def decrypt_message(
     msg_len = struct.unpack(">I", plain[16:20])[0]
     if 20 + msg_len > len(plain):
         raise ValueError("msg_len 超出明文长度，格式异常")
-    msg = plain[20 : 20 + msg_len].decode("utf-8", errors="replace")
-    corpid = plain[20 + msg_len :].decode("utf-8", errors="replace").strip()
+    msg_bytes = plain[20 : 20 + msg_len]
+    corp_bytes = plain[20 + msg_len :]
+    if not corp_bytes:
+        raise ValueError("解密后 corpid 为空")
+    try:
+        msg = msg_bytes.decode("utf-8")
+        corpid = corp_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("解密后文本不是合法 UTF-8") from exc
 
     if expected_corpid and corpid != expected_corpid:
-        raise ValueError(f"corpid 不匹配：期望 {expected_corpid}，实际 {corpid}")
+        raise ValueError("corpid 不匹配")
 
     return msg, corpid
 
@@ -175,17 +193,30 @@ def encrypt_message(
 # XML 解析 —— 企微回调是 XML（明文模式或加密模式外层都是 XML）。
 # 用标准库 xml.etree，不做外部 DTD/实体（防 XXE，企微是可信源但默认安全）。
 def parse_callback_xml(body: bytes | str) -> dict[str, str]:
-    """解析企微回调 XML body，返回字段 dict。
-
-    典型字段：ToUserName / Encrypt / MsgType / Event / Content / FromUserName / CreateTime。
-    顶层仅一层，值统一取文本。
-    """
+    """解析有界的企微回调 XML body，返回顶层字段。"""
     import xml.etree.ElementTree as ET
 
     if isinstance(body, bytes):
-        body = body.decode("utf-8", errors="replace")
-    root = ET.fromstring(body)
+        if len(body) > 1_048_576:
+            raise ValueError("回调 XML 过大")
+        try:
+            body = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("回调 XML 不是合法 UTF-8") from exc
+    elif len(body.encode("utf-8")) > 1_048_576:
+        raise ValueError("回调 XML 过大")
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise ValueError("回调 XML 格式无效") from exc
+    if root.tag != "xml":
+        raise ValueError("回调 XML 根节点无效")
+    if len(root) > 64:
+        raise ValueError("回调 XML 字段过多")
     out: dict[str, str] = {}
     for child in root:
-        out[child.tag] = (child.text or "").strip()
+        value = (child.text or "").strip()
+        if len(child.tag) > 64 or len(value) > 262_144:
+            raise ValueError("回调 XML 字段过大")
+        out[child.tag] = value
     return out

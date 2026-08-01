@@ -181,6 +181,16 @@ const HunterLogo = strokeLogo(
   </>,
 );
 
+// 个人微信 — iLink 使用微信双气泡身份，与企业微信的应用气泡分开。
+const WeChatIlinkLogo = strokeLogo(
+  <>
+    <path d="M9.5 4.5c-4 0-7 2.5-7 5.8 0 1.9 1 3.5 2.7 4.6l-.7 2.6 2.8-1.4c.7.2 1.4.3 2.2.3 4 0 7-2.6 7-6.1s-3-5.8-7-5.8Z" />
+    <path d="M14.8 9.5c3.8 0 6.7 2.3 6.7 5.4 0 1.7-.9 3.2-2.4 4.2l.6 2.4-2.6-1.3c-.7.2-1.5.3-2.3.3-2.9 0-5.3-1.3-6.3-3.4" />
+    <circle cx="7.2" cy="10" r=".65" fill="currentColor" stroke="none" />
+    <circle cx="11.6" cy="10" r=".65" fill="currentColor" stroke="none" />
+  </>,
+);
+
 // 企业微信 — 双气泡（一大一小叠加），近似官方 logo 的对话形态。
 const WecomLogo = strokeLogo(
   <>
@@ -241,6 +251,7 @@ export const CONNECTORS: Record<string, ConnectorRegistryEntry> = {
   apollo: { label: "Apollo.io", logo: ApolloLogo },
   hunter: { label: "Hunter", logo: HunterLogo },
   wecom: { label: "企业微信", logo: WecomLogo },
+  wechat_ilink: { label: "个人微信", logo: WeChatIlinkLogo },
   // Non-brand utilities.
   email: { label: "Email", logo: EmailLogo },
   browser: { label: "Browser", logo: BrowserLogo },

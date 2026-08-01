@@ -177,7 +177,7 @@ def test_muted_connector_not_delivered(tmp_path, monkeypatch):
     mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider())
     delivered: list[str] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=""):
         delivered.append(session_id)
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
@@ -205,7 +205,7 @@ def test_dm_muted_session_not_delivered(tmp_path, monkeypatch):
     mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider())
     delivered: list[str] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=""):
         delivered.append(session_id)
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)

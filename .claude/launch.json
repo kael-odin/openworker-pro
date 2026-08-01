@@ -6,6 +6,11 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "surfaces/gui", "run", "dev"],
       "port": 1420
+    },
+    {
+      "name": "vite-attach",
+      "url": "http://localhost:1420",
+      "port": 1420
     }
   ]
 }

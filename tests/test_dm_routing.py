@@ -44,7 +44,7 @@ def test_dm_with_designated_session_delivers(tmp_path, monkeypatch):
     _connect_slack(mgr)
     delivered: list[tuple[str, str]] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=""):
         delivered.append((session_id, message))
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)

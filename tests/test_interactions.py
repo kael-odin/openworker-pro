@@ -58,6 +58,56 @@ def test_slack_blocks_shape():
     assert len(_slack_blocks("hi", [])) == 1
 
 
+def test_telegram_interactive_payload():
+    """Telegram inline keyboard payload carries each button's encoded value as callback_data."""
+    from coworker.connectors.senders import _telegram_inline_keyboard
+
+    kb = _telegram_inline_keyboard([Button("批准", "v1"), Button("拒绝", "v2")])
+    assert kb == [[
+        {"text": "批准", "callback_data": "v1"},
+        {"text": "拒绝", "callback_data": "v2"},
+    ]]
+    assert _telegram_inline_keyboard([]) == []
+
+
+def test_telegram_callback_mapper():
+    """A CallbackQuery maps to an InteractionEvent carrying the encoded value + clicked msg id."""
+    from coworker.connectors.adapters import telegram_callback_to_event
+
+    class _User:
+        id = 4242
+        full_name = "Alice"
+
+    class _Chat:
+        id = -100
+
+    class _Msg:
+        message_id = 99
+        chat = _Chat()
+
+    class _CB:
+        data = json.dumps({"id": "item1", "r": "allow"})
+        from_user = _User()
+        message = _Msg()
+
+    ev = telegram_callback_to_event(_CB())
+    assert ev is not None
+    assert ev.platform == "telegram"
+    assert ev.value == json.dumps({"id": "item1", "r": "allow"})
+    assert ev.chat_id == "-100"
+    assert ev.message_id == "99"
+    assert ev.user_id == "4242"
+    assert ev.user_name == "Alice"
+
+    # empty callback_data → None
+    class _Empty:
+        data = None
+        from_user = None
+        message = None
+
+    assert telegram_callback_to_event(_Empty()) is None
+
+
 def test_interaction_click_resolves_item(tmp_path):
     mgr = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
     mgr.secrets.put(

@@ -2,8 +2,8 @@
 
 Lives inside the always-on `openworker-server` (started/stopped in its lifespan). On inbound:
 enforce the per-platform allowlist, then hand the message to the registered handler (the
-super-agent runner, wired in the next increment). Outbound replies go through the
-`send_message` tool, not the gateway — so the gateway stays a thin inbound router here.
+super-agent runner, wired in the next increment). Stateless outbound uses `send_message`
+senders; live-only platforms (including iLink) reuse `deliver()` through a bounded bridge.
 """
 
 from __future__ import annotations

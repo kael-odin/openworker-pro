@@ -17,13 +17,17 @@ access_token 管理：
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
 
-from ..base import MessageEvent, MessageType, SessionSource
+from ..base import InteractionEvent, MessageEvent, MessageType, SessionSource
 from . import crypto
 
 logger = logging.getLogger("coworker.connectors.wecom")
@@ -31,6 +35,17 @@ logger = logging.getLogger("coworker.connectors.wecom")
 QYAPI_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 # access_token 有效期 7200s，提前 300s 刷新防边界。
 _TOKEN_REFRESH_MARGIN = 300
+_CALLBACK_TIMESTAMP_TOLERANCE_SECONDS = 300
+_REPLAY_TTL_SECONDS = 600
+_REPLAY_CACHE_MAX = 2048
+
+
+@dataclass(frozen=True)
+class CallbackVerification:
+    ok: bool
+    payload: str = ""
+    error_code: str = ""
+    replay_key: str = ""
 
 
 class WeComAppClient:
@@ -47,25 +62,35 @@ class WeComAppClient:
     ) -> None:
         if not corpid or not secret or not agent_id:
             raise ValueError("corpid / secret / agent_id 不能为空")
+        token = (token or "").strip()
+        encoding_aes_key = (encoding_aes_key or "").strip()
+        if bool(token) != bool(encoding_aes_key):
+            raise ValueError("回调 Token 与 EncodingAESKey 必须同时配置")
+        if encoding_aes_key:
+            crypto._decode_aes_key(encoding_aes_key)
         self.corpid = corpid
         self.secret = secret
         self.agent_id = agent_id
-        self.token = token  # 回调签名校验用 Token
+        self.token = token
         self.encoding_aes_key = encoding_aes_key
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
+        self._token_lock = threading.Lock()
+        self._callback_replays: OrderedDict[str, float] = OrderedDict()
 
     # -- access_token ----------------------------------------------------------
     def _get_access_token(self) -> str:
-        """获取（或复用缓存的）access_token。过期则重新获取。
-
-        同步 httpx —— 在 adapter.send() 或 adapter.connect() 里通过 asyncio.to_thread
-        调用，避免阻塞事件循环。token 缓存在实例内存，进程生命周期内有效。
-        """
+        """获取或复用 token；锁内二次检查避免并发刷新风暴。"""
         now = time.time()
         if self._access_token and now < self._token_expires_at - _TOKEN_REFRESH_MARGIN:
             return self._access_token
-        # 重新获取
+        with self._token_lock:
+            now = time.time()
+            if self._access_token and now < self._token_expires_at - _TOKEN_REFRESH_MARGIN:
+                return self._access_token
+            return self._refresh_access_token(now)
+
+    def _refresh_access_token(self, now: float) -> str:
         try:
             resp = httpx.get(
                 f"{QYAPI_BASE}/gettoken",
@@ -115,6 +140,87 @@ class WeComAppClient:
         }
         return self._post_message(token, payload)
 
+    def send_template_card(
+        self, userid: str, title: str, body: str, buttons
+    ) -> dict[str, Any]:
+        """发 button_list 模板卡片 —— 审批/问答的按钮交互载体。
+
+        每个按钮的 ``key`` 就是 ``interactions.encode`` 产出的不透明 value（item_id +
+        resolution），点击后企微回调 ``template_card_event`` 把 key 带回来，adapter 转成
+        InteractionEvent，走与 Slack/Telegram 同一条解析路径。``task_id`` 用第一个按钮的
+        value 派生，使 update_taskcard 能在 resolve 后替换按钮为结果文本。
+        """
+        token = self._get_access_token()
+        from ...interactions import decode
+
+        # task_id binds this card so update_taskcard can target it later. Derive from the
+        # first button's decoded item_id — stable per Inbox item.
+        first_item_id = ""
+        for b in buttons or []:
+            decoded = decode(str(getattr(b, "value", "") or ""))
+            if decoded:
+                first_item_id = decoded[0]
+                break
+        task_id = f"ow_{first_item_id}"[:40] or "ow_card"
+        button_list = [
+            {
+                "text": str(getattr(b, "label", ""))[:20],
+                "style": 1,  # 1 = 主色（绿/蓝），2 = 次色
+                "key": str(getattr(b, "value", "")),
+            }
+            for b in (buttons or [])
+        ]
+        payload = {
+            "touser": userid,
+            "msgtype": "template_card",
+            "agentid": int(self.agent_id),
+            "template_card": {
+                "card_type": "button_list",
+                "source": {"icon_url": "", "desc": "OpenWorker"},
+                "main_title": {"title": title[:20]},
+                "sub_title_text": (body or "")[:200],
+                "task_id": task_id,
+                "button_list": button_list,
+            },
+        }
+        return self._post_message(token, payload)
+
+    def update_taskcard(
+        self, userid: str, task_id: str, outcome_text: str
+    ) -> dict[str, Any]:
+        """把已 resolve 的审批卡片按钮替换为一条结果文本（企微不支持 editMessageText，
+        只能把 button_list 换成一个 disabled 状态的按钮）。"""
+        token = self._get_access_token()
+        payload = {
+            "userids": [userid],
+            "agentid": int(self.agent_id),
+            "task_id": task_id,
+            "replaced_button_key": "ow_resolved",
+            "button_list": [
+                {
+                    "text": (outcome_text or "已处理")[:20],
+                    "style": 3,  # 3 = 灰色 disabled 视感
+                    "key": "ow_resolved",
+                }
+            ],
+        }
+        try:
+            resp = httpx.post(
+                f"{QYAPI_BASE}/message/update_taskcard",
+                params={"access_token": token},
+                json=payload,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            err = f"企微更新卡片失败: {exc}"
+            logger.error(err)
+            return {"errcode": -1, "errmsg": err}
+        if data.get("errcode") in (40014, 42001):
+            self.invalidate_token()
+        return data
+
     def _post_message(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             resp = httpx.post(
@@ -135,6 +241,46 @@ class WeComAppClient:
             self.invalidate_token()
         return data
 
+    def parse_template_card_event(self, xml_str: str) -> Optional[InteractionEvent]:
+        """If the decrypted callback XML is a template_card button click, return the
+        InteractionEvent for it; otherwise None. The button's encoded value rides in the
+        ``ButtonKeys`` field (button_list card type). Falls back to ``SelectedItems`` /
+        ``EventKey`` for other card variants."""
+        fields = crypto.parse_callback_xml(xml_str)
+        if fields.get("MsgType") != "event" or fields.get("Event") != "template_card_event":
+            return None
+        userid = fields.get("FromUserName", "")
+        # button_list cards put the selected key in ButtonKeys; other card types use
+        # SelectedItems (JSON with SelectedKey) or EventKey. Take the first non-empty.
+        value = (
+            fields.get("ButtonKeys")
+            or fields.get("EventKey")
+            or ""
+        ).strip()
+        if not value:
+            sel = fields.get("SelectedItems", "")
+            # SelectedItems may be JSON like [{"SelectedKey":"..."}]; extract loosely.
+            import json as _json
+
+            try:
+                items = _json.loads(sel)
+                if isinstance(items, list) and items:
+                    value = str(items[0].get("SelectedKey", "")).strip()
+            except (ValueError, TypeError):
+                pass
+        if not value:
+            return None
+        task_id = fields.get("TaskId", "")
+        return InteractionEvent(
+            platform="wecom",
+            chat_id=userid,
+            message_id=task_id,  # task_id is how update_message targets the card
+            value=value,
+            user_id=userid,
+            user_name=userid,
+            team_id=self.corpid,
+        )
+
     # -- 入站消息解析 ----------------------------------------------------------
     def parse_inbound_xml(self, xml_str: str) -> MessageEvent:
         """把解密后的企微回调 XML 解析成 MessageEvent。
@@ -148,7 +294,7 @@ class WeComAppClient:
         userid = fields.get("FromUserName", "")
         msg_type = fields.get("MsgType", "")
         content = fields.get("Content", "")
-        msg_id = fields.get("MsgId") or fields.get("CreateTime")
+        msg_id = fields.get("MsgId") or None
         event = fields.get("Event", "")
 
         # event 类型消息（如用户关注应用、点击菜单）—— 文本化为可读描述。
@@ -178,57 +324,85 @@ class WeComAppClient:
             mentions_me=True,  # 企微应用消息等同 @bot —— 必须回复
         )
 
-    # -- 回调校验 + 解密 -------------------------------------------------------
-    def verify_and_decrypt(self, query: dict[str, str], body: bytes) -> tuple[bool, str]:
-        """校验企微回调签名并解密，返回 (ok, plaintext_or_echostr)。
+    @property
+    def inbound_state(self) -> str:
+        """``encrypted`` 或 ``outbound_only``；不再提供不安全的明文入站。"""
+        return "encrypted" if self.token and self.encoding_aes_key else "outbound_only"
 
-        企微回调两步：
-          1. URL 验证（GET）：query 带 msg_signature/timestamp/nonce/echostr，
-             签名校验通过后原样返回 echostr 明文。
-          2. 消息接收（POST）：body 是 XML，内含 Encrypt 字段，解密后得消息 XML。
-
-        本方法处理两种：若 body 为空且 query 有 echostr → 验证模式；否则解密 POST body。
-        """
-        sig = query.get("msg_signature", "")
-        ts = query.get("timestamp", "")
-        nonce = query.get("nonce", "")
-        echostr = query.get("echostr", "")
-
-        # 模式 1：URL 验证（GET echostr）
-        if echostr and not body:
-            if not self.token:
-                return True, echostr  # 明文模式不校验，直接回 echostr
-            if not crypto.verify_signature(self.token, ts, nonce, echostr, sig):
-                return False, "签名校验失败"
-            # echostr 本身是 base64 密文，需解密后返回明文（企微验证流程要求）
-            if self.encoding_aes_key:
-                try:
-                    plain, _ = crypto.decrypt_message(echostr, self.encoding_aes_key, self.corpid)
-                    return True, plain
-                except ValueError as exc:
-                    return False, f"echostr 解密失败: {exc}"
-            return True, echostr
-
-        # 模式 2：消息接收（POST）
-        if not body:
-            return False, "空 body"
-
-        xml_dict = crypto.parse_callback_xml(body)
-        encrypt = xml_dict.get("Encrypt", "")
-        if not encrypt:
-            # 明文模式：XML 直接是消息体（无 Encrypt 字段）
-            return True, body.decode("utf-8", errors="replace")
-
-        if not self.token or not self.encoding_aes_key:
-            return False, "收到加密消息但未配置 Token/EncodingAESKey"
-
-        if not crypto.verify_signature(self.token, ts, nonce, encrypt, sig):
-            return False, "签名校验失败"
+    @staticmethod
+    def _timestamp_is_fresh(timestamp: str, now: Optional[float] = None) -> bool:
         try:
-            plain, corpid = crypto.decrypt_message(encrypt, self.encoding_aes_key, self.corpid)
-            return True, plain
-        except ValueError as exc:
-            return False, f"消息解密失败: {exc}"
+            value = int(timestamp)
+        except (TypeError, ValueError):
+            return False
+        current = time.time() if now is None else now
+        return abs(current - value) <= _CALLBACK_TIMESTAMP_TOLERANCE_SECONDS
+
+    def _consume_replay_key(self, timestamp: str, nonce: str, signature: str) -> tuple[bool, str]:
+        now = time.time()
+        cutoff = now - _REPLAY_TTL_SECONDS
+        while self._callback_replays:
+            _, seen_at = next(iter(self._callback_replays.items()))
+            if seen_at >= cutoff:
+                break
+            self._callback_replays.popitem(last=False)
+        raw = f"{timestamp}\0{nonce}\0{signature}".encode("utf-8")
+        key = hashlib.sha256(raw).hexdigest()
+        if key in self._callback_replays:
+            return False, key
+        self._callback_replays[key] = now
+        self._callback_replays.move_to_end(key)
+        while len(self._callback_replays) > _REPLAY_CACHE_MAX:
+            self._callback_replays.popitem(last=False)
+        return True, key
+
+    # -- 回调校验 + 解密 -------------------------------------------------------
+    def verify_and_decrypt(self, query: dict[str, str], body: bytes) -> CallbackVerification:
+        """严格校验加密企微回调；公开错误只返回稳定的脱敏错误码。"""
+        if self.inbound_state != "encrypted":
+            return CallbackVerification(False, error_code="callback_not_configured")
+
+        sig = (query.get("msg_signature") or "").strip()
+        ts = (query.get("timestamp") or "").strip()
+        nonce = (query.get("nonce") or "").strip()
+        echostr = (query.get("echostr") or "").strip()
+        if not sig or not nonce or not self._timestamp_is_fresh(ts):
+            return CallbackVerification(False, error_code="invalid_callback_metadata")
+
+        if echostr and not body:
+            encrypted = echostr
+        else:
+            if not body:
+                return CallbackVerification(False, error_code="empty_body")
+            try:
+                xml_dict = crypto.parse_callback_xml(body)
+            except ValueError:
+                return CallbackVerification(False, error_code="invalid_xml")
+            encrypted = xml_dict.get("Encrypt", "")
+            if not encrypted:
+                return CallbackVerification(False, error_code="plaintext_not_allowed")
+
+        if (
+            len(sig) != 40
+            or len(ts) > 16
+            or len(nonce) > 256
+            or len(encrypted) > 1_048_576
+        ):
+            return CallbackVerification(False, error_code="invalid_callback_metadata")
+        if not crypto.verify_signature(self.token, ts, nonce, encrypted, sig):
+            return CallbackVerification(False, error_code="invalid_signature")
+        fresh, replay_key = self._consume_replay_key(ts, nonce, sig)
+        if not fresh:
+            return CallbackVerification(False, error_code="replay", replay_key=replay_key)
+        try:
+            plain, _ = crypto.decrypt_message(
+                encrypted, self.encoding_aes_key, self.corpid
+            )
+        except (ValueError, TypeError):
+            return CallbackVerification(
+                False, error_code="decrypt_failed", replay_key=replay_key
+            )
+        return CallbackVerification(True, payload=plain, replay_key=replay_key)
 
     # -- 主动验证 token（配置面板"测试"按钮用）-----------------------------------
     def validate_credentials(self) -> dict[str, Any]:
@@ -241,16 +415,26 @@ class WeComAppClient:
 
 
 def client_from_profile(profile: dict[str, Any]) -> Optional[WeComAppClient]:
-    """从 SecretStore profile 构造 WeComAppClient。缺关键字段返回 None。"""
+    """从 SecretStore profile 构造客户端；不完整回调配置降级为仅出站。"""
     corpid = profile.get("corpid")
     secret = profile.get("secret")
     agent_id = profile.get("agent_id")
     if not (corpid and secret and agent_id):
         return None
-    return WeComAppClient(
-        corpid=corpid,
-        secret=secret,
-        agent_id=agent_id,
-        token=profile.get("token", ""),
-        encoding_aes_key=profile.get("encoding_aes_key", ""),
-    )
+    token = (profile.get("token") or "").strip()
+    encoding_aes_key = (profile.get("encoding_aes_key") or "").strip()
+    if bool(token) != bool(encoding_aes_key):
+        logger.warning("wecom callback config incomplete; inbound disabled until migrated")
+        token = ""
+        encoding_aes_key = ""
+    try:
+        return WeComAppClient(
+            corpid=corpid,
+            secret=secret,
+            agent_id=agent_id,
+            token=token,
+            encoding_aes_key=encoding_aes_key,
+        )
+    except ValueError:
+        logger.warning("wecom callback config invalid; inbound disabled until migrated")
+        return WeComAppClient(corpid=corpid, secret=secret, agent_id=agent_id)

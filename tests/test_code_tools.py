@@ -57,8 +57,15 @@ def test_ripgrep_uses_the_same_ignored_dirs_as_the_python_fallback(tmp_path, mon
 
     assert commands
     user_glob = commands[0].index("*.py")
-    for ignored in search._IGNORE_DIRS:
+    # ripgrep receives _GLOB_IGNORE (not _IGNORE_DIRS): OS_DATA_DIRS (AppData, Library, …)
+    # are excluded by NAME during Python os.walk, but NOT as ripgrep path globs, because
+    # `!**/AppData/**` would exclude any workspace whose path contains an AppData ancestor
+    # (e.g. Windows %TEMP% under C:\Users\<user>\AppData\Local\Temp), dropping every match.
+    for ignored in search._GLOB_IGNORE:
         assert commands[0].index(f"!**/{ignored}/**") > user_glob
+    # OS_DATA_DIRS must NOT appear as ripgrep globs.
+    for os_dir in search.OS_DATA_DIRS:
+        assert f"!**/{os_dir}/**" not in commands[0]
 
 
 def test_grep_rejects_path_escape(tmp_path):
@@ -71,6 +78,57 @@ def test_py_grep_fallback_skips_ignored_dirs(tmp_path):
     res = _py_grep(tmp_path.resolve(), tmp_path.resolve(), "hello", None, 100)
     assert res["count"] == 2  # a.py + b.txt, NOT node_modules
     assert all("node_modules" not in m["file"] for m in res["matches"])
+
+
+def test_grep_handles_drive_letter_paths(tmp_path):
+    """Windows drive letters (C:\\) have a colon that breaks naive ``split(":")`` parsing.
+    The ripgrep --json parser must handle this: paths and line numbers come back as structured
+    JSON fields, not colon-delimited text."""
+    _seed(tmp_path)
+    grep = search_tools(str(tmp_path))[0]
+    out = grep(pattern="hello")
+    files = {m["file"] for m in out["matches"]}
+    assert "a.py" in files and "b.txt" in files
+    # Line numbers are accurate (not 0 from a failed int parse).
+    lines = {m["line"] for m in out["matches"]}
+    assert 1 in lines
+
+
+def test_grep_handles_filename_with_colon(tmp_path):
+    """A filename containing a colon would break text-mode ``split(":", 2)`` at the field
+    boundary; the --json parser is immune because path/line/text are discrete JSON fields."""
+    _seed(tmp_path)
+    # On Windows, ':' is reserved in filenames; create a file whose text has a colon instead
+    # to verify the match text (after the line number) is not truncated by a colon split.
+    (tmp_path / "weird.txt").write_text("key: value with: colons\n", encoding="utf-8")
+    grep = search_tools(str(tmp_path))[0]
+    out = grep(pattern="colons")
+    match = next((m for m in out["matches"] if m["file"] == "weird.txt"), None)
+    assert match is not None
+    assert "value with: colons" in match["text"]
+
+
+def test_grep_invalid_regex_returns_error(tmp_path):
+    _seed(tmp_path)
+    grep = search_tools(str(tmp_path))[0]
+    out = grep(pattern="(unclosed")
+    # ripgrep reports a regex error via non-zero return code; the python fallback catches it.
+    assert "error" in out
+
+
+def test_grep_no_matches_returns_empty(tmp_path):
+    _seed(tmp_path)
+    grep = search_tools(str(tmp_path))[0]
+    out = grep(pattern="zzz_nonexistent_zzz")
+    assert out["count"] == 0
+    assert out["matches"] == []
+
+
+def test_grep_respects_max_results(tmp_path):
+    _seed(tmp_path)
+    grep = search_tools(str(tmp_path))[0]
+    out = grep(pattern="hello", max_results=1)
+    assert out["count"] <= 1
 
 
 # -- git_log -------------------------------------------------------------------

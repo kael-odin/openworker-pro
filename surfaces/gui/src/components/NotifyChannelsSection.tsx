@@ -6,6 +6,7 @@ import {
   getNotifyChannels,
   getNotifyChannelConfig,
   saveNotifyChannelConfig,
+  setNotifyChannelEnabled,
   testNotifyChannel,
   type NotifyChannelInfo,
 } from "../api";
@@ -20,19 +21,19 @@ const LABEL = "text-[12px] font-medium text-muted mb-1 block";
 type Field = { key: string; labelKey: string; type: "text" | "password"; placeholder?: string };
 const FIELDS: Record<string, Field[]> = {
   dingtalk: [
-    { key: "url", labelKey: "notify.field_webhook_url", type: "text", placeholder: "https://oapi.dingtalk.com/robot/send?access_token=..." },
+    { key: "url", labelKey: "notify.field_webhook_url", type: "password", placeholder: "https://oapi.dingtalk.com/robot/send?access_token=..." },
     { key: "secret", labelKey: "notify.field_sign_secret", type: "password", placeholder: "SEC..." },
   ],
   feishu: [
-    { key: "url", labelKey: "notify.field_webhook_url", type: "text", placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/..." },
+    { key: "url", labelKey: "notify.field_webhook_url", type: "password", placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/..." },
     { key: "secret", labelKey: "notify.field_sign_secret", type: "password" },
   ],
   wecom: [
-    { key: "url", labelKey: "notify.field_webhook_url", type: "text", placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." },
+    { key: "url", labelKey: "notify.field_webhook_url", type: "password", placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." },
     { key: "secret", labelKey: "notify.field_sign_secret", type: "password" },
   ],
   webhook: [
-    { key: "url", labelKey: "notify.field_webhook_url", type: "text", placeholder: "https://..." },
+    { key: "url", labelKey: "notify.field_webhook_url", type: "password", placeholder: "https://..." },
   ],
   email: [
     { key: "smtp_host", labelKey: "notify.field_smtp_host", type: "text", placeholder: "smtp.example.com" },
@@ -87,9 +88,7 @@ export function NotifyChannelsSection() {
     setSaving(ch);
     try {
       const cfg = configs[ch] || {};
-      // 合并 enabled 状态。enabled 单独由 toggle 管理，不在这里丢。
-      const enabled = channels.find((c) => c.channel === ch)?.enabled ?? false;
-      const res = await saveNotifyChannelConfig(ch, { ...cfg, enabled });
+      const res = await saveNotifyChannelConfig(ch, cfg);
       if (res.ok) {
         setTestState((prev) => ({ ...prev, [ch]: { ok: true, msg: t("notify.saved") } }));
         reload();
@@ -106,8 +105,7 @@ export function NotifyChannelsSection() {
     setTestState((prev) => ({ ...prev, [ch]: null }));
     try {
       const cfg = configs[ch] || {};
-      const enabled = channels.find((c) => c.channel === ch)?.enabled ?? false;
-      const res = await testNotifyChannel(ch, { ...cfg, enabled });
+      const res = await testNotifyChannel(ch, cfg);
       const r = res.results?.[0];
       if (res.ok && r?.ok) {
         setTestState((prev) => ({ ...prev, [ch]: { ok: true, msg: t("notify.test_ok") } }));
@@ -120,9 +118,15 @@ export function NotifyChannelsSection() {
   };
 
   const toggleEnabled = async (ch: string, enabled: boolean) => {
-    const cfg = configs[ch] || {};
-    await saveNotifyChannelConfig(ch, { ...cfg, enabled });
-    setChannels((prev) => prev.map((c) => (c.channel === ch ? { ...c, enabled } : c)));
+    const res = await setNotifyChannelEnabled(ch, enabled);
+    if (res.ok) {
+      setChannels((prev) => prev.map((c) => (c.channel === ch ? { ...c, enabled } : c)));
+    } else {
+      setTestState((prev) => ({
+        ...prev,
+        [ch]: { ok: false, msg: res.error || t("notify.save_fail") },
+      }));
+    }
   };
 
   return (

@@ -390,6 +390,15 @@ export function App() {
     return () => window.removeEventListener("coworker:open-onboarding", open);
   }, []);
 
+  // A connector detail page (e.g. personal WeChat) can prompt the user to configure where DM
+  // messages land. The detail page can't reach setSurface directly (it's nested several layers
+  // deep under IntegrationsView), so it dispatches this event and the App opens the Inbox.
+  useEffect(() => {
+    const open = () => setSurface("inbox");
+    window.addEventListener("coworker:open-inbox", open);
+    return () => window.removeEventListener("coworker:open-inbox", open);
+  }, []);
+
   const sessionRef = useRef<Session | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // A prompt to auto-send once the next session connects (used by "Run now").
@@ -967,18 +976,33 @@ export function App() {
   const [runToast, setRunToast] = useState<{
     title: string; sessionId: string; workspace: string; agent: string; time: string;
   } | null>(null);
+  // UX-026 (done): pairs with the started toast — fires when a scheduled run completes, so a
+  // user who stepped away or is in another section sees "✓ finished" with a View-run link.
+  const [doneToast, setDoneToast] = useState<{
+    title: string; sessionId: string; workspace: string; agent: string; status: string;
+  } | null>(null);
   useEffect(() => {
     const stop = connectEvents((msg) => {
-      if (msg.type !== "automation_run_started") return;
       const d = (msg.data ?? {}) as Record<string, string>;
-      setRunToast({
-        title: d.task_title || tt("app.automation_default_title"),
-        sessionId: d.session_id || "",
-        workspace: d.workspace || "",
-        agent: d.agent || "cowork",
-        time: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
-      });
-      announceAutomationsChanged(); // the Scheduled band's badge is now stale
+      if (msg.type === "automation_run_started") {
+        setRunToast({
+          title: d.task_title || tt("app.automation_default_title"),
+          sessionId: d.session_id || "",
+          workspace: d.workspace || "",
+          agent: d.agent || "cowork",
+          time: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+        });
+        announceAutomationsChanged(); // the Scheduled band's badge is now stale
+      } else if (msg.type === "automation_run_done") {
+        setDoneToast({
+          title: d.task_title || tt("app.automation_default_title"),
+          sessionId: d.session_id || "",
+          workspace: d.workspace || "",
+          agent: d.agent || "cowork",
+          status: d.status || "ok",
+        });
+        announceAutomationsChanged(); // run history + badge are now stale
+      }
     });
     return stop;
   }, []);
@@ -987,6 +1011,11 @@ export function App() {
     const t = window.setTimeout(() => setRunToast(null), 5000);
     return () => window.clearTimeout(t);
   }, [runToast]);
+  useEffect(() => {
+    if (!doneToast) return;
+    const t = window.setTimeout(() => setDoneToast(null), 6000);
+    return () => window.clearTimeout(t);
+  }, [doneToast]);
 
   const openSessionFromInbox = (sid: string, ws: string, ag: string) => selectSession(sid, ws, ag);
   const selectSession = async (id: string, ws: string, ag: string) => {
@@ -1280,6 +1309,42 @@ export function App() {
           </div>
           <div className="absolute left-3 right-3 bottom-1 h-[2px] rounded bg-line overflow-hidden">
             <span className="block h-full bg-faint toast-drain" />
+          </div>
+        </div>
+      )}
+      {doneToast && (
+        <div
+          className="fixed top-3 right-3 z-[45] w-[290px] bg-panel border border-line rounded-xl shadow-lg px-3.5 pt-3 pb-2.5"
+          data-testid="automation-done-toast"
+        >
+          <div className="flex items-center gap-2 text-[12.5px] font-semibold">
+            <span className="w-[7px] h-[7px] rounded-full bg-emerald-500" />
+            {t("app.automation_done")}
+          </div>
+          <div className="text-[12.5px] text-muted mt-0.5 ml-[15px] truncate">
+            {doneToast.title}
+          </div>
+          <div className="flex items-center justify-between ml-[15px] mt-1.5">
+            <button
+              className="text-[12.5px] text-accent font-medium"
+              data-testid="toast-view-done-run"
+              onClick={() => {
+                selectSession(doneToast.sessionId, doneToast.workspace, doneToast.agent);
+                setDoneToast(null);
+              }}
+            >
+              {t("app.view_run")}
+            </button>
+            <button
+              className="text-[12px] text-faint px-0.5"
+              title={t("app.dismiss")}
+              onClick={() => setDoneToast(null)}
+            >
+              ✕
+            </button>
+          </div>
+          <div className="absolute left-3 right-3 bottom-1 h-[2px] rounded bg-line overflow-hidden">
+            <span className="block h-full bg-emerald-500 toast-drain" />
           </div>
         </div>
       )}

@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 import aisuite as ai
 
 from ..secrets import SecretStore
-from .base import parse_target
+from .base import SendResult, parse_target
 from .senders import DEFAULT_FILE_SENDERS, DEFAULT_SENDERS, FileSender, Sender
 
 _SCHEMA = {
@@ -22,9 +22,10 @@ _SCHEMA = {
     "function": {
         "name": "send_message",
         "description": (
-            "Send a message to a connected chat (Slack or Telegram). `target` is the "
-            "reply handle from an inbound message (e.g. 'telegram:12345' or 'slack:C0123', "
-            "optionally with a ':<thread>' suffix) — or, for Slack, just the channel NAME "
+            "Send a message to a connected chat (Slack, Telegram, WeCom, or personal WeChat). "
+            "`target` is the reply handle from an inbound message (e.g. 'telegram:12345', "
+            "'slack:C0123', or 'wechat_ilink:<account>/<user>', optionally with a "
+            "':<thread>' suffix where the platform supports threads) — or, for Slack, just "
             "('#general' or 'general'; resolved against the connected workspaces). Use this to "
             "actually reach a person — plain assistant text is not delivered anywhere."
         ),
@@ -33,7 +34,7 @@ _SCHEMA = {
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "Destination handle 'platform:chat_id[:thread]', e.g. 'telegram:12345'.",
+                    "description": "Destination handle 'platform:chat_id[:thread]', e.g. 'telegram:12345' or 'wechat_ilink:<account>/<user>'.",
                 },
                 "text": {"type": "string", "description": "The message text to send."},
             },
@@ -145,8 +146,9 @@ def make_send_message_tool(
     secrets: SecretStore,
     *,
     senders: Optional[dict[str, Sender]] = None,
+    live_delivery: Optional[Callable[[str, str], SendResult]] = None,
 ) -> Callable[..., Any]:
-    """Build the `send_message` tool bound to a SecretStore (and optional sender registry)."""
+    """Build `send_message`; live-only platforms use the injected Gateway bridge."""
     senders = senders if senders is not None else DEFAULT_SENDERS
 
     def send_message(target: str, text: str) -> dict[str, Any]:
@@ -155,6 +157,13 @@ def make_send_message_tool(
         except ValueError as exc:
             return {"error": str(exc)}
         sender = senders.get(platform)
+        if platform == "wechat_ilink":
+            if live_delivery is None:
+                return {"error": "wechat_ilink live connection is unavailable"}
+            result = live_delivery(target, text)
+            if result.ok:
+                return {"ok": True, "message_id": result.message_id, "target": target}
+            return {"error": result.error or "send failed"}
         if sender is None:
             return {"error": f"unknown platform: {platform}"}
         # §36: a channel NAME resolves to its address (the user says "#general", not C0123).

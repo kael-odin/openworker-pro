@@ -22,6 +22,11 @@ def _isolated_state_dir(tmp_path, monkeypatch):
     as burst noise in the ocw-connect-telemetry-events table)."""
     monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "coworker-state"))
     monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
+    # P1-01 fail-closed: a missing sidecar token now rejects authenticated requests in
+    # production. The test suite builds tokenless TestClients everywhere; treat the whole
+    # run as the explicit local-dev opt-in so those clients keep working. Tests that verify
+    # the gated path (test_sidecar_token_gates_rest_and_websockets) set a real token.
+    monkeypatch.setenv("COWORKER_INSECURE_LOCAL_DEV", "1")
 
 
 @pytest_asyncio.fixture

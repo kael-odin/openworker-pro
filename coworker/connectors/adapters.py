@@ -20,7 +20,13 @@ from .base import (
     SendResult,
     SessionSource,
 )
-from .senders import _send_slack, _send_slack_interactive, _send_telegram
+from .senders import (
+    _edit_telegram_message,
+    _send_slack,
+    _send_slack_interactive,
+    _send_telegram,
+    _send_telegram_interactive,
+)
 
 logger = logging.getLogger("coworker.connectors")
 
@@ -53,6 +59,27 @@ def telegram_message_to_event(msg: Any) -> Optional[MessageEvent]:
     )
     return MessageEvent(
         text=text, source=source, message_id=str(getattr(msg, "message_id", ""))
+    )
+
+
+def telegram_callback_to_event(cb: Any) -> Optional[InteractionEvent]:
+    """Map a python-telegram-bot CallbackQuery to an InteractionEvent. The button's
+    ``callback_data`` is the opaque encoded value from ``interactions.encode`` — the adapter
+    doesn't parse it, the manager's ``_on_interaction`` does. The clicked message's id rides
+    along so ``update_message`` can swap the keyboard for the outcome line."""
+    data = getattr(cb, "data", None)
+    if not data:
+        return None
+    msg = getattr(cb, "message", None)
+    user = getattr(cb, "from_user", None)
+    chat = getattr(msg, "chat", None)
+    return InteractionEvent(
+        platform="telegram",
+        chat_id=str(getattr(chat, "id", "")) if chat else "",
+        message_id=str(getattr(msg, "message_id", "")) if msg else None,
+        value=str(data),
+        user_id=str(user.id) if user else None,
+        user_name=getattr(user, "full_name", None) if user else None,
     )
 
 
@@ -96,7 +123,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         try:
-            from telegram.ext import Application, MessageHandler, filters
+            from telegram.ext import (
+                Application,
+                CallbackQueryHandler,
+                MessageHandler,
+                filters,
+            )
         except ImportError:
             logger.warning(
                 "python-telegram-bot not installed — `pip install coworker[messaging]`"
@@ -106,6 +138,20 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app = Application.builder().token(self.token).build()
 
         async def _on_update(update, _context):
+            # A button click arrives as a callback_query, not a message — route it to the
+            # interaction handler so the same resolution path as Slack Block Kit fires.
+            if update.callback_query is not None:
+                cb = update.callback_query
+                event = telegram_callback_to_event(cb)
+                if event is not None:
+                    await self.handle_interaction(event)
+                # Acknowledge so Telegram stops the loading spinner on the button. Best-effort:
+                # a failure here (network, timed out) must not strand the resolution.
+                try:
+                    await cb.answer()
+                except Exception:
+                    logger.debug("telegram callback answer failed", exc_info=True)
+                return
             event = telegram_message_to_event(update.effective_message)
             if event is not None:
                 await self.handle_message(event)
@@ -113,6 +159,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, _on_update)
         )
+        self._app.add_handler(CallbackQueryHandler(_on_update))
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
@@ -133,6 +180,22 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, text: str, *, thread_id: Optional[str] = None
     ) -> SendResult:
         return _send_telegram(self.token, chat_id, text, thread_id)
+
+    async def send_interactive(
+        self, chat_id: str, text: str, buttons, *, thread_id: Optional[str] = None
+    ) -> SendResult:
+        return _send_telegram_interactive(
+            self.token, chat_id, text, buttons, thread_id
+        )
+
+    async def update_message(self, chat_id: str, message_id: str, text: str) -> None:
+        """Swap a resolved prompt's inline keyboard for a plain outcome line."""
+        if not message_id:
+            return
+        try:
+            _edit_telegram_message(self.token, chat_id, message_id, text)
+        except Exception:
+            logger.debug("telegram editMessageText failed", exc_info=True)
 
 
 class SlackAdapter(BasePlatformAdapter):
@@ -441,6 +504,10 @@ def make_adapter(
     """
     if platform == "telegram" and profile.get("bot_token"):
         return TelegramAdapter(profile["bot_token"])
+    if platform == "wechat_ilink" and secrets is not None:
+        from .wechat_ilink import WeChatIlinkAdapter
+
+        return WeChatIlinkAdapter(secrets)
     if platform == "wecom":
         from .wecom_app import WeComAppAdapter, client_from_profile
 

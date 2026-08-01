@@ -17,6 +17,15 @@ describe("ConnectorIcon", () => {
     expect(el.style.getPropertyValue("--brand")).toBe("#611f69");
   });
 
+  it("renders the dedicated personal WeChat iLink mark", () => {
+    const { container } = render(
+      <ConnectorIcon connector={{ logo: "wechat_ilink", brand_color: "#07c160" }} />,
+    );
+    const el = container.querySelector("[data-logo]") as HTMLElement;
+    expect(el.getAttribute("data-logo")).toBe("wechat_ilink");
+    expect(el.querySelector("svg")).not.toBeNull();
+  });
+
   it("falls back to the plug glyph for an unknown id while keeping the provided color", () => {
     const { container } = render(
       <ConnectorIcon connector={{ logo: "does-not-exist", brand_color: "#123456" }} />,

@@ -376,3 +376,107 @@ def test_import_skips_traversal_rel_paths(tmp_path: Path, monkeypatch):
     r = m.import_browser_logins(payload)
     assert r["ok"] is True
     assert not (tmp_path.parent.parent / "escape.txt").exists()
+
+
+def test_import_rejects_absolute_path_in_files(tmp_path: Path, monkeypatch):
+    """An absolute path in _files must not escape the state dir — the canonical-filename
+    filter discards it regardless of the supplied path."""
+    monkeypatch.setattr("coworker.server.manager.state_dir", lambda: tmp_path)
+    target = tmp_path.parent / "stolen.txt"
+    payload = json.dumps({"version": 1, "logins": [{
+        "id": "evil-com", "url": "https://evil.com", "label": "Evil",
+        "has_state": True,
+        "_files": {str(target): "exfiltrated"},
+    }]})
+    m = _FakeManager({}, tmp_path)
+    r = m.import_browser_logins(payload)
+    assert r["ok"]  # import succeeds but the malicious file is not written
+    assert not target.exists()
+
+
+def test_import_rejects_same_prefix_sibling(tmp_path: Path, monkeypatch):
+    """String ``startswith`` can be bypassed by a sibling directory whose name shares a prefix
+    with the state dir (e.g. ``state_dir_evil``). ``is_relative_to`` must reject it."""
+    monkeypatch.setattr("coworker.server.manager.state_dir", lambda: tmp_path)
+    # A path that resolves to a sibling of tmp_path (shares a prefix but is NOT under it).
+    sibling = tmp_path.parent / (tmp_path.name + "_evil")
+    sibling.mkdir(exist_ok=True)
+    payload = json.dumps({"version": 1, "logins": [{
+        "id": "evil", "url": "https://evil.com", "label": "Evil",
+        "has_state": True,
+        "_files": {f"../{sibling.name}/storageState.json": "pwned"},
+    }]})
+    m = _FakeManager({}, tmp_path)
+    r = m.import_browser_logins(payload)
+    assert r["ok"]
+    assert not (sibling / "storageState.json").exists()
+
+
+def test_import_rejects_oversized_file(tmp_path: Path, monkeypatch):
+    """An oversized state blob must be skipped, not written."""
+    monkeypatch.setattr("coworker.server.manager.state_dir", lambda: tmp_path)
+    huge = "x" * (6 * 1024 * 1024)  # 6 MiB — over the 5 MiB per-file limit
+    payload = json.dumps({"version": 1, "logins": [{
+        "id": "big-com", "url": "https://big.com", "label": "Big",
+        "has_state": True,
+        "_files": {"browser_profiles/big-com/storageState.json": huge},
+    }]})
+    m = _FakeManager({}, tmp_path)
+    r = m.import_browser_logins(payload)
+    assert r["ok"]
+    assert not (tmp_path / "browser_profiles" / "big-com" / "storageState.json").exists()
+
+
+def test_import_cannot_read_secrets_via_files(tmp_path: Path, monkeypatch):
+    """The _files keys are display-only metadata from the export; import must NOT read or
+    overwrite arbitrary files like secrets.json. Only canonical filenames are written."""
+    monkeypatch.setattr("coworker.server.manager.state_dir", lambda: tmp_path)
+    # Pre-create a secrets file; the import must not touch it via _files.
+    (tmp_path / "secrets.json").write_text('{"real_secret": "sk-xxx"}', encoding="utf-8")
+    payload = json.dumps({"version": 1, "logins": [{
+        "id": "evil-com", "url": "https://evil.com", "label": "Evil",
+        "has_state": True,
+        "_files": {"secrets.json": '{"stolen": true}'},
+    }]})
+    m = _FakeManager({}, tmp_path)
+    r = m.import_browser_logins(payload)
+    assert r["ok"]
+    # secrets.json must still have the original content — not overwritten.
+    assert json.loads((tmp_path / "secrets.json").read_text(encoding="utf-8"))["real_secret"] == "sk-xxx"
+
+
+def test_import_writes_canonical_filenames_only(tmp_path: Path, monkeypatch):
+    """Only storageState.json and cookies.json are written under the profile dir; a non-
+    canonical filename in _files is filtered out by basename, not written to disk."""
+    monkeypatch.setattr("coworker.server.manager.state_dir", lambda: tmp_path)
+    # Two separate logins: one with only canonical files (accepted), one sneaking in evil.exe
+    # alongside them (the evil.exe must be filtered, but the canonical files still write).
+    payload = json.dumps({"version": 1, "logins": [
+        {
+            "id": "ok-com", "url": "https://ok.com", "label": "OK",
+            "has_state": True,
+            "_files": {
+                "browser_profiles/ok-com/storageState.json": '{"cookies": []}',
+                "browser_profiles/ok-com/cookies.json": '[{"name": "s"}]',
+            },
+        },
+        {
+            "id": "sneak-com", "url": "https://sneak.com", "label": "Sneak",
+            "has_state": True,
+            "_files": {
+                "browser_profiles/sneak-com/storageState.json": '{"cookies": []}',
+                "browser_profiles/sneak-com/evil.exe": "MALWARE",
+            },
+        },
+    ]})
+    m = _FakeManager({}, tmp_path)
+    r = m.import_browser_logins(payload)
+    assert r["ok"] and r["imported"] == 2
+    prof_ok = tmp_path / "browser_profiles" / "ok-com"
+    assert (prof_ok / "storageState.json").is_file()
+    assert (prof_ok / "cookies.json").is_file()
+    prof_sneak = tmp_path / "browser_profiles" / "sneak-com"
+    assert (prof_sneak / "storageState.json").is_file()
+    assert not (prof_sneak / "evil.exe").exists()  # non-canonical file rejected
+
+

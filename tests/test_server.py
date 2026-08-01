@@ -468,18 +468,36 @@ def test_server_sets_explicit_websocket_frame_limit(tmp_path, monkeypatch):
 
 def test_standalone_server_token_file_is_user_only(tmp_path, monkeypatch):
     import os
+    import subprocess
+    import sys
 
     from coworker.server import run as server_run
 
     monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
+    # The autouse conftest fixture sets COWORKER_INSECURE_LOCAL_DEV=1 for tokenless
+    # TestClients; this test wants the REAL token-generation path, so clear it.
+    monkeypatch.delenv("COWORKER_INSECURE_LOCAL_DEV", raising=False)
     path = server_run._ensure_api_token(9876)
     try:
         assert path == tmp_path / "coworker-state" / "sidecar-9876.token"
         assert path.read_text().strip() == os.environ["COWORKER_API_TOKEN"]
         assert len(path.read_text().strip()) == 64
-        assert (path.stat().st_mode & 0o777) == 0o600
+        # POSIX: mode 0600. Windows: no mode bits — _restrict_to_user applies an ACL
+        # (inheritance stripped, current user only) via icacls; assert that instead.
+        if sys.platform == "win32":
+            # icacls on non-English Windows emits the system OEM codepage (GBK etc.),
+            # not UTF-8 — decode with replacement so the assertion never trips on mojibake.
+            raw = subprocess.run(["icacls", str(path)], capture_output=True).stdout
+            out = raw.decode("utf-8", errors="replace")
+            if not out:
+                out = raw.decode("mbcs", errors="replace")
+            assert os.environ.get("USERNAME", "") in out
+            assert "BUILTIN\\Administrators" not in out
+        else:
+            assert (path.stat().st_mode & 0o777) == 0o600
     finally:
-        path.unlink(missing_ok=True)
+        if path is not None:
+            path.unlink(missing_ok=True)
         os.environ.pop("COWORKER_API_TOKEN", None)
 
 
@@ -601,6 +619,33 @@ def test_sidecar_token_gates_rest_and_websockets(tmp_path, monkeypatch):
     ).status_code == 400
     assert client.get("/mcp/oauth/callback").status_code == 400
     assert client.post("/oauth/callback", data={"app_state": "bad"}).status_code == 400
+
+
+def test_missing_token_fails_closed_without_dev_opt_in(tmp_path, monkeypatch):
+    """P1-01: with no sidecar token AND no --insecure-local-dev opt-in, authenticated
+    endpoints must 401 (fail-closed). The dev opt-in is the only way to run tokenless."""
+    monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
+    monkeypatch.delenv("COWORKER_INSECURE_LOCAL_DEV", raising=False)
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    client = TestClient(create_app(manager))
+
+    # Tokenless path still serves (health is intentionally public).
+    assert client.get("/v1/health").status_code == 200
+    # An authenticated endpoint is rejected, not left open.
+    assert client.get("/v1/sessions").status_code == 401
+    assert client.post(
+        "/v1/mcp", json={"name": "x", "config": {"command": "echo"}}
+    ).status_code == 401
+
+
+def test_missing_token_allows_dev_opt_in(tmp_path, monkeypatch):
+    """P1-01: the explicit --insecure-local-dev opt-in restores tokenless operation (dev only)."""
+    monkeypatch.delenv("COWORKER_API_TOKEN", raising=False)
+    monkeypatch.setenv("COWORKER_INSECURE_LOCAL_DEV", "1")
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    client = TestClient(create_app(manager))
+
+    assert client.get("/v1/sessions").status_code == 200
 
 
 def test_ws_approval_round_trip(tmp_path):
@@ -726,6 +771,16 @@ def test_workspace_command_trust_controls_live_engine(tmp_path):
         assert not after.allowed and after.needs_user
 
     manager.workspace_trust.set_trusted(proj, True)
+    # On Windows the persistent shell holds the workspace as its cwd, so the OS refuses
+    # to rename the directory while the session's process is alive. Close the executor
+    # (taskkills the shell tree) first — a real close-before-move does the same.
+    engine = manager._engines.pop("trust", None)
+    executor = getattr(engine, "executor", None) if engine is not None else None
+    if executor is not None:
+        try:
+            executor.close()
+        except Exception:
+            pass
     proj.rename(tmp_path / "moved-project")
     assert client.post(
         "/v1/workspaces/trust",

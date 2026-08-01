@@ -343,6 +343,14 @@ const PROVIDERS = [
 
 /** Install the API + WebSocket mocks on a page. Returns handles for assertions/seed data. */
 export async function mockApi(page: import("@playwright/test").Page) {
+  // The GUI defaults to Chinese (i18n DEFAULT = "zh"), but the specs below assert
+  // against the original English copy. Pin the lang pref to "en" before any document
+  // loads so the rendered text matches the assertions — mirrors what a user toggling
+  // the language in Settings would see. (specs are hermetic; this never touches real state.)
+  await page.addInitScript(() => {
+    try { localStorage.setItem("openwork-lang", "en"); } catch { /* ignore */ }
+  });
+
   const subscriptions: any[] = [
     // One existing subscription (a non-pinned session) so the Slack page's per-workspace
     // "Listening" row has an entry. Relay-mode channels are team-qualified (slack:T…/C…).

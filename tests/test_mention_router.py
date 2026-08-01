@@ -82,7 +82,7 @@ def _mgr(tmp_path):
 def _capture_deliveries(mgr, monkeypatch):
     captured: list[tuple] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=""):
         captured.append((session_id, message, source))
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)

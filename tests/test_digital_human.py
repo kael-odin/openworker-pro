@@ -756,6 +756,16 @@ class _FakeManager:
         from coworker.server.manager import SessionManager
 
         self.update_automation = SessionManager.update_automation.__get__(self)
+        # install_digital_human calls self.preflight_digital_human to recompute the digest at the
+        # approval boundary — bind the real method so the install path works under the fake.
+        self.preflight_digital_human = SessionManager.preflight_digital_human.__get__(self)
+        # install_digital_human also calls self._provision_scratch to get a workspace dir. The
+        # fake doesn't manage real sessions, so a fixed temp dir under the workspace suffices.
+        self._scratch_dir = tmp_path / "scratch"
+        self._scratch_dir.mkdir(exist_ok=True)
+
+    def _provision_scratch(self, session_id):
+        return str(self._scratch_dir / session_id)
 
 
 def test_update_digital_human_changes_cron(tmp_path):
@@ -855,3 +865,166 @@ def test_upgrade_check_detects_outdated(tmp_path):
     assert result["latest_version"] == "2.0.0"
     assert result["up_to_date"] is False
 
+
+
+# -- secret boundary (Task #11: DHP hardening) --------------------------------
+
+
+def test_build_instructions_masks_secret_values():
+    """Secret config values must NEVER appear in the static task instructions."""
+    s = _skill_spec(
+        "config_schema:\n  - key: api_key\n    label: K\n    type: string\n"
+        "  - key: topic\n    label: T\n    type: string\n"
+    )
+    out = build_instructions(s, {"topic": "news"}, secret_keys=["api_key"])
+    assert "<configured>" in out
+    assert "topic" in out and "news" in out  # non-secret value is present
+    # No real secret value leaks even if a caller mistakenly passes it.
+    out2 = build_instructions(s, {"topic": "news", "api_key": "sk-LEAK-VALUE"})
+    assert "sk-LEAK-VALUE" not in out2
+    assert "<configured>" in out2
+
+
+def test_install_instructions_have_no_secret_value(tmp_path):
+    """The installed task's instructions carry a marker, not the secret value."""
+    from coworker.secrets import SecretStore
+
+    s = parse_spec(
+        "name: X\nversion: '1.0.0'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: y.\n"
+        "subscriptions:\n  - source:\n      type: schedule\n      config:\n        every: 1h\n"
+        "config_schema:\n  - key: api_token\n    label: T\n    type: string\n    required: true\n"
+        "  - key: topic\n    label: Topic\n    type: string\n    default: news\n"
+    )
+    ts = _FakeTaskStore()
+    secrets = SecretStore(tmp_path / "secrets.json")
+    insts = InstanceStore(tmp_path / "dh.json", secrets=secrets)
+    result = install_digital_human(
+        s, {"api_token": "sk-SECRET-123"},
+        task_store=ts, scratch_provider=lambda sid: sid, instances=insts,
+    )
+    assert result["ok"]
+    task = ts.get(result["instance"]["task_id"])
+    assert "sk-SECRET-123" not in task.instructions
+    assert "<configured>" in task.instructions
+    # The secret value IS in the SecretStore (resolvable at run time by the capability layer).
+    assert secrets.get(insts.get(result["instance"]["id"]).secret_profile())["api_token"] == "sk-SECRET-123"
+
+
+def test_reinstall_instructions_masks_secret_on_edit(tmp_path):
+    """Editing an instance must not leak the secret into the rewritten instructions."""
+    from coworker.digital_human import reinstall_instructions
+    from coworker.secrets import SecretStore
+
+    s = parse_spec(
+        "name: X\nversion: '1.0.0'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: y.\n"
+        "subscriptions:\n  - source:\n      type: schedule\n      config:\n        every: 1h\n"
+        "config_schema:\n  - key: api_key\n    label: K\n    type: string\n"
+        "  - key: topic\n    label: T\n    type: string\n"
+    )
+    out = reinstall_instructions(s, {"topic": "AI"}, system_prompt="custom prompt", secret_keys=["api_key"])
+    assert "<configured>" in out
+    assert "custom prompt" in out
+    assert "api_key" in out  # the KEY is present (as a marker), the VALUE is not
+    # No leak even if a value slips through.
+    out2 = reinstall_instructions(s, {"topic": "AI", "api_key": "sk-LEAK"})
+    assert "sk-LEAK" not in out2
+
+
+def test_fresh_install_clears_migration_flag(tmp_path):
+    """A fresh install is clean — needs_secret_migration is False."""
+    from coworker.secrets import SecretStore
+
+    s = parse_spec(
+        "name: X\nversion: '1.0.0'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: y.\n"
+        "subscriptions:\n  - source:\n      type: schedule\n      config:\n        every: 1h\n"
+    )
+    ts = _FakeTaskStore()
+    insts = InstanceStore(tmp_path / "dh.json", secrets=SecretStore(tmp_path / "s.json"))
+    result = install_digital_human(
+        s, {}, task_store=ts, scratch_provider=lambda sid: sid, instances=insts,
+    )
+    inst = insts.get(result["instance"]["id"])
+    assert inst.needs_secret_migration is False
+    assert inst.unreviewed is False
+    assert result["instance"]["needs_secret_migration"] is False
+
+
+def test_legacy_instance_marks_migration_needed(tmp_path):
+    """An instance record loaded from a legacy file (no migration flag) is treated as needing it."""
+    from coworker.digital_human.instances import InstanceStore, DigitalHumanInstance
+
+    path = tmp_path / "dh.json"
+    # Write a legacy record that predates the secret-boundary fix (no needs_secret_migration key).
+    path.write_text(json.dumps({"instances": [{
+        "id": "dh-legacy", "slug": "news", "name": "News", "task_id": "t-1",
+        "config": {"topic": "AI"}, "secret_keys": ["api_key"], "spec_version": "1.0.0",
+    }]}), encoding="utf-8")
+    store = InstanceStore(path)
+    inst = store.get("dh-legacy")
+    assert inst.needs_secret_migration is True  # legacy → flagged
+
+
+def test_edit_clears_migration_flag(tmp_path):
+    """Re-saving an instance (config/prompt edit) rewrites clean instructions → flag clears."""
+    from coworker.digital_human import install_digital_human
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    spec = mgr.dhp_registry.get_spec("news")
+    result = install_digital_human(
+        spec, {}, task_store=mgr.task_store, scratch_provider=lambda sid: sid, instances=mgr.dhp_instances
+    )
+    inst_id = result["instance"]["id"]
+    # Force the legacy flag on, then re-save via an edit.
+    mgr.dhp_instances.get(inst_id).needs_secret_migration = True
+    SessionManager.update_digital_human(mgr, inst_id, {"user_config": {"topic": "sports"}})
+    inst = mgr.dhp_instances.get(inst_id)
+    assert inst.needs_secret_migration is False
+    # And the rewritten task instructions carry no plaintext secret.
+    task = mgr.task_store.get(inst.task_id)
+    assert "<configured>" in task.instructions or "api_key" not in task.instructions
+
+
+# -- dependency approval digest (Task #11) ------------------------------------
+
+
+def test_preflight_returns_manifest_and_digest(tmp_path):
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    pf = SessionManager.preflight_digital_human(mgr, "news", {})
+    assert pf["ok"], pf
+    assert "approval_digest" in pf and len(pf["approval_digest"]) == 64
+    m = pf["manifest"]
+    assert m["version"] == "1.0.0"
+    assert "config_secret_keys" in m
+    assert "api_key" in m["config_secret_keys"]
+
+
+def test_install_without_digest_is_refused(tmp_path):
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    result = SessionManager.install_digital_human(mgr, "news", {})
+    assert not result["ok"]
+    assert "re-approve" in result["error"] or "approval" in result["error"].lower()
+    assert "approval_digest" in result  # caller gets the digest to show + resubmit
+
+
+def test_install_with_matching_digest_succeeds(tmp_path):
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    pf = SessionManager.preflight_digital_human(mgr, "news", {})
+    result = SessionManager.install_digital_human(mgr, "news", {}, approval_digest=pf["approval_digest"])
+    assert result["ok"], result
+
+
+def test_install_with_stale_digest_is_refused(tmp_path):
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    # A digest that doesn't match the current manifest.
+    result = SessionManager.install_digital_human(mgr, "news", {}, approval_digest="0" * 64)
+    assert not result["ok"]
+    assert "changed" in result["error"] or "re-approve" in result["error"]

@@ -129,6 +129,16 @@ def _ensure_api_token(port: int) -> Path | None:
     """Set launch auth; standalone/dev tokens use a user-only, port-specific file."""
     if os.environ.get("COWORKER_API_TOKEN"):
         return None  # Tauri supplied an in-memory token; never persist it.
+    if os.environ.get("COWORKER_INSECURE_LOCAL_DEV") == "1":
+        # Explicit dev opt-in: run tokenless. The app middleware still serves, but every
+        # authenticated request is accepted only because this flag is set (P1-01 fail-closed).
+        # Warn loudly — this must never be the production path.
+        print(
+            "WARNING: running with --insecure-local-dev: sidecar auth is DISABLED. "
+            "Use only for local development on a trusted machine.",
+            file=sys.stderr,
+        )
+        return None
     token = secrets.token_hex(32)
     os.environ["COWORKER_API_TOKEN"] = token
     return write_private_text(
@@ -149,7 +159,14 @@ def main(argv=None) -> None:
     )
     parser.add_argument("--host", default=cfg.host)
     parser.add_argument("--port", type=int, default=cfg.port)
+    parser.add_argument(
+        "--insecure-local-dev",
+        action="store_true",
+        help="run WITHOUT sidecar auth (dev only, never use in production)",
+    )
     args = parser.parse_args(argv)
+    if args.insecure_local_dev:
+        os.environ["COWORKER_INSECURE_LOCAL_DEV"] = "1"
 
     # Publish the ACTUAL bound port so loopback URLs (the managed-OAuth callback)
     # target this process, not config.port. The desktop shell runs the sidecar on

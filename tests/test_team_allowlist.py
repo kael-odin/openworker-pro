@@ -137,6 +137,31 @@ def test_set_allowed_without_team_keeps_flat_behavior(tmp_path):
     assert not m.secrets.get("slack:team:T1").get("allowed_users")
 
 
+def test_set_allowed_wechat_ilink_writes_account_profile(tmp_path):
+    from coworker.connectors.wechat_ilink.profiles import save_confirmation
+
+    m = SessionManager(data_dir=tmp_path / "data", provider=ScriptedProvider())
+    save_confirmation(
+        m.secrets,
+        account_id="Case-Sensitive-A",
+        bot_token="token",
+        base_url="https://ilinkai.weixin.qq.com",
+    )
+    m.gateway = Gateway(secrets=m.secrets, settings=load_settings(m.secrets))
+
+    result = m.allow_user(
+        "wechat_ilink", "friend", team_id="Case-Sensitive-A"
+    )
+    assert result["ok"] is True
+    assert m.secrets.get("wechat_ilink:account:Case-Sensitive-A")[
+        "allowed_users"
+    ] == ["friend"]
+    assert m.secrets.get("wechat_ilink:team:Case-Sensitive-A") is None
+    assert m.gateway.settings["wechat_ilink"].teams[
+        "Case-Sensitive-A"
+    ].allowed_users == {"friend"}
+
+
 # -- park + resolve --------------------------------------------------------------
 async def test_park_carries_team_and_resolve_allows_into_team(tmp_path):
     m = _relay_manager(tmp_path, teams=("T1",))

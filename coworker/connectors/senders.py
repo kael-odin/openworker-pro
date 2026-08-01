@@ -55,6 +55,82 @@ def _send_telegram(
     return SendResult(False, error=data.get("description") or "telegram send failed")
 
 
+def _telegram_inline_keyboard(buttons) -> list[list[dict]]:
+    """One row of buttons (Telegram inline_keyboard is a list of rows). Each button's
+    ``callback_data`` carries the encoded (item_id, resolution) — ≤64 bytes per Telegram's
+    limit, and ``encode`` stays well under it (32-hex id + short resolution)."""
+    row = [
+        {"text": str(b.label)[:64], "callback_data": str(b.value)}
+        for b in (buttons or [])
+    ]
+    return [row] if row else []
+
+
+def _send_telegram_interactive(
+    token: str,
+    chat_id: str,
+    text: str,
+    buttons,
+    thread_id: Optional[str] = None,
+) -> SendResult:
+    """sendMessage with an inline keyboard so a mirrored approval/answer renders as tappable
+    buttons. A click fires a callback_query the adapter's CallbackQueryHandler turns into an
+    InteractionEvent — same resolution path as Slack Block Kit."""
+    import httpx
+
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": _telegram_inline_keyboard(buttons)},
+    }
+    if thread_id and thread_id != "1":
+        try:
+            payload["message_thread_id"] = int(thread_id)
+        except ValueError:
+            pass
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json=payload,
+            timeout=_TIMEOUT,
+        )
+        data = resp.json()
+    except Exception as exc:
+        return SendResult(False, error=str(exc))
+    if data.get("ok"):
+        return SendResult(
+            True, message_id=str(data.get("result", {}).get("message_id"))
+        )
+    return SendResult(False, error=data.get("description") or "telegram send failed")
+
+
+def _edit_telegram_message(
+    token: str, chat_id: str, message_id: str, text: str
+) -> SendResult:
+    """Swap a resolved prompt's inline buttons for a plain outcome line. editMessageText with
+    an empty reply_markup removes the keyboard so the buttons vanish."""
+    import httpx
+
+    payload: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": []},
+    }
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{token}/editMessageText",
+            json=payload,
+            timeout=_TIMEOUT,
+        )
+        data = resp.json()
+    except Exception as exc:
+        return SendResult(False, error=str(exc))
+    if data.get("ok"):
+        return SendResult(True, message_id=message_id)
+    return SendResult(False, error=data.get("description") or "telegram edit failed")
+
+
 def _send_slack(
     token: str, chat_id: str, text: str, thread_id: Optional[str] = None
 ) -> SendResult:

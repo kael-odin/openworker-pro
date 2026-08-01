@@ -259,6 +259,10 @@ async def test_ui_refresh_cross_cutting_e2e(fake_slack, tmp_path, monkeypatch):
         assert await _wait_until(lambda: not mgr.is_running(SID))
         assert mgr.inbox.get(item_id).state == "resolved"
 
+        # Wait for the auto-title background task (it calls provider.complete separately
+        # from the turn) to settle so its call doesn't land during the muted-message check.
+        assert await _wait_until(lambda: SID not in mgr._autotitle_inflight)
+
         # -- Step 4: mute Slack for the session -> a further post does NOT wake it, still buffered -
         msgcount_before = len(mgr.session_messages(SID))
         calls_before = len(provider.calls)

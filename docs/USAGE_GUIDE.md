@@ -2,7 +2,7 @@
 
 > 本文是写给「准备自己装来用」的人的实战指南，不是代码审计。安全细节见同目录的 `AUDIT_REPORT.md`，本文只在「注意事项」里点出与日常使用直接相关的几条并指向该报告。
 >
-> 仓库本地路径：`D:\Github_Open\openworker`。当前 HEAD：`f96ad4c`（2026-07 用量统计合并）。状态：开放 Beta。
+> 仓库：`openworker-pro` fork（`https://github.com/kael-odin/openworker-pro`），本地路径 `D:\Github_Open\openworker-pro`。状态：开放 Beta。
 
 ---
 

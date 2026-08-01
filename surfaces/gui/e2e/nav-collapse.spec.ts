@@ -23,9 +23,14 @@ test("collapse hides the sidebar and reclaims the width; reveal button docks it 
 test("⌘B toggles the sidebar collapse", async ({ page }) => {
   await page.goto("/");
   const app = page.locator(".app");
-  await page.keyboard.press("Meta+b");
+  // Wait for the boot splash to clear and the sidebar to mount before pressing —
+  // the keydown listener only fires after the app shell is ready.
+  await expect(page.locator(".sidebar")).toBeVisible();
+  // The shortcut binds both metaKey (⌘B on macOS) and ctrlKey (Ctrl+B on Win/Linux).
+  // Use Control (not ControlOrMeta, which maps to Super on Linux Chromium and won't fire).
+  await page.keyboard.press("Control+b");
   await expect(app).toHaveClass(/nav-collapsed/);
-  await page.keyboard.press("Meta+b");
+  await page.keyboard.press("Control+b");
   await expect(app).not.toHaveClass(/nav-collapsed/);
 });
 
@@ -34,9 +39,10 @@ test("RECENT header group/filter popover: switch grouping + see coworker filters
 }) => {
   await page.goto("/");
   const header = page.getByTestId("recent-header");
-  await expect(header).toContainText("Recent");
+  // The English label is "RECENT" (en.json sidebar.recent); match case-sensitively.
+  await expect(header).toContainText("RECENT");
 
-  await header.getByRole("button", { name: "Group and filter conversations" }).click();
+  await header.getByRole("button", { name: "Group & filter conversations" }).click();
   const menu = page.getByTestId("group-filter-menu");
   await expect(menu).toContainText("Group by");
   await expect(menu).toContainText("Filter by coworker");

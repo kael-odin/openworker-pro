@@ -1,12 +1,14 @@
 """Risk classes for tools — the intrinsic side-effect category that drives permission
-gating (and, later in Phase 2, unattended Inbox routing).
+gating and unattended Inbox routing (an EXTERNAL tool in an unattended session routes
+its approval to the Inbox instead of blocking on a live prompt).
 
 This replaces the hardcoded ``WRITE_TOOLS`` / ``SHELL_TOOL`` name sets the permission engine
 used to carry inline: risk is now a declared property a single ``classify`` reads.
 
-A tool's *effective* risk = an optional user-local override (Phase 2) ?? the base
-classification here. Built-in vetted tools are classified by name; anything else falls back
-to its aisuite metadata (``requires_approval`` → external) or is treated as read.
+A tool's *effective* risk = an optional user-local override ?? the base classification here.
+Built-in vetted tools are classified by name; anything else falls back to its aisuite metadata
+(``requires_approval`` → external) or is treated as read. The override resolver is wired in
+``coworker/agent.py`` via ``RiskOverrideStore`` (mainly to relax MCP's conservative default).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ _BASE: dict[str, RiskClass] = {
 }
 
 # A user-local override resolver: tool name -> RiskClass (or None to defer to the base).
-# Wired in Phase 2 (mainly to relax MCP's conservative default); always None until then.
+# Wired in coworker/agent.py via RiskOverrideStore (mainly to relax MCP's conservative default).
 RiskOverrides = Callable[[str], Optional["RiskClass"]]
 
 

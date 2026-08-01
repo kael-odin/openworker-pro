@@ -42,3 +42,31 @@ test("the toast dismisses on ✕ and by itself after ~5s", async ({ page }) => {
   // auto-dismiss: gone within the 5s drain (+ slack for CI)
   await expect(page.getByTestId("automation-toast")).toHaveCount(0, { timeout: 7000 });
 });
+
+// UX-026 (done): pairs with the started toast — fires over the same /ws/events stream when a
+// scheduled run completes. A user who stepped away sees "✓ finished" with a View-run link.
+const RUN_DONE = {
+  type: "automation_run_done",
+  data: {
+    task_id: "task-1",
+    task_title: "Daily AI News",
+    session_id: "run-live-1",
+    workspace: "/tmp/aw",
+    agent: "cowork",
+    run_id: "r1",
+    status: "ok",
+    summary: "All quiet on the western front.",
+  },
+};
+
+test("a completed run pops the done toast; View run opens its session", async ({ page }) => {
+  await page.goto("/");
+  await sendAppEvent(page, RUN_DONE);
+  const toast = page.getByTestId("automation-done-toast");
+  await expect(toast).toContainText("finished");
+  await expect(toast).toContainText("Daily AI News");
+
+  await toast.getByTestId("toast-view-done-run").click();
+  await expect(page.getByTestId("automation-done-toast")).toHaveCount(0);
+  await expect(page.getByPlaceholder(/Ask the coworker/)).toBeVisible();
+});

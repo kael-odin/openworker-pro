@@ -335,6 +335,238 @@ async def test_manual_run_prepare_and_finalize(tmp_path, monkeypatch):
     assert manager.task_store.get(task.id).run_count == 1
 
 
+async def test_manual_run_finalize_notifies_on_all_level(tmp_path, monkeypatch):
+    """A manual run's completion fans out through the NotifyRouter when the task's level is
+    'all' — the user stepped away mid-run and gets told it finished. 'important' (default)
+    stays silent on success, matching the scheduled path."""
+    from coworker.providers import AssistantTurn, ModelCapabilities, ProviderClient
+    from coworker.server.manager import SessionManager
+
+    class ScriptedProvider(ProviderClient):
+        def __init__(self, turns):
+            self._turns = list(turns)
+
+        def complete(self, *, model, messages, tools=None, **settings):
+            return self._turns.pop(0)
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    manager = SessionManager(
+        data_dir=tmp_path / "data",
+        provider=ScriptedProvider(
+            [AssistantTurn(text="Done.", finish_reason="stop")]
+        ),
+    )
+    task = _task(workspace=str(ws), agent="cowork", notify_level="all")
+    manager.task_store.save(task)
+
+    dispatched: list[dict] = []
+    orig = manager.notify_router.dispatch_run
+
+    def _capture(**kwargs):
+        dispatched.append(kwargs)
+        return orig(**kwargs)
+
+    manager.notify_router.dispatch_run = _capture  # type: ignore[assignment]
+
+    prep = manager.prepare_manual_run(task.id)
+    engine = manager.get_engine(prep["session_id"], workspace=str(ws), agent="cowork")
+    async for _ in engine.run(prep["prompt"]):
+        pass
+    manager.save(prep["session_id"], engine)
+    manager.finalize_manual_run(task.id, prep["run_id"])
+
+    assert dispatched, "manual run completion should fire notify dispatch at level=all"
+    assert dispatched[0]["task_name"] == "Daily brief"
+    assert dispatched[0]["run_status"] == "ok"
+
+
+async def test_manual_run_finalize_silent_on_important(tmp_path, monkeypatch):
+    """Default 'important' level: a successful manual run still calls dispatch_run (the
+    plumbing is wired), but the router's own status gate suppresses the send — exactly as
+    the scheduled path behaves. Asserts the call happens AND the router reports no sends."""
+    from coworker.providers import AssistantTurn, ModelCapabilities, ProviderClient
+    from coworker.server.manager import SessionManager
+
+    class ScriptedProvider(ProviderClient):
+        def __init__(self, turns):
+            self._turns = list(turns)
+
+        def complete(self, *, model, messages, tools=None, **settings):
+            return self._turns.pop(0)
+
+        def capabilities(self, model):
+            return ModelCapabilities()
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    manager = SessionManager(
+        data_dir=tmp_path / "data",
+        provider=ScriptedProvider([AssistantTurn(text="Done.", finish_reason="stop")]),
+    )
+    task = _task(workspace=str(ws), agent="cowork")  # default notify_level="important"
+    manager.task_store.save(task)
+
+    dispatched: list[dict] = []
+    real_dispatch_run = manager.notify_router.dispatch_run
+
+    def _capture(**kwargs):
+        result = real_dispatch_run(**kwargs)
+        dispatched.append({**kwargs, "any_ok": result.any_ok})
+        return result
+
+    manager.notify_router.dispatch_run = _capture  # type: ignore[assignment]
+
+    prep = manager.prepare_manual_run(task.id)
+    engine = manager.get_engine(prep["session_id"], workspace=str(ws), agent="cowork")
+    async for _ in engine.run(prep["prompt"]):
+        pass
+    manager.save(prep["session_id"], engine)
+    out = manager.finalize_manual_run(task.id, prep["run_id"])
+
+    assert out["ok"] and out["run"]["status"] == "ok"
+    # The dispatch IS invoked (plumbing wired) but important+ok => no channel sends.
+    assert dispatched and dispatched[0]["level"] == "important"
+    assert dispatched[0]["run_status"] == "ok"
+    assert not dispatched[0]["any_ok"], "important level must not send on a successful run"
+
+
+# -- approval-needed notify fan-out -------------------------------------------
+def test_approval_notify_fans_out_for_task_run(tmp_path, monkeypatch):
+    """A pending approval from a scheduled/unattended run carries task context, so
+    _notify_inbox_action_needed pings the notify channels — even with NO messaging
+    connector bound (the user has only 钉钉/飞书/企微)."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    task = _task(workspace=str(tmp_path / "ws"), notify_level="all")
+    manager.task_store.save(task)
+
+    dispatched: list[dict] = []
+    real_dispatch = manager.notify_router.dispatch
+
+    def _capture(**kwargs):
+        dispatched.append(kwargs)
+        return real_dispatch(**kwargs)
+
+    manager.notify_router.dispatch = _capture  # type: ignore[assignment]
+
+    import asyncio as _asyncio
+
+    item = type(
+        "Item",
+        (),
+        {
+            "state": "pending",
+            "kind": "approval",
+            "title": "运行 `write_file`？",
+            "body": "/tmp/x.txt",
+            "data": {"task_id": task.id, "task_title": task.title, "tool": "write_file"},
+        },
+    )()
+    _asyncio.run(manager._notify_inbox_action_needed(item))
+
+    assert dispatched, "approval from a task run should fan out to notify channels"
+    assert task.title in dispatched[0]["title"]
+    assert "需要你处理" in dispatched[0]["title"]
+
+
+def test_approval_notify_skipped_without_task_context(tmp_path, monkeypatch):
+    """An approval from an interactive session (no task context) is NOT pinged — the user is
+    in-app already. Only unattended/automation-run decisions raise the alarm."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+
+    dispatched: list[dict] = []
+    manager.notify_router.dispatch = lambda **k: dispatched.append(k)  # type: ignore[assignment]
+
+    import asyncio as _asyncio
+
+    item = type(
+        "Item",
+        (),
+        {
+            "state": "pending",
+            "kind": "approval",
+            "title": "运行 `write_file`？",
+            "body": "",
+            "data": {"tool": "write_file"},  # no task_id / task_title
+        },
+    )()
+    _asyncio.run(manager._notify_inbox_action_needed(item))
+
+    assert not dispatched, "interactive-session approval should NOT fan out"
+
+
+def test_approval_notify_respects_none_level(tmp_path, monkeypatch):
+    """A task with notify_level='none' opted out of all notifications — a pending approval
+    from it stays silent too."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    task = _task(workspace=str(tmp_path / "ws"), notify_level="none")
+    manager.task_store.save(task)
+
+    dispatched: list[dict] = []
+    manager.notify_router.dispatch = lambda **k: dispatched.append(k)  # type: ignore[assignment]
+
+    import asyncio as _asyncio
+
+    item = type(
+        "Item",
+        (),
+        {
+            "state": "pending",
+            "kind": "approval",
+            "title": "运行 `write_file`？",
+            "body": "",
+            "data": {"task_id": task.id, "task_title": task.title},
+        },
+    )()
+    _asyncio.run(manager._notify_inbox_action_needed(item))
+
+    assert not dispatched, "notify_level=none should suppress even approval alarms"
+
+
+def test_approval_notify_skips_already_resolved(tmp_path, monkeypatch):
+    """A durable-resume re-raise of an already-resolved prompt must not re-alarm."""
+    from coworker.server.manager import SessionManager
+
+    monkeypatch.setenv("COWORKER_STATE_DIR", str(tmp_path / "state"))
+    manager = SessionManager(data_dir=tmp_path / "data")
+    task = _task(workspace=str(tmp_path / "ws"), notify_level="all")
+    manager.task_store.save(task)
+
+    dispatched: list[dict] = []
+    manager.notify_router.dispatch = lambda **k: dispatched.append(k)  # type: ignore[assignment]
+
+    import asyncio as _asyncio
+
+    item = type(
+        "Item",
+        (),
+        {
+            "state": "resolved",  # durable resume re-raised an already-answered prompt
+            "kind": "approval",
+            "title": "运行 `write_file`？",
+            "body": "",
+            "data": {"task_id": task.id, "task_title": task.title},
+        },
+    )()
+    _asyncio.run(manager._notify_inbox_action_needed(item))
+
+    assert not dispatched, "a resolved item must not re-alarm"
+
+
 # -- REST ----------------------------------------------------------------------
 def test_automations_rest(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient

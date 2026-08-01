@@ -18,6 +18,7 @@ import urllib.parse
 from typing import Any
 
 from .._result import NotifyResult
+from ..http import VENDOR_HOSTS, WebhookPostError, post_json
 
 
 def _signed_url(url: str, secret: str) -> str:
@@ -33,8 +34,6 @@ def _signed_url(url: str, secret: str) -> str:
 
 
 def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> NotifyResult:
-    import httpx
-
     url = (config.get("url") or "").strip()
     if not url:
         return NotifyResult(ok=False, channel="dingtalk", error="钉钉 webhook url 未配置")
@@ -52,10 +51,17 @@ def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> 
     }
 
     try:
-        resp = httpx.post(target, json=payload, timeout=10.0)
-        data = resp.json()
-    except Exception as exc:
+        status_code, data = post_json(
+            target, payload, allowed_hosts=VENDOR_HOSTS["dingtalk"]
+        )
+    except WebhookPostError as exc:
         return NotifyResult(ok=False, channel="dingtalk", error=str(exc))
+    if not 200 <= status_code < 300:
+        return NotifyResult(
+            ok=False, channel="dingtalk", error=f"钉钉 webhook HTTP {status_code}"
+        )
+    if not isinstance(data, dict):
+        data = {}
     # 钉钉成功时 errcode=0；失败 errcode 非 0 带 errmsg。
     if data.get("errcode") == 0:
         return NotifyResult(ok=True, channel="dingtalk")

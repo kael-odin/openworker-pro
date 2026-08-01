@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import os
 import struct
+import threading
 import time
 from unittest.mock import patch
 
@@ -54,6 +55,15 @@ def test_signature_verify():
     assert crypto.verify_signature(token, ts, nonce, enc, "") is False
 
 
+def test_pkcs7_unpad_rejects_invalid_padding():
+    """非法/空 PKCS#7 填充必须 fail closed。"""
+    from coworker.connectors.wecom_app import crypto
+
+    for value in (b"", b"plain\x00", b"plain\x21", b"plain\x02\x03"):
+        with pytest.raises(ValueError, match="PKCS#7"):
+            crypto._pkcs7_unpad(value)
+
+
 def test_decrypt_bad_key_raises():
     """非法 EncodingAESKey 长度应报错。"""
     from coworker.connectors.wecom_app import crypto
@@ -70,6 +80,19 @@ def test_corpid_mismatch_raises():
     enc = crypto.encrypt_message("<xml/>", key, "real_corp", token="t", timestamp="1", nonce="n")
     with pytest.raises(ValueError, match="corpid 不匹配"):
         crypto.decrypt_message(enc["encrypt"], key, "wrong_corpid")
+
+
+def test_decrypt_rejects_bad_ciphertext_padding():
+    """合法 block 长度但解密后 padding 被篡改时必须拒绝。"""
+    from coworker.connectors.wecom_app import crypto
+
+    key = _make_aes_key()
+    enc = crypto.encrypt_message("<xml/>", key, "corp")
+    raw = bytearray(base64.b64decode(enc["encrypt"]))
+    raw[-1] ^= 0x01
+    tampered = base64.b64encode(raw).decode("ascii")
+    with pytest.raises(ValueError, match="PKCS#7"):
+        crypto.decrypt_message(tampered, key, "corp")
 
 
 def test_parse_callback_xml():
@@ -122,6 +145,31 @@ def test_access_token_cached_and_refreshed():
         resp.json.return_value = {"errcode": 0, "access_token": "T2", "expires_in": 7200}
         assert client._get_access_token() == "T2"
         assert mock_get.call_count == 1
+
+
+def test_access_token_concurrent_refresh_is_single_flight():
+    """多个 worker 同时遇到过期 token 时只刷新一次。"""
+    from coworker.connectors.wecom_app.provider import WeComAppClient
+
+    client = WeComAppClient(corpid="c", secret="s", agent_id="1")
+    barrier = threading.Barrier(5)
+    values = []
+
+    def fetch():
+        barrier.wait()
+        values.append(client._get_access_token())
+
+    with patch("coworker.connectors.wecom_app.provider.httpx.get") as mock_get:
+        response = mock_get.return_value
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"errcode": 0, "access_token": "ONE", "expires_in": 7200}
+        threads = [threading.Thread(target=fetch) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert values == ["ONE"] * 5
+    assert mock_get.call_count == 1
 
 
 def test_access_token_error_raises():
@@ -201,6 +249,96 @@ def test_parse_inbound_non_text_message():
     assert "image" in event.text
 
 
+def test_parse_template_card_event_button_list():
+    """template_card 按钮点击回调解析为 InteractionEvent，value = 按钮的 encoded key，
+    message_id = 卡片 task_id（update_taskcard 用它定位卡片）。"""
+    from coworker.connectors.wecom_app.provider import WeComAppClient
+
+    client = WeComAppClient(corpid="corp1", secret="s", agent_id="1")
+    import json as _json
+
+    encoded = _json.dumps({"id": "item-abc", "r": "allow"})
+    xml = (
+        "<xml><ToUserName>corp1</ToUserName>"
+        "<FromUserName>zhangsan</FromUserName>"
+        "<MsgType>event</MsgType><Event>template_card_event</Event>"
+        f"<TaskId>ow_item-abc</TaskId><ButtonKeys>{encoded}</ButtonKeys></xml>"
+    )
+    ev = client.parse_template_card_event(xml)
+    assert ev is not None
+    assert ev.platform == "wecom"
+    assert ev.value == encoded
+    assert ev.chat_id == "zhangsan"
+    assert ev.message_id == "ow_item-abc"  # task_id for update_taskcard
+    assert ev.user_id == "zhangsan"
+    assert ev.team_id == "corp1"
+
+
+def test_parse_template_card_event_not_a_card_click():
+    """普通事件（如 subscribe）不是卡片点击，返回 None —— 走普通消息路径。"""
+    from coworker.connectors.wecom_app.provider import WeComAppClient
+
+    client = WeComAppClient(corpid="c", secret="s", agent_id="1")
+    xml = (
+        "<xml><FromUserName>u1</FromUserName>"
+        "<MsgType>event</MsgType><Event>subscribe</Event></xml>"
+    )
+    assert client.parse_template_card_event(xml) is None
+
+
+def test_parse_template_card_event_selected_items_fallback():
+    """SelectedItems（JSON 含 SelectedKey）也能取出 value —— 覆盖非 button_list 卡片变体。"""
+    from coworker.connectors.wecom_app.provider import WeComAppClient
+
+    client = WeComAppClient(corpid="corp1", secret="s", agent_id="1")
+    import json as _json
+
+    encoded = _json.dumps({"id": "item-x", "r": "deny"})
+    sel = _json.dumps([{"SelectedKey": encoded}])
+    xml = (
+        "<xml><FromUserName>u1</FromUserName>"
+        "<MsgType>event</MsgType><Event>template_card_event</Event>"
+        f"<TaskId>t1</TaskId><SelectedItems>{sel}</SelectedItems></xml>"
+    )
+    ev = client.parse_template_card_event(xml)
+    assert ev is not None and ev.value == encoded
+
+
+def test_send_template_card_payload_shape(monkeypatch):
+    """send_template_card 发的 payload 是 button_list 卡片，每个 button 的 key = encoded value。"""
+    from coworker.connectors.wecom_app.provider import WeComAppClient
+    from coworker.interactions import Button, encode
+
+    client = WeComAppClient(corpid="c", secret="s", agent_id="100")
+    # stub access_token + httpx.post to capture the payload
+    monkeypatch.setattr(client, "_get_access_token", lambda: "tok")
+    captured: list[dict] = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"errcode": 0, "msgid": "m1"}
+
+        def raise_for_status(self):
+            pass
+
+    import coworker.connectors.wecom_app.provider as prov
+
+    monkeypatch.setattr(prov.httpx, "post", lambda *a, **k: (captured.append(k["json"]), _Resp())[1])
+
+    btns = [Button("批准", encode("item1", "allow")), Button("拒绝", encode("item1", "deny"))]
+    data = client.send_template_card("zhangsan", "审批", "运行 write_file？", btns)
+    assert data["errcode"] == 0
+    payload = captured[0]
+    assert payload["msgtype"] == "template_card"
+    card = payload["template_card"]
+    assert card["card_type"] == "button_list"
+    assert card["task_id"].startswith("ow_item1")
+    keys = [b["key"] for b in card["button_list"]]
+    assert keys == [encode("item1", "allow"), encode("item1", "deny")]
+
+
 # -- adapter handle_callback --------------------------------------------------
 
 
@@ -210,20 +348,21 @@ async def test_handle_callback_get_verification():
     from coworker.connectors.wecom_app import WeComAppAdapter, WeComAppClient
     from coworker.connectors.wecom_app import crypto
 
-    # 明文模式（无 token/aes_key）
+    # 未配置回调凭据时保留出站，但公网 GET 回调 fail closed。
     client = WeComAppClient(corpid="c", secret="s", agent_id="1")
     adapter = WeComAppAdapter(client)
     status, body = await adapter.handle_callback(
-        {"echostr": "abc123", "msg_signature": "", "timestamp": "1", "nonce": "n"}, b""
+        {"echostr": "abc123", "msg_signature": "", "timestamp": str(int(time.time())), "nonce": "n"}, b""
     )
-    assert status == 200
-    assert body == "abc123"  # 明文模式直接回 echostr
+    assert status == 403
+    assert body == "invalid callback"
 
     # 加密模式
     key = _make_aes_key()
     client2 = WeComAppClient(corpid="c", secret="s", agent_id="1", token="TOK", encoding_aes_key=key)
     adapter2 = WeComAppAdapter(client2)
-    enc = crypto.encrypt_message("hello_echo", key, "c", token="TOK", timestamp="1", nonce="n")
+    now = str(int(time.time()))
+    enc = crypto.encrypt_message("hello_echo", key, "c", token="TOK", timestamp=now, nonce="n")
     status, body = await adapter2.handle_callback(
         {
             "echostr": enc["encrypt"],
@@ -261,7 +400,8 @@ async def test_handle_callback_post_message():
         "<FromUserName>zhangsan</FromUserName>"
         "<MsgType>text</MsgType><Content>你好</Content></xml>"
     )
-    enc = crypto.encrypt_message(inner_xml, key, "c", token="TOK", timestamp="1", nonce="n")
+    now = str(int(time.time()))
+    enc = crypto.encrypt_message(inner_xml, key, "c", token="TOK", timestamp=now, nonce="n")
     body_xml = f"<xml><Encrypt>{enc['encrypt']}</Encrypt></xml>".encode()
 
     status, resp = await adapter.handle_callback(
@@ -287,18 +427,18 @@ async def test_handle_callback_bad_signature():
     client = WeComAppClient(corpid="c", secret="s", agent_id="1", token="TOK", encoding_aes_key=_make_aes_key())
     adapter = WeComAppAdapter(client)
     status, body = await adapter.handle_callback(
-        {"echostr": "x", "msg_signature": "bad", "timestamp": "1", "nonce": "n"}, b""
+        {"echostr": "x", "msg_signature": "bad", "timestamp": str(int(time.time())), "nonce": "n"}, b""
     )
     assert status == 403
-    assert "签名" in body or "失败" in body
+    assert body == "invalid callback"
 
 
 @pytest.mark.asyncio
 async def test_handle_callback_plaintext_xml():
-    """明文模式 POST：XML 无 Encrypt 字段，直接当消息体解析。"""
+    """没有回调密钥的旧 profile 保留出站，但拒绝明文入站。"""
     from coworker.connectors.wecom_app import WeComAppAdapter, WeComAppClient
 
-    client = WeComAppClient(corpid="c", secret="s", agent_id="1")  # 无 token/aes_key
+    client = WeComAppClient(corpid="c", secret="s", agent_id="1")
     adapter = WeComAppAdapter(client)
     received = []
 
@@ -311,12 +451,113 @@ async def test_handle_callback_plaintext_xml():
         "<MsgType>text</MsgType><Content>明文消息</Content></xml>"
     ).encode("utf-8")
     status, resp = await adapter.handle_callback(
-        {"msg_signature": "", "timestamp": "1", "nonce": "n"}, xml
+        {"msg_signature": "", "timestamp": str(int(time.time())), "nonce": "n"}, xml
     )
-    assert status == 200
-    assert resp == "success"
+    assert status == 403
+    assert resp == "invalid callback"
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_rejects_plaintext_downgrade():
+    """已配置加密回调时，无 Encrypt 的 POST 也不得降级为明文。"""
+    from coworker.connectors.wecom_app import WeComAppAdapter, WeComAppClient
+
+    client = WeComAppClient(
+        corpid="c", secret="s", agent_id="1", token="TOK", encoding_aes_key=_make_aes_key()
+    )
+    adapter = WeComAppAdapter(client)
+    xml = b"<xml><FromUserName>u1</FromUserName><MsgType>text</MsgType></xml>"
+    status, body = await adapter.handle_callback(
+        {
+            "msg_signature": "not-used",
+            "timestamp": str(int(time.time())),
+            "nonce": "n",
+        },
+        xml,
+    )
+    assert status == 403
+    assert body == "invalid callback"
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_rejects_stale_timestamp():
+    from coworker.connectors.wecom_app import WeComAppAdapter, WeComAppClient, crypto
+
+    key = _make_aes_key()
+    client = WeComAppClient(
+        corpid="c", secret="s", agent_id="1", token="TOK", encoding_aes_key=key
+    )
+    adapter = WeComAppAdapter(client)
+    enc = crypto.encrypt_message(
+        "hello", key, "c", token="TOK", timestamp="1", nonce="n"
+    )
+    status, body = await adapter.handle_callback(
+        {
+            "echostr": enc["encrypt"],
+            "msg_signature": enc["msg_signature"],
+            "timestamp": "1",
+            "nonce": "n",
+        },
+        b"",
+    )
+    assert status == 403
+    assert body == "invalid callback"
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_replay_and_message_id_dedup():
+    """同一签名重放及不同签名下的重复 MsgId 都不得二次分发。"""
+    from coworker.connectors.wecom_app import WeComAppAdapter, WeComAppClient, crypto
+
+    key = _make_aes_key()
+    client = WeComAppClient(
+        corpid="c", secret="s", agent_id="1", token="TOK", encoding_aes_key=key
+    )
+    adapter = WeComAppAdapter(client)
+    received = []
+
+    async def _handler(event):
+        received.append(event)
+
+    adapter.set_message_handler(_handler)
+    inner = (
+        "<xml><FromUserName>u1</FromUserName><MsgType>text</MsgType>"
+        "<Content>x</Content><MsgId>same-id</MsgId></xml>"
+    )
+    now = str(int(time.time()))
+    first = crypto.encrypt_message(inner, key, "c", token="TOK", timestamp=now, nonce="n1")
+    first_body = f"<xml><Encrypt>{first['encrypt']}</Encrypt></xml>".encode()
+    first_query = {
+        "msg_signature": first["msg_signature"],
+        "timestamp": now,
+        "nonce": "n1",
+    }
+    assert await adapter.handle_callback(first_query, first_body) == (200, "success")
+    assert await adapter.handle_callback(first_query, first_body) == (200, "success")
+
+    second = crypto.encrypt_message(inner, key, "c", token="TOK", timestamp=now, nonce="n2")
+    second_body = f"<xml><Encrypt>{second['encrypt']}</Encrypt></xml>".encode()
+    second_query = {
+        "msg_signature": second["msg_signature"],
+        "timestamp": now,
+        "nonce": "n2",
+    }
+    assert await adapter.handle_callback(second_query, second_body) == (200, "success")
     assert len(received) == 1
-    assert received[0].text == "明文消息"
+
+
+def test_callback_credentials_must_be_paired():
+    from coworker.connectors.wecom_app import WeComAppClient
+    from coworker.connectors.wecom_app.provider import client_from_profile
+
+    with pytest.raises(ValueError, match="必须同时配置"):
+        WeComAppClient(corpid="c", secret="s", agent_id="1", token="TOK")
+    client = client_from_profile(
+        {"corpid": "c", "secret": "s", "agent_id": "1", "token": "legacy-only"}
+    )
+    assert client is not None
+    assert client.inbound_state == "outbound_only"
 
 
 # -- 出站 send ----------------------------------------------------------------
@@ -436,11 +677,16 @@ def test_validate_wecom_ok():
 
 
 def test_validate_wecom_missing_fields():
-    """_validate_wecom：缺字段 → ok=False。"""
+    """_validate_wecom：缺字段或回调密钥只填一个 → ok=False。"""
     from coworker.connectors.descriptors import _validate_wecom
 
     result = _validate_wecom({"corpid": "", "secret": "", "agent_id": ""})
     assert result.ok is False
+    pair = _validate_wecom(
+        {"corpid": "c", "secret": "s", "agent_id": "1", "token": "only-token"}
+    )
+    assert pair.ok is False
+    assert "必须同时配置" in (pair.error or "")
 
 
 # -- sender -------------------------------------------------------------------

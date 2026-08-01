@@ -20,8 +20,37 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[messaging,dev,bedrock]"
+          pip install ruff
+      - name: Lint (ruff)
+        # Non-blocking surface check: surfaces real issues without gating on style.
+        run: ruff check coworker tests --select F --ignore F401,F811 || true
       - name: Test
         run: pytest tests -q
+
+  # Targeted Windows run: the search/browser-login/server/iLink/security paths have
+  # platform-specific behavior (ripgrep --json on drive letters, ACL/private files,
+  # path containment). Catches Windows-only regressions early without the cost of the
+  # full suite. Pre-existing Windows-env flakes (ACL, file-rename race) are tolerated
+  # via continue-on-error until the harness is hardened.
+  pytest-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[messaging,dev,bedrock]"
+      - name: Targeted tests
+        run: >
+          pytest tests/test_code_tools.py tests/test_browser_logins.py
+          tests/test_server.py tests/test_mcp_oauth.py tests/test_relay_backoff.py
+          tests/test_session_events.py tests/test_wechat_ilink_adapter.py
+          tests/test_wechat_ilink_api.py tests/test_wechat_ilink_auth.py
+          tests/test_wechat_ilink_models.py tests/test_wechat_ilink_profiles.py -q
 
   gui-unit:
     runs-on: ubuntu-latest
@@ -35,12 +64,19 @@ jobs:
       - name: npm ci
         working-directory: surfaces/gui
         run: npm ci
+      - name: Typecheck
+        # Gate type errors before running tests — `tsc` is the same step `build` runs.
+        working-directory: surfaces/gui
+        run: npx tsc --noEmit
       - name: Unit tests
         working-directory: surfaces/gui
         run: npm test
 
   gui-e2e:
-    if: false  # Disabled: Windows Wails runtime 404 (all 158 fail); CI ubuntu runs English mock irrelevant to Chinese localization; vitest already covers Chinese text assertions
+    # Hermetic Playwright suite: every /v1 request and the event/session WebSockets are
+    # mocked at the network layer (see surfaces/gui/e2e/fixtures.ts), so it runs without
+    # the Python backend or any model. fixtures.ts pins the lang pref to "en" so the
+    # English assertions match the rendered text (the GUI defaults to "zh").
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

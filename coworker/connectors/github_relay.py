@@ -180,7 +180,7 @@ class GitHubRelayAdapter(BasePlatformAdapter):
 
         base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
         try:
-            async with httpx.AsyncClient(timeout=20) as http:
+            async with httpx.AsyncClient(timeout=20, trust_env=False) as http:
                 resp = await http.post(
                     f"{base}/repos/{owner_repo}/issues/{number}/comments",
                     json={"body": text},

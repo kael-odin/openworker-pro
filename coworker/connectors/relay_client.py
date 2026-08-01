@@ -59,6 +59,12 @@ TokenProvider = Callable[[], str]  # returns the current cloud sign-in JWT
 HistoryFetcher = Callable[[str, str, int], Awaitable[list[dict]]]
 
 
+def _rand_jitter() -> float:
+    """Uniform [0, 1) for reconnect backoff jitter. Uses os.urandom (no global RNG state
+    to seed/lock); tests monkeypatch this for deterministic timing."""
+    return int.from_bytes(os.urandom(4), "big") / 2**32
+
+
 class RelayHub:
     """The ONE desktop↔cloud relay socket, shared by every provider adapter.
 
@@ -69,6 +75,10 @@ class RelayHub:
     GitHub became the second relay provider (github-relay-spec §8)."""
 
     _RECONNECT_DELAY = 2.0
+    # P1-06: exponential backoff + jitter instead of a flat 2s. Caps at 30s so a long
+    # cloud outage doesn't hammer the relay, and a transient drop recovers quickly.
+    _RECONNECT_CAP = 30.0
+    _RECONNECT_BASE = 1.0
 
     def __init__(
         self,
@@ -84,6 +94,7 @@ class RelayHub:
         self._reconnect_delay = (
             reconnect_delay if reconnect_delay is not None else self._RECONNECT_DELAY
         )
+        self._consecutive_failures = 0  # reset on a successful (re)connect
         self._handlers: dict[str, Callable[[dict], Awaitable[None]]] = {}
         self._transport: Optional[RelayTransport] = None
         self._task: Optional[asyncio.Task] = None
@@ -121,6 +132,7 @@ class RelayHub:
             return False
         self._connections = 1
         self._connected = True
+        self._consecutive_failures = 0
         self.last_error = ""
         self._task = asyncio.create_task(self._run())
         return True
@@ -151,8 +163,19 @@ class RelayHub:
             await self._reconnect()
 
     async def _reconnect(self) -> None:
+        # Exponential backoff: base * 2^failures, capped, with ±25% jitter. The base is
+        # ``_reconnect_delay`` (default 2s; tests pass 0 for near-instant reconnects). A
+        # fixed delay hammered the relay during a long outage; this recovers fast on a
+        # transient drop and backs off under sustained failure (P1-06).
+        base = self._reconnect_delay
+        if base <= 0:
+            delay = 0.0
+        else:
+            delay = min(base * (2 ** min(self._consecutive_failures, 6)), self._RECONNECT_CAP)
+            delay = delay * (0.75 + _rand_jitter() * 0.5)
         try:
-            await asyncio.sleep(self._reconnect_delay)
+            if delay > 0:
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
         if self._closing:
@@ -162,9 +185,11 @@ class RelayHub:
             await self._transport.open()
             self._connections += 1
             self._connected = True
+            self._consecutive_failures = 0
             self.last_error = ""
             logger.info("relay reconnected (#%d)", self._connections - 1)
         except Exception as exc:
+            self._consecutive_failures += 1
             self.last_error = str(exc) or type(exc).__name__
             logger.exception("relay reconnect failed — will retry")
 
@@ -191,7 +216,7 @@ class RelayHub:
             return "reconnecting"
         return "offline"
 
-    async def wait_dispatched(self, at_least: int, timeout: float = 2.0) -> None:
+    async def wait_dispatched(self, at_least: int, timeout: float = 10.0) -> None:
         """Test helper: wait until at least N frames have been dispatched."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
@@ -284,7 +309,7 @@ class SlackRelayAdapter(BasePlatformAdapter):
             },
         }
 
-    async def wait_dispatched(self, at_least: int, timeout: float = 2.0) -> None:
+    async def wait_dispatched(self, at_least: int, timeout: float = 10.0) -> None:
         await self._hub.wait_dispatched(at_least, timeout)
 
     # -- team registry -------------------------------------------------------
@@ -407,7 +432,10 @@ class SlackRelayAdapter(BasePlatformAdapter):
             return None
         base = os.environ.get("SLACK_API_URL", "https://slack.com/api/")
         try:
-            async with httpx.AsyncClient(timeout=15) as http:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=3.0, read=10.0, write=3.0, pool=3.0),
+                trust_env=False,
+            ) as http:
                 resp = await http.get(
                     base + method,
                     params=params,

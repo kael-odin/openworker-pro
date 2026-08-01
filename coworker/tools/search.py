@@ -2,11 +2,18 @@
 
 ripgrep respects `.gitignore`, so it skips `node_modules`/`target`/`dist` automatically; the
 fallback skips a hardcoded set of heavy dirs. Read-only, workspace-scoped. Returns file:line:text.
+
+Parsing note: ripgrep's text output uses ``path:line:text`` with ``:`` as the separator, which
+breaks on Windows drive letters (``C:\\path`` — the drive colon is mistaken for the field
+separator and the match is dropped). We therefore request ``rg --json`` and parse structured
+``type == "match"`` events, which carry path/line/text as discrete JSON fields and are immune
+to drive letters, colons in filenames, and Unicode path edge cases.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import shutil
@@ -43,6 +50,14 @@ _IGNORE_DIRS = {
     ".ruff_cache",
     ".idea",
 } | OS_DATA_DIRS
+
+# OS_DATA_DIRS (AppData, Library, …) must NOT be passed to ripgrep as `--glob !**/<dir>/**`.
+# ripgrep's glob matches against the full path, so `!**/AppData/**` would exclude a workspace
+# whose path merely *contains* an AppData ancestor (e.g. Windows %TEMP% under
+# C:\Users\<user>\AppData\Local\Temp) — silently dropping every match. These dirs only need to
+# be skipped during a Python os.walk (which matches by directory NAME at each level, not by
+# path). ripgrep already respects .gitignore; the _GLOB_IGNORE set below is the safe subset.
+_GLOB_IGNORE = _IGNORE_DIRS - OS_DATA_DIRS
 
 _SCHEMA = {
     "type": "function",
@@ -100,9 +115,7 @@ def search_tools(workspace: str) -> list:
         if rg:
             cmd = [
                 rg,
-                "--line-number",
-                "--no-heading",
-                "--color=never",
+                "--json",
                 "--max-count",
                 str(n),
                 "-e",
@@ -113,7 +126,9 @@ def search_tools(workspace: str) -> list:
             # Do not rely solely on a workspace's .gitignore: the Python fallback
             # always omits these generated/dependency directories too. Exclusions come
             # last because ripgrep resolves conflicting globs with the later one winning.
-            for ignored in sorted(_IGNORE_DIRS):
+            # Use _GLOB_IGNORE (not _IGNORE_DIRS): OS_DATA_DIRS are excluded here only by
+            # name during traversal, not as path globs (see _GLOB_IGNORE comment above).
+            for ignored in sorted(_GLOB_IGNORE):
                 cmd += ["--glob", f"!**/{ignored}/**"]
             cmd.append(str(base))
             try:
@@ -122,7 +137,7 @@ def search_tools(workspace: str) -> list:
                 return {"error": f"grep failed: {exc}"}
             if out.returncode not in (0, 1):  # 1 = no matches
                 return {"error": (out.stderr or "ripgrep error").strip()[:300]}
-            return {"engine": "ripgrep", **_parse_rg(out.stdout, root, n)}
+            return {"engine": "ripgrep", **_parse_rg_json(out.stdout, root, n)}
 
         return {"engine": "python", **_py_grep(root, base, pattern, glob, n)}
 
@@ -146,19 +161,55 @@ def _rel(path: str, root: Path) -> str:
         return path
 
 
-def _parse_rg(stdout: str, root: Path, n: int) -> dict[str, Any]:
+def _parse_rg_json(stdout: str, root: Path, n: int) -> dict[str, Any]:
+    """Parse ripgrep ``--json`` output into structured matches.
+
+    Only ``type == "match"`` events carry search hits; each has ``data.path.text`` (file path),
+    ``data.line_number`` and ``data.lines`` (the matching text, as bytes or text). Structured
+    JSON avoids the Windows drive-letter / colon-in-path breakage of text-mode parsing.
+    """
     matches: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
-        parts = line.split(":", 2)
-        if len(parts) == 3:
-            f, ln, txt = parts
-            matches.append(
-                {
-                    "file": _rel(f, root),
-                    "line": int(ln) if ln.isdigit() else 0,
-                    "text": txt[:300],
-                }
-            )
+    for raw_line in stdout.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            evt = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError):
+            continue  # malformed event — skip, don't abort the whole result
+        if evt.get("type") != "match":
+            continue
+        data = evt.get("data") or {}
+        # path.text is the file path (str); fall back to bytes→decode for exotic encodings.
+        path_val = (data.get("path") or {}).get("text")
+        if not path_val:
+            pb = (data.get("path") or {}).get("bytes")
+            if pb:
+                try:
+                    path_val = bytes(pb, "utf-8").decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+        if not path_val:
+            continue
+        ln = data.get("line_number") or 0
+        # lines may be {text: "..."} or {bytes: "..."}; extract the matching line text.
+        lines_val = data.get("lines") or {}
+        txt = lines_val.get("text")
+        if txt is None:
+            lb = lines_val.get("bytes")
+            if lb:
+                try:
+                    txt = bytes(lb, "utf-8").decode("utf-8", errors="replace")
+                except Exception:
+                    txt = ""
+        txt = (txt or "").rstrip("\r\n")
+        matches.append(
+            {
+                "file": _rel(str(path_val), root),
+                "line": ln,
+                "text": txt[:300],
+            }
+        )
         if len(matches) >= n:
             break
     return {"count": len(matches), "matches": matches}

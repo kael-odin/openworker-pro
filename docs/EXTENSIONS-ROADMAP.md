@@ -150,7 +150,7 @@ Hook = name + event + match（glob 限定哪些任务名触发）+ command（she
 - **一键补装**：`install_digital_human` 安装前检查 `requires_plugins` 缺失项，自动从默认市场源补装。
 - **sha pin + 更新检查**：`_git_clone_or_pull` 支持 sha pin（`git fetch --depth 1 origin <sha>` + checkout，unshallow fallback）。`check_updates` 对比注册表记录 sha 与 marketplace 最新 sha，返回可更新项。
 
-**验证**：15 新插件测试 + 1 新数字人测试通过；101 通过/1 预存环境失败（DHP repo 未克隆，非 E4 引入）；tsc 0 错；后端端到端：真实 marketplace catalog 解析正确、装 42crunch 插件后 5 个 skill 立即出现在 `/v1/skills`（loader 联动）、更新检查 sha 匹配、卸载清理干净。**注**：GUI 端到端无法在独立浏览器验证（Wails runtime 404→React 不 mount，仓库预存限制，非 E4 引入），前端代码 tsc 通过且遵循既有模式。
+**验证**：15 新插件测试 + 1 新数字人测试通过；101 通过/1 预存环境失败（DHP repo 未克隆，非 E4 引入）；tsc 0 错；后端端到端：真实 marketplace catalog 解析正确、装 42crunch 插件后 5 个 skill 立即出现在 `/v1/skills`（loader 联动）、更新检查 sha 匹配、卸载清理干净。前端代码 tsc 通过且遵循既有模式（GUI 端到端现由复活的 Playwright 套件覆盖，见 ci.yml `gui-e2e` job）。
 
 **不做（留 E5/后续）**：
 - ~~Persona 市场源（`persona_sources`）——subagents 健康检查只读展示，不自动补装。~~ **✅ 已完成（E4 后续，见下）**
@@ -187,7 +187,7 @@ E4 完成时把 Persona/Commands 市场源留到了 E5；E5 落地后补齐 Pers
 
 ## 不做 / 后续
 
-- **ilink 个人微信逆向协议**：红线，不碰。微信集成只走合规路径：企业微信自建应用 API、ClawBot 官方腾讯插件。
+- **个人微信（iLink）**：已作为普通连接器 `wechat_ilink` 交付（扫码登录、多账号、私聊长轮询、文本入站/回复、媒体占位、运行期 context 主动发送、断线重连、200 条去重、登录失效重新认证）。实现边界：基于已观察协议行为的独立 Python 行为实现，不复制任何上游 TypeScript 源码/注释/类型/测试数据；`bot_token` 仅存后端 SecretStore，`context_token` 仅在 adapter 运行期内存，不进 renderer/API 响应/日志/模型 prompt/工具参数；传输层强制 HTTPS + 微信 vendor hostname 校验，不接受用户输入任意 `base_url`。能力边界如实标注：不支持群聊/thread/出站媒体/真实媒体下载/无上下文主动发送/重启后保留上下文。详见 `docs/WECHAT_ILINK_CONNECTOR.md`。
 - **自建 MCP 服务器开发框架**：openworker 是 MCP 消费者，不做"用 openworker 开发 MCP server"方向。
 - **插件代码执行沙箱**：插件本质是声明 + 资源（SKILL.md/persona/spec.yaml/command 模板），不跑任意代码。需执行的场景走 MCP（已有 sandbox 意识）。
 
@@ -195,7 +195,7 @@ E4 完成时把 Persona/Commands 市场源留到了 E5；E5 落地后补齐 Pers
 
 **当前选定顺序**（用户确认）：
 
-1. **E1**（Skills 全链路）— 最高性价比，skills 半成品只差安装链路。**← 进行中**
+1. **E1**（Skills 全链路）— 最高性价比，skills 半成品只差安装链路。**✅ 完成**
 2. **E2**（Rules 三态 + Hooks 雏形）— 安全/合规 + 数字人运行前后钩子。**✅ 完成（CRUD+UI+触发；resolver 接引擎/数字人 requires 留 E2.5）**
 3. **E3**（Commands + Subagents）— 委托子代理是数字人"并行干活"的关键能力。**✅ 完成（Commands 全链路 + delegate_to_subagent 泛化委托；Bash/Browser 内置子代理、创建 UI、市场源留 E3.5/E4）**
 4. **E4**（统一 Hub + Plugin 打包）— 跨类打包 + 自定义源（含 claude-plugins-official.git）。**✅ 完成（Plugin 市场安装链路 + 4 种 source + loader 联动 + spec.requires 统一 + 健康面板扩展 + 一键补装；Persona/Commands 市场源留 E5）**

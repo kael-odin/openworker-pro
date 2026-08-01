@@ -118,12 +118,12 @@ _pending: Optional[asyncio.Future] = None
 # The last authorize URL we sent the user to — surfaced over REST so the GUI can offer
 # a "reopen sign-in page" link if the browser popup was lost.
 last_authorize_url: Optional[str] = None
-# The `state` the SDK put in the current authorize URL. The SDK itself re-checks the
-# returned state (mcp.client.auth.oauth2 compare_digest), so this is NOT the CSRF guard —
-# it's a loopback gate: without it any local caller could hit /mcp/oauth/callback with a
-# bogus code and consume the single pending future, aborting the user's real sign-in
-# (which then finds no pending flow). Matching state here rejects that stray callback and
-# leaves the flow waiting for the genuine one.
+# The `state` bound to the current interactive flow. Always client-generated (P1-02):
+# `_inject_state` guarantees the authorize URL carries a state even when the server/SDK
+# omits one, so `deliver_callback` can always enforce an exact match. This is the loopback
+# gate — without it any local caller could hit /mcp/oauth/callback with a bogus code and
+# consume the single pending future, aborting the user's real sign-in. The SDK itself also
+# re-checks state (mcp.client.auth.oauth2 compare_digest) server-side; both must pass.
 _expected_state: Optional[str] = None
 
 
@@ -140,14 +140,14 @@ def deliver_callback(code: str, state: Optional[str]) -> bool:
 
     A callback whose `state` doesn't match the pending flow's is ignored (returns False)
     WITHOUT consuming the pending future, so a stray/forged local hit can't abort a live
-    sign-in — only the browser redirect carrying the SDK's own state resolves it.
+    sign-in — only the browser redirect carrying our state resolves it. The state is
+    client-generated (P1-02): we never depend on the server to supply or echo one, so a
+    server that omits state from its authorize URL still gets CSRF protection.
     """
     global _pending
     if _pending is None or _pending.done():
         return False
-    # Only enforce when we actually captured a state for this flow; a flow with no state
-    # in its authorize URL falls back to the prior accept-any behavior.
-    if _expected_state is not None and (
+    if _expected_state is None or (
         state is None or not secrets.compare_digest(state, _expected_state)
     ):
         return False
@@ -156,8 +156,27 @@ def deliver_callback(code: str, state: Optional[str]) -> bool:
     return True
 
 
+def _inject_state(url: str) -> str:
+    """Ensure the authorize URL carries a client-generated state (P1-02).
+
+    OAuth state is a CSRF guard that must always be present and bound to this flow — never
+    dependent on whether the server/SDK chose to include one. If the URL already has a
+    state, keep it (the SDK's compare_digest will also check it server-side). If not, we
+    generate a fresh high-entropy state and append it; the loopback callback then enforces
+    an exact match against `_expected_state`, so a forged callback without it is rejected.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if "state" not in query or not query["state"]:
+        query["state"] = secrets.token_urlsafe(32)
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
 async def _open_browser(url: str) -> None:
     global last_authorize_url, _expected_state
+    url = _inject_state(url)
     last_authorize_url = url
     _expected_state = _state_from_url(url)
     import webbrowser

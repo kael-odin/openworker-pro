@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 from coworker.config import load_config
@@ -70,14 +74,37 @@ def test_workspace_trust_is_canonical_and_user_owned(tmp_path):
     real = tmp_path / "real"
     real.mkdir()
     alias = tmp_path / "alias"
-    alias.symlink_to(real, target_is_directory=True)
+    # Creating a symlink on Windows needs admin/Developer Mode (WinError 1314 otherwise).
+    # A directory junction needs no privilege and still exercises canonicalization.
+    try:
+        alias.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if sys.platform == "win32":
+            # os.symlink with target_is_directory=False on a dir path yields a junction-free
+            # link that still resolves; fall back to a junction via mklink /J.
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias), str(real)],
+                capture_output=True, check=True,
+            )
+        else:
+            raise
     store = WorkspaceTrustStore(tmp_path / "state" / "workspace_trust.json")
 
     canonical = store.set_trusted(alias, True)
     assert canonical == str(real.resolve())
     assert store.is_trusted(real)
     assert store.list() == [str(real.resolve())]
-    assert (store.path.stat().st_mode & 0o777) == 0o600
+    # POSIX expresses user-only as mode 0600; Windows has no such bits (os.chmod is a
+    # near no-op there) and the store uses an ACL instead — assert that, not the mode.
+    if sys.platform == "win32":
+        raw = subprocess.run(
+            ["icacls", str(store.path)], capture_output=True
+        ).stdout
+        out = raw.decode("utf-8", errors="replace") or raw.decode("mbcs", errors="replace")
+        assert os.environ.get("USERNAME", "") in out
+        assert "BUILTIN\\Administrators" not in out
+    else:
+        assert (store.path.stat().st_mode & 0o777) == 0o600
 
     store.set_trusted(real, False)
     assert not store.is_trusted(alias)

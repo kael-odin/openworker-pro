@@ -42,6 +42,13 @@ class DigitalHumanInstance:
     spec_version: str = ""  # spec version at install time (for upgrade detection)
     installed_at: int = 0
     updated_at: int = 0
+    # Legacy instances created before the secret-boundary fix may have secret values baked into
+    # the task instructions (the preamble used to merge secret values into the JSON). A run that
+    # rewrites the instructions (any config/prompt edit via update_digital_human) clears this.
+    # Until then, list_dh_instances reports needs_secret_migration so the user is prompted to
+    # re-save (which rewrites a clean preamble) rather than silently running a leaky task.
+    needs_secret_migration: bool = False
+    unreviewed: bool = False
 
     def secret_profile(self) -> str:
         return f"{SECRET_PROFILE_PREFIX}{self.id}"
@@ -57,6 +64,8 @@ class DigitalHumanInstance:
             "spec_version": self.spec_version,
             "installed_at": self.installed_at,
             "updated_at": self.updated_at,
+            "needs_secret_migration": self.needs_secret_migration,
+            "unreviewed": self.unreviewed,
         }
 
     @classmethod
@@ -71,6 +80,10 @@ class DigitalHumanInstance:
             spec_version=str(d.get("spec_version") or ""),
             installed_at=int(d.get("installed_at") or 0),
             updated_at=int(d.get("updated_at") or 0),
+            # A legacy record (no key) is treated as needing migration: it predates the
+            # secret-boundary fix and its instructions may carry plaintext secret values.
+            needs_secret_migration=bool(d.get("needs_secret_migration", True)),
+            unreviewed=bool(d.get("unreviewed", False)),
         )
 
 

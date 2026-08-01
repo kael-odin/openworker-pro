@@ -125,14 +125,20 @@ class NotifyRouter:
         )
 
     def test_send(self, channel: str, config: dict[str, Any]) -> NotifyDispatch:
-        """用给定配置（非持久化的）测试发送一条 —— 供配置面板"测试"按钮。"""
+        """用服务端已存 secret + 表单 patch 测试；mask/omitted 字段不会覆盖凭据。"""
         sender = CHANNELS.get(channel)
         if sender is None:
             return NotifyDispatch(
                 results=[NotifyResult(ok=False, channel=channel, error=f"未知渠道 {channel!r}")]
             )
         try:
-            r = sender("OpenWorker 通知测试", "这是一条测试通知，配置成功。", config, status="ok")
+            merged = self.store.merge_for_test(channel, config)
+            r = sender(
+                "OpenWorker 通知测试",
+                "这是一条测试通知，配置成功。",
+                merged,
+                status="ok",
+            )
             r.channel = channel
             return NotifyDispatch(results=[r])
         except Exception as exc:

@@ -76,7 +76,10 @@ const fetch = async (
 };
 
 const openWebSocket = (url: string): WebSocket => {
-  const token = apiToken();
+  // devTokenOverride is set by the REST self-heal after a sidecar restart; without it the
+  // WebSocket would keep using the stale frozen __COWORKER_DEV_TOKEN__ and 403-loop until a
+  // full page reload that re-runs the self-heal. Prefer the override, then fall back.
+  const token = devTokenOverride || apiToken();
   return token
     ? new WebSocket(url, ["openworker", token])
     : new WebSocket(url);
@@ -960,6 +963,46 @@ export interface GithubInstallation {
   allow_all: boolean;
 }
 
+export interface WeChatIlinkAccount {
+  account_id: string;
+  display_name: string;
+  enabled: boolean;
+  default: boolean;
+  allowed_users: string[];
+  allow_all: boolean;
+  allowed_user_names?: Record<string, string | null>;
+  needs_reauth: boolean;
+  state: "connecting" | "live" | "reconnecting" | "auth_required" | "failed" | "offline" | string;
+  retry_count: number;
+  last_event_at: number | null;
+  last_error: string;
+}
+
+export interface WeChatIlinkStatus {
+  ok: boolean;
+  state: "live" | "reconnecting" | "auth_required" | "offline" | string;
+  accounts: WeChatIlinkAccount[];
+}
+
+export type WeChatIlinkQrState =
+  | "waiting"
+  | "scanned"
+  | "confirmed"
+  | "expired"
+  | "failed"
+  | "cancelled";
+
+export interface WeChatIlinkQrAttempt {
+  ok: boolean;
+  error?: string;
+  attempt_id?: string;
+  status?: WeChatIlinkQrState;
+  expires_at?: number;
+  qr_content?: string;
+  account_id?: string;
+  display_name?: string;
+}
+
 // One connected HubSpot portal (multi-portal: `hubspot:portal:<hub_id>` profiles).
 export interface HubSpotPortal {
   hub_id: string;
@@ -1033,8 +1076,9 @@ export interface Connector {
   mode?: string; // "relay" for the managed cloud path; "" for manual/token connect
   workspaces?: SlackWorkspace[]; // Slack only: connected workspaces (managed relay)
   // Gmail/Calendar: email-keyed rows; generic account connectors (notion,
-  // attio, posthog, …): AccountRow. The detail pages narrow by connector.
-  accounts?: GmailAccount[] | AccountRow[];
+  // attio, posthog, …): AccountRow; personal WeChat uses its live state row.
+  accounts?: GmailAccount[] | AccountRow[] | WeChatIlinkAccount[];
+  status?: WeChatIlinkStatus; // personal WeChat aggregate + per-account live state
   filters?: GmailFilters; // Gmail only: "Never show agents" senders/labels
   portals?: HubSpotPortal[]; // HubSpot only: connected portals (multi-portal)
   hidden_fields?: string[]; // HubSpot only: properties stripped from agent reads
@@ -1167,6 +1211,68 @@ export async function disconnectConnector(name: string): Promise<{ ok: boolean }
   const res = await fetch(`${httpBase()}/v1/connectors/${encodeURIComponent(name)}/disconnect`, {
     method: "POST",
   });
+  return res.json();
+}
+
+export async function getWeChatIlinkAccounts(): Promise<WeChatIlinkAccount[]> {
+  const res = await fetch(`${httpBase()}/v1/connectors/wechat_ilink/accounts`);
+  return (await res.json()).accounts ?? [];
+}
+
+export async function getWeChatIlinkStatus(): Promise<WeChatIlinkStatus> {
+  const res = await fetch(`${httpBase()}/v1/connectors/wechat_ilink/status`);
+  return res.json();
+}
+
+export async function createWeChatIlinkQr(): Promise<WeChatIlinkQrAttempt> {
+  const res = await fetch(`${httpBase()}/v1/connectors/wechat_ilink/qrcode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  return res.json();
+}
+
+export async function getWeChatIlinkQr(attemptId: string): Promise<WeChatIlinkQrAttempt> {
+  const res = await fetch(
+    `${httpBase()}/v1/connectors/wechat_ilink/qrcode/${encodeURIComponent(attemptId)}`,
+  );
+  return res.json();
+}
+
+export async function cancelWeChatIlinkQr(attemptId: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/connectors/wechat_ilink/qrcode/${encodeURIComponent(attemptId)}`,
+    { method: "DELETE" },
+  );
+  return res.json();
+}
+
+export async function reauthWeChatIlinkAccount(accountId: string): Promise<WeChatIlinkQrAttempt> {
+  const res = await fetch(
+    `${httpBase()}/v1/connectors/wechat_ilink/accounts/${encodeURIComponent(accountId)}/reauth`,
+    { method: "POST" },
+  );
+  return res.json();
+}
+
+export async function disconnectWeChatIlinkAccount(
+  accountId: string,
+): Promise<{ ok: boolean; error?: string; remaining_accounts?: number }> {
+  const res = await fetch(
+    `${httpBase()}/v1/connectors/wechat_ilink/accounts/${encodeURIComponent(accountId)}`,
+    { method: "DELETE" },
+  );
+  return res.json();
+}
+
+export async function setDefaultWeChatIlinkAccount(
+  accountId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(
+    `${httpBase()}/v1/connectors/wechat_ilink/accounts/${encodeURIComponent(accountId)}/default`,
+    { method: "POST" },
+  );
   return res.json();
 }
 
@@ -2139,7 +2245,18 @@ export function connectEvents(
       }
     };
     ws.onclose = () => {
-      if (!closed) timer = window.setTimeout(open, 5000);
+      if (closed) return;
+      // A 403 (sidecar restarted, token rotated) closes the socket before any REST 401 can
+      // refresh the override. Proactively refresh the dev token, then reconnect — without this
+      // the loop would keep using the stale token and 403-loop forever.
+      const reconnect = () => {
+        if (!closed) timer = window.setTimeout(open, 5000);
+      };
+      if (!devTokenOverride) {
+        refreshDevToken().finally(reconnect);
+      } else {
+        reconnect();
+      }
     };
   };
   open();
@@ -2478,6 +2595,8 @@ export interface WecomStatus {
   has_token?: boolean;
   has_aes_key?: boolean;
   encrypted?: boolean;
+  inbound_state?: "encrypted" | "outbound_only" | string;
+  needs_migration?: boolean;
 }
 
 export async function getWecomStatus(): Promise<WecomStatus> {
@@ -2500,16 +2619,60 @@ export class Session {
   // Payloads sent before the socket finished opening, replayed on `onopen`. Belt-and-suspenders
   // against the first message being dropped if the user sends in the connect window.
   private outbox: object[] = [];
+  // P1-06: auto-reconnect on unexpected close. `closed` marks an intentional teardown (close()),
+  // which suppresses reconnect. Backoff is exponential with jitter, capped at 30s.
+  private closed = false;
+  private reconnectTimer: number | null = null;
+  private reconnectAttempt = 0;
+  private readonly maxReconnectDelayMs = 30_000;
+  private readonly baseReconnectDelayMs = 1_000;
 
-  constructor(sessionId: string, workspace: string, agent: string, handlers: Handlers) {
-    const q = `?workspace=${encodeURIComponent(workspace)}&agent=${encodeURIComponent(agent)}`;
-    this.ws = openWebSocket(`${wsBase()}/ws/session/${sessionId}${q}`);
-    this.ws.onmessage = (e) => handlers.onEvent(JSON.parse(e.data));
-    this.ws.onopen = () => {
+  constructor(
+    private sessionId: string,
+    private workspace: string,
+    private agent: string,
+    private handlers: Handlers,
+  ) {
+    this.ws = this.open();
+  }
+
+  private url(): string {
+    const q = `?workspace=${encodeURIComponent(this.workspace)}&agent=${encodeURIComponent(this.agent)}`;
+    return `${wsBase()}/ws/session/${this.sessionId}${q}`;
+  }
+
+  private open(): WebSocket {
+    const ws = openWebSocket(this.url());
+    ws.onmessage = (e) => this.handlers.onEvent(JSON.parse(e.data));
+    ws.onopen = () => {
+      this.reconnectAttempt = 0;
       this.flush();
-      handlers.onOpen?.();
+      this.handlers.onOpen?.();
     };
-    this.ws.onclose = () => handlers.onClose?.();
+    ws.onclose = () => {
+      if (this.closed) return;
+      this.handlers.onClose?.();
+      this.scheduleReconnect();
+    };
+    ws.onerror = () => {
+      // The browser will fire onclose after onerror; reconnect is handled there.
+    };
+    return ws;
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer !== null) return;
+    // Exponential backoff: base * 2^attempt, capped, with ±25% jitter.
+    const exp = this.baseReconnectDelayMs * Math.pow(2, this.reconnectAttempt);
+    const capped = Math.min(exp, this.maxReconnectDelayMs);
+    const jitter = capped * (0.75 + Math.random() * 0.5);
+    this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 8);
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closed) return;
+      // Replace the dead socket; handlers reattach in open().
+      this.ws = this.open();
+    }, jitter);
   }
 
   private flush() {
@@ -2581,12 +2744,19 @@ export class Session {
   }
 
   close() {
-    // Detach before closing: this socket's async `close` event may land AFTER the
-    // successor session's `open` (observed when switching into an automation-run
-    // session), and a torn-down socket must not clobber the new one's connected state.
+    // Intentional teardown: suppress auto-reconnect and detach handlers. This socket's
+    // async `close` event may land AFTER the successor session's `open` (observed when
+    // switching into an automation-run session), and a torn-down socket must not clobber
+    // the new one's connected state or schedule a spurious reconnect.
+    this.closed = true;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.ws.onopen = null;
     this.ws.onmessage = null;
     this.ws.onclose = null;
+    this.ws.onerror = null;
     this.ws.close();
   }
 }
@@ -2620,11 +2790,24 @@ export async function getNotifyChannelConfig(
 export async function saveNotifyChannelConfig(
   channel: string,
   config: Record<string, unknown>,
+  clearFields: string[] = [],
 ): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch(`${httpBase()}/v1/notify/channels/${encodeURIComponent(channel)}`, {
-    method: "POST",
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ config }),
+    body: JSON.stringify({ config, clear_fields: clearFields }),
+  });
+  return res.json();
+}
+
+export async function setNotifyChannelEnabled(
+  channel: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/notify/channels/${encodeURIComponent(channel)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
   });
   return res.json();
 }

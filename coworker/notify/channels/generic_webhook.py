@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from .._result import NotifyResult
+from ..http import WebhookPostError, post_json
 
 
 def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> NotifyResult:
@@ -19,8 +20,6 @@ def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> 
         headers: 可选，额外请求头（dict）
         template: 可选，自定义 body 模板（dict）；缺省用 ``{title, body, status}``
     """
-    import httpx
-
     url = (config.get("url") or "").strip()
     if not url:
         return NotifyResult(ok=False, error="webhook url 未配置")
@@ -30,15 +29,15 @@ def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> 
         "body": body,
         "status": status,
     }
-    headers = {"Content-Type": "application/json"}
-    headers.update(config.get("headers") or {})
-
     try:
-        resp = httpx.post(url, json=payload, headers=headers, timeout=10.0)
-    except Exception as exc:  # 网络 / DNS / 超时
+        status_code, _ = post_json(
+            url,
+            payload,
+            headers=config.get("headers"),
+            allow_http=config.get("allow_http") is True,
+        )
+    except WebhookPostError as exc:
         return NotifyResult(ok=False, error=str(exc))
-    if 200 <= resp.status_code < 300:
+    if 200 <= status_code < 300:
         return NotifyResult(ok=True)
-    return NotifyResult(
-        ok=False, error=f"webhook HTTP {resp.status_code}: {resp.text[:200]}"
-    )
+    return NotifyResult(ok=False, error=f"webhook HTTP {status_code}")

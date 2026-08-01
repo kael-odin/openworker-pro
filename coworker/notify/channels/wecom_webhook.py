@@ -16,6 +16,7 @@ import time
 from typing import Any
 
 from .._result import NotifyResult
+from ..http import VENDOR_HOSTS, WebhookPostError, post_json
 
 
 def _sign(secret: str) -> tuple[str, str]:
@@ -33,8 +34,6 @@ def _sign(secret: str) -> tuple[str, str]:
 
 
 def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> NotifyResult:
-    import httpx
-
     url = (config.get("url") or "").strip()
     if not url:
         return NotifyResult(ok=False, channel="wecom", error="企微 webhook url 未配置")
@@ -53,10 +52,17 @@ def send(title: str, body: str, config: dict[str, Any], *, status: str = "") -> 
         payload["sign"] = sign
 
     try:
-        resp = httpx.post(url, json=payload, timeout=10.0)
-        data = resp.json()
-    except Exception as exc:
+        status_code, data = post_json(
+            url, payload, allowed_hosts=VENDOR_HOSTS["wecom"]
+        )
+    except WebhookPostError as exc:
         return NotifyResult(ok=False, channel="wecom", error=str(exc))
+    if not 200 <= status_code < 300:
+        return NotifyResult(
+            ok=False, channel="wecom", error=f"企微 webhook HTTP {status_code}"
+        )
+    if not isinstance(data, dict):
+        data = {}
     # 企微成功时 errcode=0；失败 errcode 非 0 带 errmsg。
     if data.get("errcode") == 0:
         return NotifyResult(ok=True, channel="wecom")

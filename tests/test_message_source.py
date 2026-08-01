@@ -83,7 +83,7 @@ def test_inbound_builds_message_source(tmp_path, monkeypatch):
     _connect_slack(mgr)
     captured: list[tuple] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=""):
         captured.append((session_id, message, source))
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
@@ -244,7 +244,7 @@ def test_dm_message_source_kind_dm(tmp_path, monkeypatch):
     _connect_slack(mgr)
     captured: list[tuple] = []
 
-    async def fake_deliver(session_id, message, *, source=None):
+    async def fake_deliver(session_id, message, *, source=None, reply_target=""):
         captured.append((session_id, message, source))
 
     monkeypatch.setattr(mgr, "deliver_to_session", fake_deliver)
