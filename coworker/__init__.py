@@ -10,4 +10,11 @@
 # constructs `ai.ToolMetadata` at import time. See coworker/tools/_aisuite_compat.py.
 from .tools import _aisuite_compat  # noqa: F401  (side effect: patches aisuite)
 
+# Install the aisuite.toolkits compat shim (files/git tool factories). PyPI 0.1.14
+# dropped the entire `toolkits` submodule; ~108 tests + the agent's file-editing
+# capability depend on `ai.toolkits.files()` / `.git()`. This shim reimplements
+# them locally and patches `aisuite.toolkits` so call sites in catalog.py /
+# subagent.py / tests work unchanged. See coworker/tools/_toolkits_compat.py.
+from .tools import _toolkits_compat  # noqa: F401  (side effect: patches aisuite.toolkits)
+
 __version__ = "0.0.0"
