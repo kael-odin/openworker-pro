@@ -31,9 +31,14 @@ from coworker.digital_human.installer import (
     split_config,
 )
 
-DHP_REPO = Path(os.environ.get("OPENWORKER_DHP_REPO", "")).resolve() or Path(
-    __file__
-).resolve().parents[2] / "digital-human-protocol"
+_dhp_env = os.environ.get("OPENWORKER_DHP_REPO", "").strip()
+DHP_REPO = (
+    Path(_dhp_env).resolve()
+    if _dhp_env
+    else Path(__file__).resolve().parents[2] / "digital-human-protocol"
+)
+# Path("").resolve() returns the cwd (truthy), so guard on the env string, not
+# the resolved Path — otherwise skipif never triggers when the repo is absent.
 
 
 # -- spec parser: minimal + required-field enforcement ------------------------

@@ -228,8 +228,9 @@ def test_hook_fire_never_raises_on_bad_command():
 
 def test_hook_fire_pre_run_skip_signal():
     _prefs, store = _prefs_and_hook_store()
-    # A pre_run hook that requests a skip via stdout JSON.
-    store.add("guard", PRE_RUN, 'echo {"skip": true}', match="*")
+    # A pre_run hook that requests a skip via stdout JSON. printf keeps the JSON
+    # quotes intact (a bare `echo {"skip": true}` loses its quotes under sh).
+    store.add("guard", PRE_RUN, 'printf \'%s\' \'{"skip": true}\'', match="*")
     results = store.fire(PRE_RUN, {"task_name": "x", "event": PRE_RUN})
     assert len(results) == 1
     assert results[0].get("skip") is True
