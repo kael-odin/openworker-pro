@@ -49,6 +49,12 @@ class DigitalHumanInstance:
     # re-save (which rewrites a clean preamble) rather than silently running a leaky task.
     needs_secret_migration: bool = False
     unreviewed: bool = False
+    # Instance-level override of the spec's config_schema, stored as the raw list-of-dicts shape from
+    # the YAML node. The manager re-fetches the spec from the remote registry on every update, so
+    # schema edits made in the form editor (add/remove/reorder fields) must persist on the instance
+    # and be re-applied to the freshly-fetched spec via spec.apply_schema_override. Empty = use the
+    # spec's own config_schema unchanged.
+    config_schema_override: list[dict] = field(default_factory=list)
 
     def secret_profile(self) -> str:
         return f"{SECRET_PROFILE_PREFIX}{self.id}"
@@ -66,6 +72,7 @@ class DigitalHumanInstance:
             "updated_at": self.updated_at,
             "needs_secret_migration": self.needs_secret_migration,
             "unreviewed": self.unreviewed,
+            "config_schema_override": list(self.config_schema_override),
         }
 
     @classmethod
@@ -84,6 +91,7 @@ class DigitalHumanInstance:
             # secret-boundary fix and its instructions may carry plaintext secret values.
             needs_secret_migration=bool(d.get("needs_secret_migration", True)),
             unreviewed=bool(d.get("unreviewed", False)),
+            config_schema_override=list(d.get("config_schema_override") or []),
         )
 
 
@@ -135,6 +143,17 @@ class InstanceStore:
             if inst.task_id == task_id:
                 return inst
         return None
+
+    def get_by_slug(self, slug: str) -> Optional[DigitalHumanInstance]:
+        """Return the most recently installed instance for a DHP slug, or None.
+
+        Multiple installs of the same slug are uncommon but possible (re-install replaces in place,
+        but a stale record could linger); we return the newest by installed_at to match ``list``.
+        """
+        matches = [i for i in self._instances.values() if i.slug == slug]
+        if not matches:
+            return None
+        return max(matches, key=lambda i: i.installed_at)
 
     def resolve_config(self, inst: DigitalHumanInstance) -> dict[str, Any]:
         """Merge non-secret config + secret config (resolved from SecretStore) for prompt injection."""

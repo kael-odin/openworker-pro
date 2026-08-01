@@ -2839,16 +2839,24 @@ export interface SelectOption {
   label: string;
   value: string | number | boolean;
 }
+export type InputType =
+  | "string" | "text" | "number" | "boolean" | "url" | "email" | "select"
+  | "json" | "stringList" | "urlList" | "keyvalue" | "date" | "datetime";
 export interface ConfigField {
   key: string;
   label: string;
-  type: "string" | "text" | "number" | "boolean" | "url" | "email" | "select";
+  type: InputType;
   required: boolean;
   description?: string;
   default?: unknown;
   placeholder?: string;
   options?: SelectOption[];
-  secret?: boolean;
+  secret?: boolean;        // explicit secret flag (routed to SecretStore)
+  multiple?: boolean;      // select only: multi-select, value stored as array
+  min?: number;            // number only
+  max?: number;            // number only
+  step?: number;           // number only
+  visible_if?: string;     // conditional display expression, e.g. 'channel == "webhook"'
 }
 export interface DigitalHumanEntry {
   slug: string;
@@ -2906,6 +2914,7 @@ export interface DigitalHumanInstance {
   spec_version: string;
   installed_at: number;
   updated_at: number;
+  config_schema_override?: ConfigField[]; // form-editor schema edits (empty/absent = use spec's)
   task: {
     id: string;
     title: string;
@@ -2963,6 +2972,7 @@ export async function updateDigitalHumanInstance(
   changes: {
     system_prompt?: string;
     user_config?: Record<string, unknown>;
+    config_schema?: ConfigField[]; // form-editor schema edits → instance-level override
     cron?: string;
     notify_channels?: string[];
     notify_level?: string;

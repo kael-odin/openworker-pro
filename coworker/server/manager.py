@@ -4024,6 +4024,15 @@ class SessionManager:
             spec = self.dhp_registry.get_spec(slug)
         except Exception as e:  # SpecError or file error
             return {"ok": False, "error": str(e)}
+        # If an installed instance has a config_schema override (form-editor edits), apply it so the
+        # editor sees the edited schema, not the registry's original.
+        inst = self.dhp_instances.get_by_slug(slug)
+        if inst is not None and inst.config_schema_override:
+            from ..digital_human.spec import apply_schema_override
+            try:
+                apply_schema_override(spec, inst.config_schema_override, slug)
+            except Exception as e:
+                return {"ok": False, "error": f"config_schema override is invalid: {e}"}
         return {
             "ok": True,
             "entry": entry.to_dict(),
@@ -4248,6 +4257,7 @@ class SessionManager:
         """
         from ..digital_human import reinstall_instructions, validate_config, split_config
         from ..digital_human.instances import SECRET_PROFILE_PREFIX
+        from ..digital_human.spec import apply_schema_override
 
         inst = self.dhp_instances.get(instance_id)
         if inst is None:
@@ -4258,12 +4268,34 @@ class SessionManager:
             return {"ok": False, "error": str(e)}
 
         changes = changes or {}
+
+        # If the instance already has a config_schema override (from prior form-editor edits), apply
+        # it so validation/split/instructions use the edited schema, not the registry's original.
+        if inst.config_schema_override:
+            try:
+                apply_schema_override(spec, inst.config_schema_override, inst.slug)
+            except Exception as e:
+                return {"ok": False, "error": f"stored config_schema override is invalid: {e}"}
+
+        # A new config_schema in changes replaces the override. Validate it by applying it to the
+        # spec (raises SpecError on bad shape) before persisting, so an invalid edit is rejected
+        # without touching the instance.
+        new_schema = changes.get("config_schema")
+        if new_schema is not None:
+            try:
+                apply_schema_override(spec, new_schema, inst.slug)
+            except Exception as e:
+                return {"ok": False, "error": f"config_schema is invalid: {e}"}
+            inst.config_schema_override = list(new_schema) if isinstance(new_schema, list) else []
+
         task_changes: dict[str, Any] = {}
         user_config = changes.get("user_config")
         system_prompt = changes.get("system_prompt")
 
         # Only rebuild instructions when config or prompt actually changed.
-        if user_config is not None or system_prompt is not None:
+        # A config_schema edit also forces a rebuild — the preamble must reflect the new schema, and
+        # existing config values must be re-validated/default-filled against it.
+        if user_config is not None or system_prompt is not None or new_schema is not None:
             merged = self.dhp_instances.resolve_config(inst)  # current non-secret + secret values
             if user_config is not None:
                 merged.update(user_config)

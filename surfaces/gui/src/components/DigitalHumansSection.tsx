@@ -18,10 +18,9 @@ import { useT } from "../i18n/I18nProvider";
 import { GRP, GRP_H, ROW, PILL_ACCENT, PILL_LINE, TAG_ACCENT, TAG_QUIET, TAG_WARN, CHIP_OFF } from "./connectors/ui";
 import { DhpSourcesSection } from "./DhpSourcesSection";
 import { DhEditPanel } from "./dh-edit/DhEditPanel";
+import { ConfigFieldInput } from "./dh-edit/ConfigFieldInput";
+import { evalCondition } from "./dh-edit/cond";
 
-const INPUT =
-  "px-3 py-1.5 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent w-full";
-const LABEL = "text-[12px] font-medium text-muted mb-1 block";
 const SEARCH_INPUT =
   "w-full px-3 py-2 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent";
 const SCROLL = "overflow-y-auto";
@@ -36,6 +35,15 @@ function defaultFor(f: ConfigField): unknown {
       return "";
     case "boolean":
       return false;
+    case "stringList":
+    case "urlList":
+      return [];
+    case "keyvalue":
+      return [];
+    case "json":
+      return "";
+    case "select":
+      return f.multiple ? [] : "";
     default:
       return "";
   }
@@ -297,7 +305,9 @@ export function DigitalHumansSection() {
               {detail.spec.config_schema.length > 0 && (
                 <>
                   <div className="text-[12px] font-semibold text-muted mb-2">{t("digital.config_title")}</div>
-                  {detail.spec.config_schema.map((f) => (
+                  {detail.spec.config_schema
+                    .filter((f) => evalCondition(f.visible_if, config))
+                    .map((f) => (
                     <ConfigFieldInput key={f.key} f={f} value={config[f.key]} onChange={(v) => setField(f.key, v)} t={t} />
                   ))}
                 </>
@@ -359,85 +369,3 @@ export function DigitalHumansSection() {
   );
 }
 
-// 单个 config_schema 字段的动态表单控件。
-function ConfigFieldInput({
-  f,
-  value,
-  onChange,
-  t,
-}: {
-  f: ConfigField;
-  value: unknown;
-  onChange: (v: unknown) => void;
-  t: (k: string) => string;
-}) {
-  const isSecret = f.secret;
-  const required = f.required;
-  const labelSuffix = required ? " *" : "";
-
-  let control: React.ReactNode;
-  if (f.type === "boolean") {
-    control = (
-      <label className="flex items-center gap-2 text-[13px] text-ink cursor-pointer">
-        <input
-          type="checkbox"
-          checked={Boolean(value)}
-          onChange={(e) => onChange(e.target.checked)}
-        />
-        {f.description || t("digital.field_boolean_hint")}
-      </label>
-    );
-  } else if (f.type === "select") {
-    control = (
-      <select
-        className={INPUT}
-        value={String(value ?? "")}
-        onChange={(e) => onChange(e.target.value)}
-      >
-        {!f.options?.some((o) => String(o.value) === String(value)) && (
-          <option value="">{t("digital.field_select_placeholder")}</option>
-        )}
-        {f.options?.map((o) => (
-          <option key={String(o.value)} value={String(o.value)}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    );
-  } else if (f.type === "text") {
-    control = (
-      <textarea
-        className={INPUT + " min-h-[60px] resize-y"}
-        placeholder={f.placeholder}
-        value={String(value ?? "")}
-        spellCheck={false}
-        onChange={(e) => onChange(e.target.value)}
-      />
-    );
-  } else {
-    control = (
-      <input
-        className={INPUT}
-        type={isSecret ? "password" : f.type === "number" ? "number" : f.type === "email" ? "email" : f.type === "url" ? "url" : "text"}
-        placeholder={f.placeholder}
-        value={String(value ?? "")}
-        spellCheck={false}
-        onChange={(e) => onChange(f.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value)}
-      />
-    );
-  }
-
-  return (
-    <div className="mb-2.5">
-      <label className={LABEL}>
-        {f.label}
-        {labelSuffix}
-        {isSecret && <span className="text-faint ml-1">· {t("digital.field_secret")}</span>}
-      </label>
-      {control}
-      {f.description && f.type !== "boolean" && (
-        <div className="text-[11px] text-faint mt-0.5">{f.description}</div>
-      )}
-    </div>
-  );
-}

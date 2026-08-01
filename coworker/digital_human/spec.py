@@ -24,7 +24,18 @@ import yaml
 # -- enums / constants --------------------------------------------------------
 
 APP_TYPES = ("automation", "skill", "mcp", "extension")
-INPUT_TYPES = ("string", "text", "number", "boolean", "url", "email", "select")
+# Input types for config_schema. The first 7 are the original DHP set; the rest extend the form
+# editor to cover richer vertical scenarios (collectors, structured config, scheduling, etc.).
+#   json        — JSON code editor, syntax-validated at install time
+#   stringList  — editable list of strings (keywords, tags); value normalized to string[]
+#   urlList     — editable list of URLs (multi-page collectors); value normalized to string[]
+#   keyvalue    — editable key/value rows (headers, params); value normalized to [{key,value}]
+#   date        — date picker, value "YYYY-MM-DD"
+#   datetime    — datetime picker, value ISO 8601
+INPUT_TYPES = (
+    "string", "text", "number", "boolean", "url", "email", "select",
+    "json", "stringList", "urlList", "keyvalue", "date", "datetime",
+)
 SOURCE_TYPES = ("schedule", "file", "webhook", "webpage", "rss", "custom")
 FILTER_OPS = ("eq", "neq", "contains", "matches", "gt", "lt", "gte", "lte")
 
@@ -70,11 +81,23 @@ class ConfigField:
     default: Any = None
     placeholder: str = ""
     options: list[SelectOption] = field(default_factory=list)
+    # Explicit secret declaration. When True the value is routed to SecretStore regardless of key
+    # name. When False the is_secret heuristic on the key name still applies (backward compat).
+    secret: bool = False
+    # select only: when True the control is multi-select and userConfig stores an array.
+    multiple: bool = False
+    # number only: range constraints.
+    min: Optional[float] = None
+    max: Optional[float] = None
+    step: Optional[float] = None
+    # Conditional display expression, e.g. 'channel == "webhook"'. The form editor evaluates this
+    # against the current userConfig and hides the field when it resolves falsey. See app-spec.md §4.
+    visible_if: str = ""
 
     @property
     def is_secret(self) -> bool:
         """Whether a user value for this field should be stored in SecretStore."""
-        return bool(_SECRET_KEY_RE.search(self.key))
+        return self.secret or bool(_SECRET_KEY_RE.search(self.key))
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -91,6 +114,18 @@ class ConfigField:
             d["placeholder"] = self.placeholder
         if self.options:
             d["options"] = [o.to_dict() for o in self.options]
+        if self.secret:
+            d["secret"] = True
+        if self.multiple:
+            d["multiple"] = True
+        if self.min is not None:
+            d["min"] = self.min
+        if self.max is not None:
+            d["max"] = self.max
+        if self.step is not None:
+            d["step"] = self.step
+        if self.visible_if:
+            d["visible_if"] = self.visible_if
         d["secret"] = self.is_secret
         return d
 
@@ -308,6 +343,27 @@ def _parse_options(raw: Any, ctx: str) -> list[SelectOption]:
     return out
 
 
+def _opt_float(val: Any, name: str, ctx: str) -> Optional[float]:
+    """Coerce an optional numeric constraint (min/max/step) to float, or None if absent."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        raise SpecError(f"{ctx}: `{name}` must be a number, got {val!r}")
+
+
+# Case-insensitive lookup for INPUT_TYPES, returning the canonical (exact-case) name. Accepts
+# ``stringlist``, ``StringList``, ``STRINGLIST`` etc. and returns ``"stringList"``.
+_INPUT_TYPE_LUT = {t.lower(): t for t in INPUT_TYPES}
+
+
+def _canonical_input_type(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    return _INPUT_TYPE_LUT.get(raw.strip().lower())
+
+
 def _parse_config_schema(raw: Any, slug_hint: str) -> list[ConfigField]:
     fields: list[ConfigField] = []
     for i, item in enumerate(_as_dict_list(raw, f"spec {slug_hint!r}: config_schema")):
@@ -318,13 +374,22 @@ def _parse_config_schema(raw: Any, slug_hint: str) -> list[ConfigField]:
         label = str(item.get("label") or "").strip()
         if not label:
             raise SpecError(f"{ctx}: missing `label`")
-        ftype = str(item.get("type") or "").strip().lower()
-        if ftype not in INPUT_TYPES:
+        ftype_raw = str(item.get("type") or "").strip()
+        ftype = _canonical_input_type(ftype_raw)
+        if ftype is None:
             raise SpecError(
-                f"{ctx}: type {ftype!r} is not one of {list(INPUT_TYPES)}"
+                f"{ctx}: type {ftype_raw!r} is not one of {list(INPUT_TYPES)}"
             )
         if ftype == "select" and not item.get("options"):
             raise SpecError(f"{ctx}: type `select` requires `options`")
+        # number range constraints — coerce to float if present.
+        min_v = _opt_float(item.get("min"), "min", ctx)
+        max_v = _opt_float(item.get("max"), "max", ctx)
+        step_v = _opt_float(item.get("step"), "step", ctx)
+        if ftype != "number" and (min_v is not None or max_v is not None or step_v is not None):
+            raise SpecError(f"{ctx}: min/max/step are only valid for type `number`")
+        if ftype != "select" and item.get("multiple"):
+            raise SpecError(f"{ctx}: `multiple` is only valid for type `select`")
         fields.append(
             ConfigField(
                 key=key,
@@ -335,6 +400,12 @@ def _parse_config_schema(raw: Any, slug_hint: str) -> list[ConfigField]:
                 default=item.get("default"),
                 placeholder=str(item.get("placeholder", "")).strip(),
                 options=_parse_options(item.get("options"), ctx),
+                secret=bool(item.get("secret", False)),
+                multiple=bool(item.get("multiple", False)),
+                min=min_v,
+                max=max_v,
+                step=step_v,
+                visible_if=str(item.get("visible_if", "") or "").strip(),
             )
         )
     # Duplicate keys confuse userConfig injection — reject.
@@ -344,6 +415,20 @@ def _parse_config_schema(raw: Any, slug_hint: str) -> list[ConfigField]:
             raise SpecError(f"spec {slug_hint!r}: duplicate config_schema key {f.key!r}")
         seen.add(f.key)
     return fields
+
+
+def apply_schema_override(spec: "DigitalHumanSpec", override_raw: Any, slug_hint: str) -> None:
+    """Replace ``spec.config_schema`` with a parsed override, in place.
+
+    The manager re-fetches the spec from the remote registry on every update, so schema edits made
+    in the form editor cannot live on the spec itself — they are stored on the instance as a raw
+    list-of-dicts override and re-applied here whenever the spec is loaded. ``override_raw`` is the
+    same shape as the ``config_schema`` YAML node. An empty/None override is a no-op. A malformed
+    override raises :class:`SpecError` so the caller surfaces invalid edits.
+    """
+    if not override_raw:
+        return
+    spec.config_schema = _parse_config_schema(override_raw, slug_hint)
 
 
 def _every_to_cron(every: str, slug_hint: str) -> str:

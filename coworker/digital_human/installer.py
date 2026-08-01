@@ -107,8 +107,10 @@ def reinstall_instructions(
 
 
 def validate_config(spec: DigitalHumanSpec, config: dict[str, Any]) -> list[str]:
-    """Return a list of missing-required config keys (empty = valid). Also coerces types where
-    possible (number/boolean) and fills defaults — mutates ``config`` in place."""
+    """Return a list of missing-required config keys (empty = valid). Also coerces/normalizes types
+    where possible (number/boolean/json/lists/keyvalue/date) and fills defaults — mutates ``config``
+    in place. For value-shape errors on present fields (bad JSON, bad date), the offending key is
+    added to the returned errors list."""
     errors: list[str] = []
     for f in spec.config_schema:
         val = config.get(f.key)
@@ -119,16 +121,137 @@ def validate_config(spec: DigitalHumanSpec, config: dict[str, Any]) -> list[str]
             if f.required:
                 errors.append(f.key)
             continue
-        # Coerce: DHP config values often arrive as strings from a form.
+        # Coerce/normalize: DHP config values often arrive as strings from a form.
         if f.type == "number":
             try:
-                config[f.key] = int(val) if str(val).isdigit() else float(val)
+                num = int(val) if isinstance(val, str) and val.strip().lstrip("-").isdigit() else float(val)
             except (TypeError, ValueError):
                 errors.append(f.key)
+                continue
+            if f.min is not None and num < f.min:
+                errors.append(f.key)
+                continue
+            if f.max is not None and num > f.max:
+                errors.append(f.key)
+                continue
+            config[f.key] = num
         elif f.type == "boolean":
             if isinstance(val, str):
                 config[f.key] = val.strip().lower() in ("1", "true", "yes", "on")
+        elif f.type == "json":
+            parsed = _parse_json_value(val, f.key)
+            if parsed is _JSON_ERR:
+                errors.append(f.key)
+            else:
+                config[f.key] = parsed
+        elif f.type in ("stringList", "urlList"):
+            arr = _normalize_string_list(val)
+            if arr is None:
+                errors.append(f.key)
+                continue
+            if f.type == "urlList" and not _all_urls(arr):
+                errors.append(f.key)
+                continue
+            config[f.key] = arr
+        elif f.type == "keyvalue":
+            kv = _normalize_keyvalue(val)
+            if kv is None:
+                errors.append(f.key)
+            else:
+                config[f.key] = kv
+        elif f.type == "date":
+            if not _is_date(str(val)):
+                errors.append(f.key)
+            else:
+                config[f.key] = str(val).strip()
+        elif f.type == "datetime":
+            if not _is_datetime(str(val)):
+                errors.append(f.key)
+            else:
+                config[f.key] = str(val).strip()
+        elif f.type == "select" and f.multiple:
+            # Multi-select: normalize to a list and validate every value is a known option.
+            arr = _normalize_string_list(val)
+            if arr is None:
+                errors.append(f.key)
+                continue
+            allowed = {o.value for o in f.options}
+            if any(v not in allowed for v in arr):
+                errors.append(f.key)
+                continue
+            config[f.key] = arr
     return errors
+
+
+# Sentinel for JSON parse failure (distinct from a legitimately-parsed None).
+_JSON_ERR = object()
+
+
+def _parse_json_value(val: Any, key: str) -> Any:
+    """Parse a JSON config value. Accepts already-parsed objects/arrays, or a JSON string."""
+    if isinstance(val, (dict, list)):
+        return val
+    try:
+        return json.loads(val)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _JSON_ERR
+
+
+def _normalize_string_list(val: Any) -> Optional[list[str]]:
+    """Coerce a list-ish value to list[str]. Accepts a list, or a string split on newlines/commas."""
+    if isinstance(val, list):
+        return [str(v) for v in val]
+    if isinstance(val, str):
+        # Split on newlines first, then commas, drop empties.
+        parts: list[str] = []
+        for line in val.splitlines():
+            for chunk in line.split(","):
+                chunk = chunk.strip()
+                if chunk:
+                    parts.append(chunk)
+        return parts
+    return None
+
+
+def _all_urls(arr: list[str]) -> bool:
+    """Cheap URL check: must start with http:// or https://."""
+    return all(s.lower().startswith(("http://", "https://")) for s in arr)
+
+
+def _normalize_keyvalue(val: Any) -> Optional[list[dict[str, Any]]]:
+    """Coerce a keyvalue field to a list of {key, value} dicts.
+
+    Accepts an object {k: v} → [{key: k, value: v}], or a list of {key, value}/{k, v} dicts.
+    """
+    if isinstance(val, dict):
+        return [{"key": str(k), "value": v} for k, v in val.items()]
+    if isinstance(val, list):
+        out: list[dict[str, Any]] = []
+        for item in val:
+            if not isinstance(item, dict):
+                return None
+            k = item.get("key", item.get("k"))
+            v = item.get("value", item.get("v"))
+            if k is None:
+                return None
+            out.append({"key": str(k), "value": v})
+        return out
+    return None
+
+
+def _is_date(s: str) -> bool:
+    """YYYY-MM-DD format check (does not validate calendar correctness beyond shape)."""
+    import re
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", s.strip()))
+
+
+def _is_datetime(s: str) -> bool:
+    """ISO 8601 datetime shape check (e.g. 2026-08-01T14:30:00 or with offset/Z)."""
+    import re
+    return bool(re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?",
+        s.strip(),
+    ))
 
 
 def split_config(

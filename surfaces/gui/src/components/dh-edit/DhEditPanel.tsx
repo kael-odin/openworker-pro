@@ -15,6 +15,7 @@ import {
   getPluginSources,
   installPlugin,
   type DepHealthItem,
+  type ConfigField,
   type DigitalHumanInstance,
   type DigitalHumanDetail,
   type LoginHealthItem,
@@ -60,6 +61,10 @@ export function DhEditPanel({
   const [notifyChannels, setNotifyChannels] = useState<string[]>(instance.task?.notify_channels || []);
   const [notifyLevel, setNotifyLevel] = useState(instance.task?.notify_level || "important");
   const [enabled, setEnabled] = useState(instance.task?.enabled ?? true);
+  // Local editable copy of config_schema. Seeded from the spec (which the backend already
+  // resolves through any instance-level override), patched in place by the form editor, and
+  // persisted via PATCH { config_schema } → instance.config_schema_override.
+  const [schema, setSchema] = useState<ConfigField[]>(detail?.spec?.config_schema || []);
 
   useEffect(() => {
     setLoading(true);
@@ -68,6 +73,7 @@ export function DhEditPanel({
         if (d.ok) {
           setDetail(d);
           setSystemPrompt(d.spec.system_prompt);
+          setSchema(d.spec.config_schema);
           // seed userConfig with defaults from spec for any missing keys
           const seeded = { ...instance.config };
           for (const f of d.spec.config_schema) {
@@ -347,9 +353,14 @@ export function DhEditPanel({
 
       {/* 8. 配置 */}
       <DhConfigBlock
-        schema={sp.config_schema}
+        schema={schema}
         config={userConfig}
         onChange={(cfg) => { setUserConfig(cfg); save({ user_config: cfg }); }}
+        editable
+        onSchemaChange={(s) => {
+          setSchema(s);
+          save({ config_schema: s });
+        }}
       />
 
       {/* 9. 开发者（SystemPromptEditor 核心改进） */}
