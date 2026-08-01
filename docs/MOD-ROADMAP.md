@@ -30,7 +30,7 @@
 
 ## DHP 协议关键事实（功能 3 的基石）
 
-- 仓库 `openkursar/digital-human-protocol`，CC0 协议规范 + MIT 示例。
+- 仓库 `openkursar/digital-human-protocol`（上游），openworker-pro 预置全量汉化 fork `kael-odin/digital-human-protocol-zh`，CC0 协议规范 + MIT 示例。
 - 数字人定义在 `spec.yaml`：`spec_version/name/version/author/type/icon/system_prompt/requires.mcps/subscriptions/config_schema/output.notify/store/memory_schema`。
 - **与 openworker `personas/*.md` 同构**：都是 frontmatter(YAML) + system_prompt。字段可直接映射。
 - 注册表 `index.json`：每个数字人有 `slug/name/version/path/checksum/category/tags/i18n/min_app_version`。
@@ -177,7 +177,10 @@
   - 通知渠道：`src/main/services/notify-channels/`
   - IM：`src/main/apps/runtime/im-channels/`
   - 远程：`src/main/services/remote/`
-- DHP 协议：`https://github.com/openkursar/digital-human-protocol`
+- DHP 协议（上游）：`https://github.com/openkursar/digital-human-protocol`
+  - **openworker-pro 预置源（全量汉化 fork）：** `https://github.com/kael-odin/digital-human-protocol-zh`
+    - index.json：`https://kael-odin.github.io/digital-human-protocol-zh/index.json`
+    - 由 `coworker/digital_human/store.py` 的 `OFFICIAL_INDEX_URL` + `sources.py` 的 `BUILTIN_SOURCES` 预置
   - 规范：`spec/app-spec.md`、`spec/package-format.md`、`spec/registry-protocol.md`
   - 注册表：`index.json`
   - 数字人包：`packages/digital-humans/`

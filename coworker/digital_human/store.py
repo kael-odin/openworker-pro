@@ -22,7 +22,9 @@ from typing import Any, Optional
 from .spec import DigitalHumanSpec, SpecError, load_spec_file
 
 # The official DHP registry index, served via GitHub Pages.
-OFFICIAL_INDEX_URL = "https://openkursar.github.io/digital-human-protocol/index.json"
+# Points to the fully-localized Chinese fork (kael-odin/digital-human-protocol-zh) so the preset
+# store shows Chinese names/descriptions out of the box.
+OFFICIAL_INDEX_URL = "https://kael-odin.github.io/digital-human-protocol-zh/index.json"
 
 # Categories per spec/categories.md — used for grouping in the store UI. Free-form categories from
 # the index are preserved; this list drives the canonical group order.

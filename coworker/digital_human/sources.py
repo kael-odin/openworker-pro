@@ -54,10 +54,11 @@ class RegistrySource:
 
 # The official DHP registry index, served via GitHub Pages. Re-asserted on every startup so the
 # store is never empty even with no user configuration — this fixes the empty-store bug at its root.
+# Points to the fully-localized Chinese fork so preset agents show Chinese names by default.
 BUILTIN_SOURCES: list[RegistrySource] = [
     RegistrySource(
         id="dhp-official",
-        name="数字人协议（官方）",
+        name="数字人市场（官方）",
         url=OFFICIAL_INDEX_URL,
         enabled=True,
         is_default=True,
