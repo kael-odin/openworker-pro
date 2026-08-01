@@ -219,6 +219,198 @@ def test_secret_field_heuristic():
     assert keys["normal_field"] is False
 
 
+# -- extended input types + override (13-type system) ------------------------
+
+
+_BASE_SPEC = (
+    "name: x\nversion: '1'\nauthor: a\ndescription: d\ntype: skill\nsystem_prompt: y\n"
+)
+
+
+def test_all_13_input_types_parse():
+    """parse_spec accepts every InputType, and new ConfigField attrs round-trip."""
+    from coworker.digital_human.spec import INPUT_TYPES
+    assert len(INPUT_TYPES) == 13
+    s = parse_spec(
+        _BASE_SPEC + "config_schema:\n"
+        "  - {key: s, label: S, type: string}\n"
+        "  - {key: t, label: T, type: text}\n"
+        "  - {key: n, label: N, type: number, min: 0, max: 100, step: 5, default: 50}\n"
+        "  - {key: b, label: B, type: boolean, default: false}\n"
+        "  - {key: u, label: U, type: url}\n"
+        "  - {key: e, label: E, type: email}\n"
+        "  - {key: sl, label: SL, type: select, options: [{label: A, value: a}]}\n"
+        "  - {key: js, label: JS, type: json, default: '{}'}\n"
+        "  - {key: strlist, label: SL2, type: stringList}\n"
+        "  - {key: urllist, label: UL, type: urlList}\n"
+        "  - {key: kv, label: KV, type: keyvalue}\n"
+        "  - {key: d, label: D, type: date}\n"
+        "  - {key: dt, label: DT, type: datetime}\n"
+    )
+    assert len(s.config_schema) == 13
+    types = [f.type for f in s.config_schema]
+    assert types == list(INPUT_TYPES)
+    # number constraints
+    n = s.config_schema[2]
+    assert n.min == 0.0 and n.max == 100.0 and n.step == 5.0 and n.default == 50
+    # to_dict serializes the new fields
+    d = n.to_dict()
+    assert d["min"] == 0.0 and d["max"] == 100.0 and d["step"] == 5.0
+
+
+def test_type_match_is_case_insensitive():
+    """stringList / stringlist / STRINGLIST all resolve to the canonical name."""
+    s = parse_spec(
+        _BASE_SPEC + "config_schema:\n"
+        "  - {key: a, label: A, type: stringlist}\n"
+        "  - {key: b, label: B, type: URLList}\n"
+    )
+    assert s.config_schema[0].type == "stringList"
+    assert s.config_schema[1].type == "urlList"
+
+
+def test_number_constraints_only_valid_on_number():
+    with pytest.raises(SpecError, match="min/max/step are only valid for type `number`"):
+        parse_spec(_BASE_SPEC + "config_schema:\n  - {key: s, label: S, type: string, min: 0}\n")
+
+
+def test_multiple_only_valid_on_select():
+    with pytest.raises(SpecError, match="`multiple` is only valid for type `select`"):
+        parse_spec(_BASE_SPEC + "config_schema:\n  - {key: s, label: S, type: string, multiple: true}\n")
+
+
+def test_explicit_secret_flag_overrides_heuristic():
+    """A field with secret: true is secret regardless of key name."""
+    from coworker.digital_human.spec import _SECRET_KEY_RE
+    s = parse_spec(
+        _BASE_SPEC + "config_schema:\n"
+        "  - {key: normal_name, label: N, type: string, secret: true}\n"
+    )
+    f = s.config_schema[0]
+    # heuristic alone would say False (no credential-ish keyword in "normal_name")
+    assert not _SECRET_KEY_RE.search("normal_name")
+    assert f.is_secret is True  # explicit flag wins
+    assert f.to_dict()["secret"] is True
+
+
+def test_validate_config_json_parses():
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: js, label: JS, type: json}\n")
+    cfg = {"js": '{"k": 1}'}
+    errs = validate_config(s, cfg)
+    assert errs == []
+    assert cfg["js"] == {"k": 1}
+
+
+def test_validate_config_json_invalid_reports_error():
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: js, label: JS, type: json}\n")
+    cfg = {"js": "{not valid"}
+    errs = validate_config(s, cfg)
+    assert "js" in errs
+
+
+def test_validate_config_stringlist_normalizes_string_to_array():
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: tags, label: T, type: stringList}\n")
+    cfg = {"tags": "alpha, beta\ngamma"}
+    errs = validate_config(s, cfg)
+    assert errs == []
+    assert cfg["tags"] == ["alpha", "beta", "gamma"]
+
+
+def test_validate_config_urllist_rejects_non_http():
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: urls, label: U, type: urlList}\n")
+    cfg = {"urls": ["https://ok.com", "ftp://bad"]}
+    errs = validate_config(s, cfg)
+    assert "urls" in errs
+
+
+def test_validate_config_keyvalue_normalizes_object():
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: h, label: H, type: keyvalue}\n")
+    cfg = {"h": {"X-Key": "val", "Y": "2"}}
+    errs = validate_config(s, cfg)
+    assert errs == []
+    assert cfg["h"] == [{"key": "X-Key", "value": "val"}, {"key": "Y", "value": "2"}]
+
+
+def test_validate_config_date_and_datetime():
+    s = parse_spec(
+        _BASE_SPEC + "config_schema:\n"
+        "  - {key: d, label: D, type: date}\n"
+        "  - {key: dt, label: DT, type: datetime}\n"
+    )
+    # valid
+    cfg = {"d": "2026-08-01", "dt": "2026-08-01T10:00:00Z"}
+    assert validate_config(s, cfg) == []
+    # invalid date
+    cfg2 = {"d": "08/01/2026", "dt": "2026-08-01T10:00:00Z"}
+    assert "d" in validate_config(s, cfg2)
+    # invalid datetime
+    cfg3 = {"d": "2026-08-01", "dt": "yesterday"}
+    assert "dt" in validate_config(s, cfg3)
+
+
+def test_validate_config_number_min_max():
+    s = parse_spec(
+        _BASE_SPEC + "config_schema:\n  - {key: n, label: N, type: number, min: 1, max: 10}\n"
+    )
+    assert validate_config(s, {"n": 5}) == []
+    assert "n" in validate_config(s, {"n": 0})   # below min
+    assert "n" in validate_config(s, {"n": 11})  # above max
+
+
+def test_validate_config_select_multiple_validates_each():
+    s = parse_spec(
+        _BASE_SPEC + "config_schema:\n"
+        "  - {key: sev, label: S, type: select, multiple: true,\n"
+        "     options: [{label: H, value: high}, {label: L, value: low}]}\n"
+    )
+    assert validate_config(s, {"sev": "high, low"}) == []  # string normalizes + validates
+    assert "sev" in validate_config(s, {"sev": "high, bogus"})  # bogus not in options
+
+
+def test_apply_schema_override_replaces_schema():
+    from coworker.digital_human.spec import apply_schema_override
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: a, label: A, type: string}\n")
+    assert len(s.config_schema) == 1
+    apply_schema_override(s, [{"key": "b", "label": "B", "type": "json"}], "x")
+    assert len(s.config_schema) == 1
+    assert s.config_schema[0].key == "b" and s.config_schema[0].type == "json"
+
+
+def test_apply_schema_override_empty_is_noop():
+    from coworker.digital_human.spec import apply_schema_override
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: a, label: A, type: string}\n")
+    before = list(s.config_schema)
+    apply_schema_override(s, [], "x")
+    assert s.config_schema == before
+    apply_schema_override(s, None, "x")
+    assert s.config_schema == before
+
+
+def test_apply_schema_override_rejects_bad_shape():
+    from coworker.digital_human.spec import apply_schema_override
+    s = parse_spec(_BASE_SPEC + "config_schema:\n  - {key: a, label: A, type: string}\n")
+    with pytest.raises(SpecError, match="duplicate config_schema key"):
+        apply_schema_override(s, [
+            {"key": "dup", "label": "D", "type": "string"},
+            {"key": "dup", "label": "D2", "type": "string"},
+        ], "x")
+
+
+def test_instance_config_schema_override_round_trip():
+    inst = DigitalHumanInstance(id="dh-x", slug="s", name="n", task_id="t")
+    inst.config_schema_override = [{"key": "o", "label": "O", "type": "json"}]
+    d = inst.to_dict()
+    assert d["config_schema_override"] == [{"key": "o", "label": "O", "type": "json"}]
+    inst2 = DigitalHumanInstance.from_dict(d)
+    assert inst2.config_schema_override == inst.config_schema_override
+
+
+def test_legacy_instance_has_empty_override():
+    d = {"id": "x", "slug": "s", "name": "n", "task_id": "t"}
+    inst = DigitalHumanInstance.from_dict(d)
+    assert inst.config_schema_override == []
+
+
 # -- legacy aliases + shorthand + unknown fields ------------------------------
 
 

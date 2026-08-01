@@ -7,7 +7,7 @@
 // List-type fields (stringList/urlList/keyvalue) share a ListEditor subcomponent that supports
 // add/remove/reorder of rows. visible_if conditional display is evaluated by the caller before
 // mapping (see evalCondition in cond.ts); this component only renders a field it's given.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ConfigField, SelectOption } from "../../api";
 import type { TFunc } from "../../i18n/I18nProvider";
 
@@ -185,6 +185,16 @@ function JsonEditor({
     typeof value === "string" ? value : value === undefined || value === null ? "" : JSON.stringify(value, null, 2),
   );
   const [err, setErr] = useState<string | null>(null);
+
+  // Sync from parent value when it changes externally (e.g. async detail load fills defaults
+  // after mount). Only re-sync when the parent's value differs from what we'd serialize — avoids
+  // clobbering in-progress edits on every keystroke (which doesn't change the parent value).
+  useEffect(() => {
+    const expected = typeof value === "string" ? value : value === undefined || value === null ? "" : JSON.stringify(value, null, 2);
+    if (expected !== text && !err) {
+      setText(expected);
+    }
+  }, [value]);
 
   const validate = (raw: string) => {
     if (raw.trim() === "") {
