@@ -7,12 +7,14 @@ import {
   getDigitalHumans,
   getDigitalHuman,
   installDigitalHuman,
+  preflightDigitalHuman,
   getDigitalHumanInstances,
   uninstallDigitalHuman,
   type DigitalHumanEntry,
   type DigitalHumanDetail,
   type DigitalHumanInstance,
   type ConfigField,
+  type DhpPreflight,
 } from "../api";
 import { useT } from "../i18n/I18nProvider";
 import { GRP, GRP_H, ROW, PILL_ACCENT, PILL_LINE, TAG_ACCENT, TAG_QUIET, TAG_WARN, CHIP_OFF } from "./connectors/ui";
@@ -55,6 +57,16 @@ function seedConfig(fields: ConfigField[]): Record<string, unknown> {
   return cfg;
 }
 
+// 依赖清单的一行：label + 逗号分隔的 id 列表（preflight manifest 确认步骤用）。
+function ManifestRow({ label, items }: { label: string; items: string[] }) {
+  return (
+    <div className="flex gap-2 text-[11px]">
+      <span className="text-muted shrink-0">{label}:</span>
+      <span className="text-ink">{items.join(", ")}</span>
+    </div>
+  );
+}
+
 export function DigitalHumansSection() {
   const { t } = useT();
   const [humans, setHumans] = useState<DigitalHumanEntry[]>([]);
@@ -66,6 +78,8 @@ export function DigitalHumansSection() {
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [installing, setInstalling] = useState(false);
   const [installMsg, setInstallMsg] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [preflight, setPreflight] = useState<DhpPreflight | null>(null);
+  const [mcpAck, setMcpAck] = useState(false);
   const [instances, setInstances] = useState<DigitalHumanInstance[]>([]);
   const [editing, setEditing] = useState<DigitalHumanInstance | null>(null);
 
@@ -169,16 +183,49 @@ export function DigitalHumansSection() {
     setInstalling(true);
     setInstallMsg(null);
     try {
-      const res = await installDigitalHuman(detail.entry.slug, config);
+      // Preflight: compute the dependency manifest + approval digest. The server
+      // requires the digest back at install time so a spec that changed between
+      // the user viewing the manifest and clicking install is caught.
+      const pre = await preflightDigitalHuman(detail.entry.slug, config);
+      if (!pre.ok || !pre.manifest || !pre.approval_digest) {
+        setInstallMsg({ ok: false, msg: pre.error || t("digital.install_fail") });
+        return;
+      }
+      setPreflight(pre);
+      setMcpAck(false);
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const confirmInstall = async () => {
+    if (!detail || !preflight?.approval_digest) return;
+    setInstalling(true);
+    try {
+      const res = await installDigitalHuman(detail.entry.slug, config, {
+        approval_digest: preflight.approval_digest,
+        mcp_confirmed: mcpAck || !preflight.mcp_confirmation_required?.length,
+      });
       if (res.ok) {
         setInstallMsg({ ok: true, msg: t("digital.install_ok") });
+        setPreflight(null);
         reload();
       } else {
+        // A digest mismatch means the spec changed since preflight — re-run preflight
+        // so the user re-reviews the new manifest. Surface the error inline too.
         setInstallMsg({ ok: false, msg: res.error || t("digital.install_fail") });
+        if (res.error && /changed|re-approve|manifest/i.test(res.error)) {
+          setPreflight(null);
+        }
       }
     } finally {
       setInstalling(false);
     }
+  };
+
+  const cancelPreflight = () => {
+    setPreflight(null);
+    setMcpAck(false);
   };
 
   const uninstall = async (instanceId: string) => {
@@ -319,11 +366,63 @@ export function DigitalHumansSection() {
                 </div>
               )}
 
-              <div className="flex gap-2 mt-3">
-                <button className={PILL_ACCENT} onClick={install} disabled={installing}>
-                  {installing ? t("digital.installing") : t("digital.install_btn")}
-                </button>
-              </div>
+              {preflight && preflight.manifest ? (
+                <div className="mt-3 rounded-lg border border-line bg-paperSoft p-3 space-y-2">
+                  <div className="text-[12px] font-semibold text-ink">{t("digital.manifest_title")}</div>
+                  <div className="text-[11px] text-muted">
+                    {t("digital.manifest_version")}: {preflight.manifest.version}
+                    {preflight.manifest.source ? ` · ${preflight.manifest.source}` : ""}
+                  </div>
+                  {preflight.manifest.requires_plugins.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_plugins")} items={preflight.manifest.requires_plugins.map((p) => `${p.id}${p.bundled ? " (bundled)" : ""}`)} />
+                  )}
+                  {preflight.manifest.requires_mcps.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_mcps")} items={preflight.manifest.requires_mcps.map((m) => m.id)} />
+                  )}
+                  {preflight.manifest.requires_skills.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_skills")} items={preflight.manifest.requires_skills.map((s) => s.id)} />
+                  )}
+                  {preflight.manifest.requires_commands.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_commands")} items={preflight.manifest.requires_commands.map((c) => c.id)} />
+                  )}
+                  {preflight.manifest.requires_subagents.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_subagents")} items={preflight.manifest.requires_subagents.map((s) => s.id)} />
+                  )}
+                  {preflight.manifest.permissions.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_permissions")} items={preflight.manifest.permissions} />
+                  )}
+                  {preflight.manifest.config_secret_keys.length > 0 && (
+                    <ManifestRow label={t("digital.manifest_secrets")} items={preflight.manifest.config_secret_keys} />
+                  )}
+                  {preflight.mcp_confirmation_required && preflight.mcp_confirmation_required.length > 0 && (
+                    <label className="flex items-start gap-2 text-[11px] text-ink mt-1">
+                      <input type="checkbox" checked={mcpAck} onChange={(e) => setMcpAck(e.target.checked)} className="mt-0.5" />
+                      <span>
+                        {t("digital.manifest_mcp_ack")}
+                        <span className="text-muted"> ({preflight.mcp_confirmation_required.join(", ")})</span>
+                      </span>
+                    </label>
+                  )}
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      className={PILL_ACCENT}
+                      onClick={confirmInstall}
+                      disabled={installing || (!!preflight.mcp_confirmation_required?.length && !mcpAck)}
+                    >
+                      {installing ? t("digital.installing") : t("digital.manifest_confirm")}
+                    </button>
+                    <button className={PILL_LINE} onClick={cancelPreflight} disabled={installing}>
+                      {t("digital.manifest_cancel")}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-2 mt-3">
+                  <button className={PILL_ACCENT} onClick={install} disabled={installing}>
+                    {installing ? t("digital.installing") : t("digital.install_btn")}
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>

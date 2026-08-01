@@ -2941,14 +2941,53 @@ export async function getDigitalHuman(slug: string): Promise<DigitalHumanDetail>
   return res.json();
 }
 
-export async function installDigitalHuman(
+export interface DhpManifest {
+  source: string;
+  version: string;
+  spec_version: string;
+  requires_plugins: { id: string; reason: string; bundled: boolean }[];
+  requires_mcps: { id: string; reason: string; bundled: boolean }[];
+  requires_skills: { id: string; reason: string; bundled: boolean }[];
+  requires_commands: { id: string; reason: string; bundled: boolean }[];
+  requires_subagents: { id: string; reason: string; bundled: boolean }[];
+  permissions: string[];
+  browser_login: string[];
+  config_secret_keys: string[];
+}
+
+export interface DhpPreflight {
+  ok: boolean;
+  error?: string;
+  manifest?: DhpManifest;
+  approval_digest?: string;
+  mcp_confirmation_required?: string[];
+  missing_required_config?: string[];
+}
+
+export async function preflightDigitalHuman(
   slug: string,
   config: Record<string, unknown>,
-): Promise<{ ok: boolean; error?: string; instance?: DigitalHumanInstance; task?: unknown }> {
-  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}/install`, {
+): Promise<DhpPreflight> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}/preflight`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config }),
+  });
+  return res.json();
+}
+
+export async function installDigitalHuman(
+  slug: string,
+  config: Record<string, unknown>,
+  opts?: { approval_digest?: string; mcp_confirmed?: boolean },
+): Promise<{ ok: boolean; error?: string; instance?: DigitalHumanInstance; task?: unknown }> {
+  const body: Record<string, unknown> = { config };
+  if (opts?.approval_digest) body.approval_digest = opts.approval_digest;
+  if (opts?.mcp_confirmed) body.mcp_confirmed = true;
+  const res = await fetch(`${httpBase()}/v1/digital-humans/${encodeURIComponent(slug)}/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
   return res.json();
 }

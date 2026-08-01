@@ -4340,10 +4340,10 @@ class SessionManager:
         by_name = {m.get("name"): m for m in self.list_mcp()}
         out = []
         for dep in spec.requires_mcps:
-            m = by_name.get(dep.name)
+            m = by_name.get(dep.id)
             out.append(
                 {
-                    "name": dep.name,
+                    "name": dep.id,
                     "reason": dep.reason,
                     "configured": m is not None,
                     "status": (m or {}).get("status", "missing"),

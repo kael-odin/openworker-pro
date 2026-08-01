@@ -20,6 +20,24 @@ import struct
 from typing import Optional
 
 
+def _aes():
+    """Lazy-load pycryptodome's AES module, raising ValueError (not ImportError) on miss.
+
+    pycryptodome is a ``messaging`` optional dependency; the inbound-callback callers
+    (provider.verify_and_decrypt) catch ``(ValueError, TypeError)``. Raising ValueError
+    keeps the "not installed" case inside the existing error path instead of bubbling an
+    unhandled ImportError that would crash the callback endpoint.
+    """
+    try:
+        from Crypto.Cipher import AES  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover - depends on optional dep
+        raise ValueError(
+            "pycryptodome 未安装：企微回调加解密需要它。"
+            "装 messaging 可选依赖：pip install '.[messaging]'"
+        ) from exc
+    return AES
+
+
 def _decode_aes_key(encoding_aes_key: str) -> bytes:
     """43 字符 base64 → 32 字节 AES key；非法编码一律拒绝。"""
     if not encoding_aes_key or len(encoding_aes_key) != 43:
@@ -99,7 +117,7 @@ def decrypt_message(
         raise ValueError("密文长度无效")
 
     # 延迟导入：pycryptodome 是 messaging 可选依赖，不装的用户走纯出站不会触发。
-    from Crypto.Cipher import AES
+    AES = _aes()
 
     cipher = AES.new(key, AES.MODE_CBC, iv)
     plain = cipher.decrypt(ciphertext)
@@ -163,7 +181,7 @@ def encrypt_message(
         pad_len = block
     plain += bytes([pad_len]) * pad_len
 
-    from Crypto.Cipher import AES
+    AES = _aes()
 
     cipher = AES.new(key, AES.MODE_CBC, iv)
     ciphertext = cipher.encrypt(plain)
