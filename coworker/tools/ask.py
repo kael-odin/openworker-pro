@@ -10,7 +10,7 @@ tool result. The callable here is only a schema carrier + a safe fallback.
 
 from __future__ import annotations
 
-from aisuite.agents import ToolMetadata, tool
+from ._aisuite_compat import ToolMetadata, tool
 
 
 def ask_user_tool() -> object:

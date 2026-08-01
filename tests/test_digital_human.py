@@ -1220,3 +1220,37 @@ def test_install_with_stale_digest_is_refused(tmp_path):
     result = SessionManager.install_digital_human(mgr, "news", {}, approval_digest="0" * 64)
     assert not result["ok"]
     assert "changed" in result["error"] or "re-approve" in result["error"]
+
+
+# -- aisuite.agents compatibility shim ---------------------------------------
+
+
+def test_aisuite_compat_shim_provides_tool_and_metadata():
+    """The shim exports ``tool`` + ``ToolMetadata`` whether or not the pinned aisuite commit is
+    installed. ``tool`` must attach ``__aisuite_tool_metadata__`` so the ToolRegistry can read it.
+    """
+    from coworker.tools._aisuite_compat import ToolMetadata, tool
+
+    meta = ToolMetadata(category="interaction", risk_level="low",
+                       capabilities=["x"], description="d")
+
+    @tool
+    def my_tool(question: str) -> dict:
+        return {"answer": ""}
+
+    tool_with_meta = tool(my_tool, metadata=meta)
+    # tool() returns the callable (registry calls it directly + reads __name__).
+    assert callable(tool_with_meta)
+    assert getattr(tool_with_meta, "__name__", None) == "my_tool"
+    # metadata attached so ToolRegistry.register can pick it up.
+    assert getattr(tool_with_meta, "__aisuite_tool_metadata__", None) is meta
+
+
+def test_aisuite_compat_shim_real_tools_still_importable():
+    """The shim does not break the real tool factories (ask/directories/plan) that depend on it."""
+    from coworker.tools.ask import ask_user_tool
+    from coworker.tools.directories import request_directory_tool
+    from coworker.tools.plan import propose_plan_tool
+    assert callable(ask_user_tool())
+    assert callable(request_directory_tool())
+    assert callable(propose_plan_tool())

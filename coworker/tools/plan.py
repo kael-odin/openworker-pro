@@ -10,7 +10,7 @@ for surfaces without an approver.
 
 from __future__ import annotations
 
-from aisuite.agents import ToolMetadata, tool
+from ._aisuite_compat import ToolMetadata, tool
 
 
 def propose_plan_tool() -> object:

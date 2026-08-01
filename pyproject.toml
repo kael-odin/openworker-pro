@@ -15,9 +15,13 @@ dependencies = [
     "textual>=1.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    # aisuite (toolkits/tracing), pinned to the commit this repo was imported from;
-    # swap for a PyPI pin ("aisuite>=x.y") once the next aisuite release ships.
-    "aisuite @ git+https://github.com/andrewyng/aisuite.git@1b4bbf303ec21968230b1ec869a144d054e9b3c4",
+    # aisuite (toolkits/tracing). Originally pinned to a git commit on andrewyng/aisuite that
+    # exposed an aisuite.agents submodule (tool decorator + ToolMetadata); that repo is no
+    # longer reachable and the commit was never published to PyPI. The PyPI release (0.1.14)
+    # restructured the package and dropped aisuite.agents. coworker/tools/_aisuite_compat.py
+    # bridges this: tries the real import, then falls back to a local equivalent, so either
+    # aisuite works. Install from PyPI if the pinned commit is unavailable.
+    "aisuite>=0.1.14",
     "docstring_parser",
     "pyyaml>=6",  # persona manifest frontmatter (YAML)
     "pydantic>=2",
