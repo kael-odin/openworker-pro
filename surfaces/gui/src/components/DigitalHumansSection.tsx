@@ -16,7 +16,7 @@ import {
   type ConfigField,
   type DhpPreflight,
 } from "../api";
-import { useT } from "../i18n/I18nProvider";
+import { useT, type TFunc } from "../i18n/I18nProvider";
 import { GRP, GRP_H, ROW, PILL_ACCENT, PILL_LINE, TAG_ACCENT, TAG_QUIET, TAG_WARN, CHIP_OFF } from "./connectors/ui";
 import { DhpSourcesSection } from "./DhpSourcesSection";
 import { DhEditPanel } from "./dh-edit/DhEditPanel";
@@ -63,6 +63,37 @@ function ManifestRow({ label, items }: { label: string; items: string[] }) {
     <div className="flex gap-2 text-[11px]">
       <span className="text-muted shrink-0">{label}:</span>
       <span className="text-ink">{items.join(", ")}</span>
+    </div>
+  );
+}
+
+// 软依赖清单的一行：每项带 configured 标志——未注册的标黄提醒用户。
+// rules/hooks 是软依赖，不阻塞安装，但 preflight 把缺口列在 needs_attention 里。
+function ManifestConfigRow({
+  label,
+  items,
+  t,
+}: {
+  label: string;
+  items: { label: string; configured: boolean }[];
+  t: TFunc;
+}) {
+  return (
+    <div className="flex gap-2 text-[11px]">
+      <span className="text-muted shrink-0">{label}:</span>
+      <span className="text-ink flex flex-wrap gap-x-1.5 gap-y-0.5">
+        {items.map((it, i) => (
+          <span key={i} className="inline-flex items-center gap-1">
+            <span>{it.label}</span>
+            {it.configured ? (
+              <span className="text-[9.5px] text-ok">✓</span>
+            ) : (
+              <span className="text-[9.5px] text-warnInk" title={t("digital.manifest_not_configured")}>⚠</span>
+            )}
+            {i < items.length - 1 && <span className="text-faint">,</span>}
+          </span>
+        ))}
+      </span>
     </div>
   );
 }
@@ -393,6 +424,37 @@ export function DigitalHumansSection() {
                   )}
                   {preflight.manifest.config_secret_keys.length > 0 && (
                     <ManifestRow label={t("digital.manifest_secrets")} items={preflight.manifest.config_secret_keys} />
+                  )}
+                  {preflight.manifest.requires_rules.length > 0 && (
+                    <ManifestConfigRow
+                      label={t("digital.manifest_rules")}
+                      items={preflight.manifest.requires_rules.map((r) => ({
+                        label: `${r.pattern} → ${r.action}`,
+                        configured: r.configured,
+                      }))}
+                      t={t}
+                    />
+                  )}
+                  {preflight.manifest.requires_hooks.length > 0 && (
+                    <ManifestConfigRow
+                      label={t("digital.manifest_hooks")}
+                      items={preflight.manifest.requires_hooks.map((h) => ({
+                        label: `${h.event}${h.match_tool && h.match_tool !== "*" ? ` (${h.match_tool})` : ""}`,
+                        configured: h.configured,
+                      }))}
+                      t={t}
+                    />
+                  )}
+                  {preflight.needs_attention && preflight.needs_attention.length > 0 && (
+                    <div className="rounded border border-warnInk/30 bg-warnSoft/60 p-2 mt-1">
+                      <div className="text-[11px] font-medium text-warnInk">{t("digital.manifest_needs_attention")}</div>
+                      <ul className="text-[10.5px] text-warnInk mt-1 space-y-0.5">
+                        {preflight.needs_attention.map((n, i) => (
+                          <li key={i}>· {n}</li>
+                        ))}
+                      </ul>
+                      <div className="text-[10px] text-muted mt-1">{t("digital.manifest_needs_attention_hint")}</div>
+                    </div>
                   )}
                   {preflight.mcp_confirmation_required && preflight.mcp_confirmation_required.length > 0 && (
                     <label className="flex items-start gap-2 text-[11px] text-ink mt-1">

@@ -836,16 +836,22 @@ export async function removeRule(ruleId: string): Promise<{ ok: boolean; error?:
   return res.json();
 }
 
-// -- Hooks (pre_run/post_run, E2) ---------------------------------------------
-// A hook fires on pre_run (before engine build, can skip) or post_run (after status
-// determined). CRUD only — firing is internal to the scheduler.
-export type HookEvent = "pre_run" | "post_run";
+// -- Hooks (pre_run/post_run + pre_tool/post_tool/on_message) -----------------
+// Run-level events fire around a scheduled run (pre_run can skip the whole run).
+// Tool-level events fire per tool call / per assistant message, modeled on Claude
+// Code's PreToolUse/PostToolUse: pre_tool can short-circuit a call ({"skip":true}).
+// match_tool (glob against the tool name; "*" = all) applies only to tool events.
+export type HookEvent = "pre_run" | "post_run" | "pre_tool" | "post_tool" | "on_message";
+
+// Tool-level events — used to conditionally show the match_tool field in the UI.
+export const TOOL_HOOK_EVENTS: HookEvent[] = ["pre_tool", "post_tool", "on_message"];
 
 export interface Hook {
   id: string;
   name: string;
   event: HookEvent;
   match: string; // glob against task name; "*" = all
+  match_tool: string; // glob against tool name (tool events only); "*" = all
   command: string; // shell command or script path
   enabled: boolean;
 }
@@ -860,11 +866,12 @@ export async function addHook(
   event: HookEvent,
   command: string,
   match = "*",
+  match_tool = "*",
 ): Promise<{ ok: boolean; error?: string; hook?: Hook }> {
   const res = await fetch(`${httpBase()}/v1/hooks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, event, command, match }),
+    body: JSON.stringify({ name, event, command, match, match_tool }),
   });
   return res.json();
 }
@@ -2950,6 +2957,10 @@ export interface DhpManifest {
   requires_skills: { id: string; reason: string; bundled: boolean }[];
   requires_commands: { id: string; reason: string; bundled: boolean }[];
   requires_subagents: { id: string; reason: string; bundled: boolean }[];
+  // Soft deps (don't block install): each carries a `configured` flag so the GUI
+  // can flag the ones the spec wants but aren't registered yet.
+  requires_rules: { pattern: string; action: string; reason: string; configured: boolean }[];
+  requires_hooks: { event: string; command: string; match: string; match_tool: string; reason: string; configured: boolean }[];
   permissions: string[];
   browser_login: string[];
   config_secret_keys: string[];
@@ -2962,6 +2973,9 @@ export interface DhpPreflight {
   approval_digest?: string;
   mcp_confirmation_required?: string[];
   missing_required_config?: string[];
+  // Soft-dep gaps: rules/hooks the spec wants but aren't registered yet. Doesn't
+  // block install — surfaced so the user knows the intended guardrails won't be active.
+  needs_attention?: string[];
 }
 
 export async function preflightDigitalHuman(

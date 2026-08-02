@@ -49,6 +49,7 @@ import {
   type RuleAction,
   type Skill,
 } from "../api";
+import { TOOL_HOOK_EVENTS } from "../api";
 import { Icon } from "./Icon";
 import { PanelHead } from "./IntegrationsView";
 import { McpRow } from "./ManageTabs";
@@ -137,7 +138,7 @@ export function CustomizeView() {
   const personasF = personas.filter((p) => match(p.id + " " + p.name + " " + p.tagline));
   const rulesF = rules.filter((r) => match(r.pattern + " " + r.action + " " + r.reason));
   const commandsF = commands.filter((c) => match(c.name + " " + c.description));
-  const hooksF = hooks.filter((h) => match(h.name + " " + h.event + " " + h.match + " " + h.command));
+  const hooksF = hooks.filter((h) => match(h.name + " " + h.event + " " + h.match + " " + h.match_tool + " " + h.command));
   const pluginsF = plugins.filter((p) => match(p.name + " " + p.description));
   const loginsF = logins.filter((l) => match(l.label + " " + l.url));
 
@@ -464,8 +465,11 @@ function RulesPanel({
   );
 }
 
-// Hooks panel — name + event (pre_run/post_run) + match glob + command. Add inline,
-// toggle enabled, delete per row. Hooks fire around scheduled runs (E2).
+// Hooks panel — name + event + match glob + command. Add inline, toggle enabled,
+// delete per row. Run-level events (pre_run/post_run) fire around scheduled runs;
+// tool-level events (pre_tool/post_tool/on_message) fire per tool call / per message
+// (modeled on Claude Code's PreToolUse/PostToolUse — pre_tool can short-circuit a
+// call). Tool events also take a match_tool glob (which tool name triggers them).
 function HooksPanel({
   hooks,
   t,
@@ -478,19 +482,41 @@ function HooksPanel({
   const [name, setName] = useState("");
   const [event, setEvent] = useState<HookEvent>("post_run");
   const [match, setMatch] = useState("*");
+  const [matchTool, setMatchTool] = useState("*");
   const [command, setCommand] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Whether the currently-selected event is a tool-level event (shows match_tool).
+  const isToolEvent = TOOL_HOOK_EVENTS.includes(event);
 
   const add = async () => {
     if (!name.trim() || !command.trim()) return;
     setBusy(true);
-    await addHook(name.trim(), event, command.trim(), match.trim() || "*");
+    await addHook(
+      name.trim(),
+      event,
+      command.trim(),
+      match.trim() || "*",
+      isToolEvent ? matchTool.trim() || "*" : "*",
+    );
     setName("");
     setCommand("");
     setMatch("*");
+    setMatchTool("*");
     setEvent("post_run");
     setBusy(false);
     onRefresh();
+  };
+
+  // Label for an event value, used in both the select and the row badge.
+  const eventLabel = (ev: HookEvent) => {
+    switch (ev) {
+      case "pre_run": return t("customize.hook_event_pre_run");
+      case "post_run": return t("customize.hook_event_post_run");
+      case "pre_tool": return t("customize.hook_event_pre_tool");
+      case "post_tool": return t("customize.hook_event_post_tool");
+      case "on_message": return t("customize.hook_event_on_message");
+    }
   };
 
   return (
@@ -509,8 +535,15 @@ function HooksPanel({
           value={event}
           onChange={(e) => setEvent(e.target.value as HookEvent)}
         >
-          <option value="pre_run">{t("customize.hook_event_pre_run")}</option>
-          <option value="post_run">{t("customize.hook_event_post_run")}</option>
+          <optgroup label={t("customize.hook_eventgroup_run")}>
+            <option value="pre_run">{t("customize.hook_event_pre_run")}</option>
+            <option value="post_run">{t("customize.hook_event_post_run")}</option>
+          </optgroup>
+          <optgroup label={t("customize.hook_eventgroup_tool")}>
+            <option value="pre_tool">{t("customize.hook_event_pre_tool")}</option>
+            <option value="post_tool">{t("customize.hook_event_post_tool")}</option>
+            <option value="on_message">{t("customize.hook_event_on_message")}</option>
+          </optgroup>
         </select>
         <input
           className={INPUT}
@@ -521,11 +554,20 @@ function HooksPanel({
         />
         <input
           className={INPUT}
-          placeholder={t("customize.hook_command_ph")}
-          value={command}
+          placeholder={isToolEvent ? t("customize.hook_match_tool_ph") : t("customize.hook_command_ph")}
+          value={isToolEvent ? matchTool : command}
           spellCheck={false}
-          onChange={(e) => setCommand(e.target.value)}
+          onChange={(e) => (isToolEvent ? setMatchTool(e.target.value) : setCommand(e.target.value))}
         />
+        {isToolEvent && (
+          <input
+            className={INPUT}
+            placeholder={t("customize.hook_command_ph")}
+            value={command}
+            spellCheck={false}
+            onChange={(e) => setCommand(e.target.value)}
+          />
+        )}
         <div className="col-span-2 flex justify-end">
           <button
             className={BTN_PRIMARY}
@@ -543,16 +585,16 @@ function HooksPanel({
         </div>
       ) : (
         <div className="divide-y divide-line">
-          {hooks.map((h) => (
+          {hooks.map((h) => {
+            const hIsTool = TOOL_HOOK_EVENTS.includes(h.event);
+            return (
             <div key={h.id} className="py-2.5">
               <div className="flex items-center gap-2">
                 <span className="text-[13px] font-medium text-ink flex-1 min-w-0 truncate">
                   {h.name}
                 </span>
                 <span className="text-[10.5px] px-1.5 py-0.5 rounded-full bg-accentSoft text-accent shrink-0">
-                  {h.event === "pre_run"
-                    ? t("customize.hook_event_pre_run")
-                    : t("customize.hook_event_post_run")}
+                  {eventLabel(h.event)}
                 </span>
                 <label className="switch shrink-0" title="Enable / disable">
                   <input
@@ -576,13 +618,20 @@ function HooksPanel({
                   <Icon name="trash" size={14} />
                 </button>
               </div>
-              <div className="flex items-center gap-2 mt-1 text-[11.5px] text-faint">
+              <div className="flex items-center gap-2 mt-1 text-[11.5px] text-faint flex-wrap">
                 <span className="font-mono">{h.match}</span>
+                {hIsTool && h.match_tool && h.match_tool !== "*" && (
+                  <>
+                    <span>·</span>
+                    <span className="font-mono">{h.match_tool}</span>
+                  </>
+                )}
                 <span>›</span>
                 <code className="font-mono truncate">{h.command}</code>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
