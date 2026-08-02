@@ -5,6 +5,9 @@ import {
   getArtifacts,
   readArtifact,
   revealArtifact,
+  getSessionSkills,
+  setSessionSkill,
+  type SessionSkill,
   type ArtifactContent,
   type ArtifactInfo,
 } from "../api";
@@ -13,6 +16,7 @@ import { useT } from "../i18n/I18nProvider";
 import { AccessSection } from "./AccessSection";
 import { Icon } from "./Icon";
 import { Markdown, OPEN_ARTIFACT_EVENT } from "./Markdown";
+import { Toggle } from "./Toggle";
 
 type Panel = "progress" | "artifacts";
 
@@ -112,13 +116,29 @@ export function RightRail({
   const [artifacts, setArtifacts] = useState<ArtifactInfo[]>([]);
   const [selected, setSelected] = useState<ArtifactInfo | null>(null);
   const [content, setContent] = useState<ArtifactContent | null>(null);
+  // Session skills (mute toggles): the effective menu for THIS conversation. A muted skill
+  // stays installed (Customize) but won't load into the agent's context for this session.
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [sessionSkills, setSessionSkills] = useState<SessionSkill[]>([]);
 
   const refreshArtifacts = () => getArtifacts(sessionId).then(setArtifacts).catch(() => setArtifacts([]));
+
+  const refreshSkills = () =>
+    getSessionSkills(sessionId, workspace || undefined)
+      .then(setSessionSkills)
+      .catch(() => setSessionSkills([]));
 
   useEffect(() => {
     if (!active) return;
     if (showArtifacts) refreshArtifacts();
   }, [active, sessionId, refreshKey, showArtifacts]);
+
+  // Load session skills when the section is first opened (lazy: no fetch until the user
+  // expands it). Re-fetches on session change while open.
+  useEffect(() => {
+    if (!active || !skillsOpen) return;
+    refreshSkills();
+  }, [active, sessionId, skillsOpen, workspace]);
 
   // Switching conversations closes any open artifact — it belongs to the previous session's
   // workspace, which the new session can't (and shouldn't) read.
@@ -235,6 +255,45 @@ export function RightRail({
             )}
           </RailSection>
           )}
+
+          {/* Session skills: per-conversation mute toggles. Muting here doesn't uninstall
+              (that's Customize → Skills) — it just keeps the skill's instructions out of this
+              session's context. Lazy-loaded on first expand. */}
+          <RailSection
+            title={t("rightrail.skills")}
+            open={skillsOpen}
+            onToggle={() => setSkillsOpen((v) => !v)}
+          >
+            {sessionSkills.length === 0 ? (
+              <div className="rail-muted">{t("rightrail.no_skills")}</div>
+            ) : (
+              <div className="rail-skill-list">
+                {sessionSkills.map((s) => (
+                  <div className="rail-skill-row" key={s.name}>
+                    <span className="rail-skill-name" title={s.description}>
+                      {s.name}
+                      <span className="rail-skill-scope">{s.scope}</span>
+                    </span>
+                    <Toggle
+                      checked={s.enabled}
+                      onChange={(next) => {
+                        // Optimistic: flip locally, then persist; revert on error.
+                        setSessionSkills((cur) =>
+                          cur.map((x) => (x.name === s.name ? { ...x, enabled: next } : x)),
+                        );
+                        setSessionSkill(sessionId, s.name, next, workspace || undefined).catch(() =>
+                          setSessionSkills((cur) =>
+                            cur.map((x) => (x.name === s.name ? { ...x, enabled: !next } : x)),
+                          ),
+                        );
+                      }}
+                      title={t(s.enabled ? "rightrail.skill_mute" : "rightrail.skill_unmute")}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </RailSection>
 
           {/* §32: Access — the former Session-settings drawer, one section among peers.
               key: its data ownership resets with the conversation, like the old row did. */}

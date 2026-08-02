@@ -892,10 +892,12 @@ export function App() {
     return () => clearInterval(t);
   }, [surface, sessionId, browserRefreshKey, markUnattended]);
 
-  const send = (text: string, attachments?: Attachment[]) => {
-    setItems((p) => [...p, { kind: "user", text, attachments, ts: Date.now() / 1000 }]);
+  const send = (text: string, attachments?: Attachment[], _model?: string, skill?: string) => {
+    setItems((p) => [...p, { kind: "user", text, attachments, ts: Date.now() / 1000, skill: skill ? `/${skill}` : undefined }]);
     // The visible model rides along with the message (single source of truth per turn).
-    sessionRef.current?.userMessage(text, attachments, model);
+    // `skill` triggers a force-run: the backend validates it against the session's effective
+    // menu, then frames the model-facing content while the transcript shows the user's /name line.
+    sessionRef.current?.userMessage(text, attachments, model, skill);
     followLatest(); // sending always re-engages stream-following, wherever the user had scrolled
   };
   // Resolving a LIVE prompt also resolves its parked Inbox mirror server-side, but the polled
@@ -1685,6 +1687,7 @@ export function App() {
               onUnattendedChange={agent !== "chat" ? toggleUnattended : undefined}
               prefill={composerPrefill}
               resetKey={sessionId}
+              sessionId={sessionId}
               usage={usage}
               contextWindow={modelContextWindows[model]}
               contextBar={contextBar}

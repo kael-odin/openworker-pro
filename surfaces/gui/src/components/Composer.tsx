@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import type { Attachment, SessionUsage } from "../types";
 import { isPdfFile, readFile } from "../attach";
-import { getSettings, inspectPdf, getCommands, getCommand } from "../api";
+import { getSettings, inspectPdf, getCommands, getCommand, getSessionSkills } from "../api";
 import { formatTokens, totalTokens } from "../usage";
 import { Dropdown, type Option } from "./Dropdown";
 import { Icon } from "./Icon";
@@ -67,7 +67,10 @@ interface Props {
   modelReady?: boolean;
   onConnectModel?: () => void;
   onConfigureVoiceInput?: () => void;
-  onSend: (text: string, attachments?: Attachment[]) => void;
+  // `skill` triggers a force-run: instead of expanding a prompt template, the selected
+  // skill name is passed straight through to the turn, and the backend frames the
+  // model-facing content + validates it against the session's effective skill menu.
+  onSend: (text: string, attachments?: Attachment[], skill?: string) => void;
   onInterrupt: () => void;
   onModeChange: (mode: string) => void;
   onModelChange: (model: string) => void;
@@ -84,6 +87,9 @@ interface Props {
   prefill?: { text: string; attachments?: Attachment[]; nonce: number };
   // Changes when the active conversation changes; clears any unsent draft.
   resetKey?: string;
+  // Active session id — used to fetch the session's effective skills for the
+  // slash popup's force-run entries. Absent on surfaces without a session.
+  sessionId?: string;
   // Surface-specific hint shown in the empty textarea.
   placeholder?: string;
   // Per-session token usage (OPE-42) — absent/empty hides the usage chip entirely
@@ -119,6 +125,16 @@ export function Composer(props: Props) {
   const [slashQuery, setSlashQuery] = useState("");
   const [slashCommands, setSlashCommands] = useState<{ name: string; description: string }[]>([]);
   const slashStart = useRef<number>(-1); // index of the "/" in the text
+
+  // Skills share the slash popup (E3 extension): typing "/" lists both /commands
+  // (expand their prompt_template into the textarea) and skills (force-run — the
+  // name goes straight to the turn instead of a template). Session skills load
+  // alongside the command catalog; only enabled ones are offered.
+  const [slashSkills, setSlashSkills] = useState<{ name: string; description: string }[]>([]);
+  // A skill awaiting submit: set when a skill row is picked, consumed by submit()
+  // so the force-run carries the user's typed text as the prompt body.
+  const pendingSkill = useRef<string | null>(null);
+  const [forceRunSkill, setForceRunSkill] = useState<string | null>(null);
 
   // Rejected-attachment notice: visible ~8s, then clears (or on ✕).
   const showAttachNotice = (message: string) => {
@@ -173,6 +189,31 @@ export function Composer(props: Props) {
     };
   }, []);
 
+  // Load the session's effective skills (force-run entries in the slash popup). Reloads
+  // when the session changes — muting a skill mid-session must be reflected. Absent
+  // sessionId (surfaces without a session) or fetch error just yields no skill rows.
+  useEffect(() => {
+    if (!props.sessionId) {
+      setSlashSkills([]);
+      return;
+    }
+    let cancelled = false;
+    getSessionSkills(props.sessionId, props.workspace || undefined)
+      .then((skills) => {
+        if (!cancelled) {
+          setSlashSkills(
+            skills
+              .filter((s) => s.enabled)
+              .map((s) => ({ name: s.name, description: s.description })),
+          );
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [props.sessionId, props.workspace]);
+
   // Detect an active slash query at the caret: a "/" either at the start of the text or right
   // after whitespace, with no whitespace after it (the user is still typing the command name).
   // Returns the "/" index + the query text after it, or null when no slash is active.
@@ -194,25 +235,57 @@ export function Composer(props: Props) {
     return null;
   };
 
-  const slashFiltered = slashOpen
-    ? slashCommands.filter((c) => {
-        const q = slashQuery.toLowerCase();
-        if (!q) return true;
-        return c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q);
-      })
+  // Unified slash-popup list: /commands (expand a template) first, then skills
+  // (force-run). Both are filtered by the query against name + description. A
+  // `kind` discriminator drives render + selection behavior.
+  type SlashItem =
+    | { kind: "command"; name: string; description: string }
+    | { kind: "skill"; name: string; description: string };
+  const slashFiltered: SlashItem[] = slashOpen
+    ? [
+        ...slashCommands
+          .filter((c) => {
+            const q = slashQuery.toLowerCase();
+            if (!q) return true;
+            return c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q);
+          })
+          .map((c) => ({ kind: "command" as const, ...c })),
+        ...slashSkills
+          .filter((s) => {
+            const q = slashQuery.toLowerCase();
+            if (!q) return true;
+            return s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q);
+          })
+          .map((s) => ({ kind: "skill" as const, ...s })),
+      ]
     : [];
   // Keep the selection index in range as the filtered list shrinks.
   if (slashIndex > slashFiltered.length - 1 && slashFiltered.length > 0) {
     setSlashIndex(Math.max(0, slashFiltered.length - 1));
   }
 
-  // Expand the selected command: fetch its prompt_template and replace the "/query" token in
-  // the textarea with the template text. The slash token has no spaces (by detectSlash), so it
-  // runs from slashStart to the next whitespace (or end). Closes the popup + refocuses.
-  const applySlashCommand = async (name: string) => {
+  // Apply the selected popup item. Commands expand their prompt_template in place of
+  // the "/query" token (existing E3 behavior). Skills trigger a force-run: the "/query"
+  // token is dropped, whatever the user typed around it becomes the prompt body, and the
+  // skill name is carried to submit() via the pendingSkill ref. Closes the popup.
+  const applySlashItem = async (item: { kind: "command" | "skill"; name: string }) => {
     const start = slashStart.current;
     setSlashOpen(false);
-    const cmd = await getCommand(name);
+    if (item.kind === "skill") {
+      // Strip the "/query" token; keep any surrounding text as the prompt body.
+      if (start >= 0) {
+        setText((cur) => {
+          let end = start;
+          while (end < cur.length && cur[end] !== " " && cur[end] !== "\n") end += 1;
+          return cur.slice(0, start) + cur.slice(end);
+        });
+      }
+      pendingSkill.current = item.name;
+      setForceRunSkill(item.name);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      return;
+    }
+    const cmd = await getCommand(item.name);
     if (!cmd || !cmd.prompt_template || start < 0) {
       requestAnimationFrame(() => textareaRef.current?.focus());
       return;
@@ -350,13 +423,19 @@ export function Composer(props: Props) {
 
   const submit = () => {
     const draft = text.trim();
-    if ((!draft && attachments.length === 0) || props.running || dictation?.recording || dictationBusy) return;
+    const skill = pendingSkill.current;
+    // A force-run skill can fire with no text (the skill's own instructions drive the
+    // turn); commands/normal sends still require text or an attachment.
+    if ((!draft && attachments.length === 0 && !skill) || props.running || dictation?.recording || dictationBusy)
+      return;
     // No model connected: keep the draft (don't drop it) and send the user to setup instead.
     if (needsModel) {
       props.onConnectModel?.();
       return;
     }
-    props.onSend(draft, attachments);
+    props.onSend(draft, attachments, skill ?? undefined);
+    pendingSkill.current = null;
+    setForceRunSkill(null);
     setText("");
     setAttachments([]);
   };
@@ -377,7 +456,7 @@ export function Composer(props: Props) {
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
         const pick = slashFiltered[slashIndex];
-        if (pick) void applySlashCommand(pick.name);
+        if (pick) void applySlashItem(pick);
         return;
       }
       if (e.key === "Escape") {
@@ -450,8 +529,8 @@ export function Composer(props: Props) {
     "w-7 h-7 grid place-items-center rounded-md text-muted hover:text-ink hover:bg-paper shrink-0";
 
   // The send button is accent only when there's something to send — subtle grey otherwise, so the
-  // composer isn't carrying a constant blue dot.
-  const hasContent = text.trim().length > 0 || attachments.length > 0;
+  // composer isn't carrying a constant blue dot. A queued force-run skill counts as content.
+  const hasContent = text.trim().length > 0 || attachments.length > 0 || !!forceRunSkill;
 
   return (
     <div className="composer-wrap px-6 pb-5 pt-4">
@@ -474,6 +553,28 @@ export function Composer(props: Props) {
             className="shrink-0 opacity-60 hover:opacity-100"
             onClick={() => setAttachNotice(null)}
             title={t("composer.dismiss")}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Force-run skill indicator: shown when a skill is queued for the next send.
+          ✕ cancels the force-run (clears the queued skill) without dropping the draft. */}
+      {forceRunSkill && (
+        <div className="max-w-3xl mx-auto mb-1.5 flex items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1 text-[12px] text-accent">
+            <span className="font-medium">/{forceRunSkill}</span>
+            <span className="text-faint">· {t("composer.slash_skill_badge")}</span>
+          </span>
+          <button
+            className="text-[12px] text-faint hover:text-ink"
+            onClick={() => {
+              pendingSkill.current = null;
+              setForceRunSkill(null);
+              textareaRef.current?.focus();
+            }}
+            title={t("composer.slash_skill_cancel")}
           >
             ✕
           </button>
@@ -533,16 +634,17 @@ export function Composer(props: Props) {
           rows={1}
         />
 
-        {/* Slash-command autocomplete popup (E3). Renders above the textarea; clicking an item
-            expands its template. Empty query shows all commands; no matches shows a hint. */}
+        {/* Slash-command autocomplete popup (E3). Renders above the textarea; commands
+            expand their template, skills force-run (the name goes to the turn). Empty
+            query shows all items; no matches shows a hint. */}
         {slashOpen && (
           <div className="absolute z-40 bottom-full mb-1 left-0 right-0 max-h-[260px] overflow-y-auto rounded-xl border border-line bg-panel shadow-2xl py-1.5">
             {slashFiltered.length === 0 ? (
               <div className="px-3.5 py-2 text-[12.5px] text-faint">{t("composer.slash_empty")}</div>
             ) : (
-              slashFiltered.map((c, i) => (
+              slashFiltered.map((item, i) => (
                 <button
-                  key={c.name}
+                  key={`${item.kind}:${item.name}`}
                   className={
                     "w-full text-left px-3.5 py-2 flex items-baseline gap-2.5 " +
                     (i === slashIndex ? "bg-paper text-ink" : "text-muted hover:bg-paper")
@@ -551,11 +653,20 @@ export function Composer(props: Props) {
                   onMouseDown={(e) => {
                     // mousedown (not click) so the textarea doesn't lose focus before apply.
                     e.preventDefault();
-                    void applySlashCommand(c.name);
+                    void applySlashItem(item);
                   }}
                 >
-                  <span className="text-[13px] font-medium text-ink shrink-0">/{c.name}</span>
-                  <span className="text-[12px] text-faint truncate">{c.description}</span>
+                  {item.kind === "command" ? (
+                    <span className="text-[13px] font-medium text-ink shrink-0">/{item.name}</span>
+                  ) : (
+                    <span className="text-[13px] font-medium text-accent shrink-0">/{item.name}</span>
+                  )}
+                  <span className="text-[12px] text-faint truncate">{item.description}</span>
+                  {item.kind === "skill" && (
+                    <span className="ml-auto text-[10px] uppercase tracking-wide text-faint shrink-0">
+                      {t("composer.slash_skill_badge")}
+                    </span>
+                  )}
                 </button>
               ))
             )}

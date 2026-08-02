@@ -38,6 +38,10 @@ import {
   updateHook,
   updatePlugin,
   updateRule,
+  createSkill,
+  updateSkill,
+  deleteSkill,
+  revealSkill,
   type BrowserLogin,
   type Command,
   type Hook,
@@ -230,33 +234,7 @@ export function CustomizeView() {
         )}
 
         {active === "skills" && (
-          skillsF.length === 0 ? (
-            <EmptyKind kind={t("customize.skills_title")} t={t} />
-          ) : (
-            <div className="divide-y divide-line">
-              {skillsF.map((s) => (
-                <div key={s.name} className="flex items-center gap-3 py-2.5">
-                  <Icon name="file" size={14} className="text-faint shrink-0" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[13px] font-medium text-ink">{s.name}</div>
-                    {s.description && (
-                      <div className="text-[11.5px] text-faint truncate">{s.description}</div>
-                    )}
-                  </div>
-                  <button
-                    className="text-faint hover:text-danger p-1"
-                    title={t("common.delete_aria", { title: s.name })}
-                    onClick={async () => {
-                      await uninstallSkill(s.name);
-                      refresh();
-                    }}
-                  >
-                    <Icon name="trash" size={14} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )
+          <SkillsPanel skills={skillsF} t={t} onRefresh={refresh} />
         )}
 
         {active === "subagents" && (
@@ -1052,6 +1030,258 @@ function LoginsPanel({
             onRefresh();
           }}
         />
+      )}
+    </div>
+  );
+}
+
+function SkillsPanel({
+  skills,
+  t,
+  onRefresh,
+}: {
+  skills: Skill[];
+  t: (key: string, params?: Record<string, string | number>) => string;
+  onRefresh: () => void;
+}) {
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newDesc, setNewDesc] = useState("");
+  const [newBody, setNewBody] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [editDesc, setEditDesc] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const startCreate = () => {
+    setCreating(true);
+    setNewName("");
+    setNewDesc("");
+    setNewBody("");
+  };
+
+  const submitCreate = async () => {
+    const name = newName.trim();
+    if (!name) return;
+    setBusy(true);
+    const r = await createSkill({ name, description: newDesc.trim(), instructions: newBody });
+    setBusy(false);
+    if (!r.ok) {
+      alert(r.error || "create failed");
+      return;
+    }
+    setCreating(false);
+    onRefresh();
+  };
+
+  const startEdit = (s: Skill) => {
+    setEditing(s.name);
+    setEditDesc(s.description || "");
+    // Instructions aren't in the list row; the edit form starts with desc only,
+    // body is optional (append). A full edit fetches the skill folder — but for
+    // a clean panel we keep it to desc + body-overwrite here.
+    setEditBody("");
+  };
+
+  const submitEdit = async (name: string) => {
+    setBusy(true);
+    const r = await updateSkill(name, {
+      description: editDesc.trim(),
+      instructions: editBody || undefined,
+    });
+    setBusy(false);
+    if (!r.ok) {
+      alert(r.error || "update failed");
+      return;
+    }
+    setEditing(null);
+    onRefresh();
+  };
+
+  const scopeBadge = (s: Skill) => {
+    const scope = s.scope || "global";
+    const label = t(`skills.scope_${scope}`);
+    const cls =
+      scope === "plugin"
+        ? "bg-paper border border-line text-faint"
+        : scope === "project"
+          ? "bg-accentSoft text-accent"
+          : "bg-paper border border-line text-muted";
+    return (
+      <span className={"text-[10.5px] px-1.5 py-0.5 rounded-full shrink-0 " + cls}>{label}</span>
+    );
+  };
+
+  return (
+    <div>
+      {/* Create button / form */}
+      {!creating ? (
+        <div className="flex justify-end mb-3">
+          <button
+            className="text-[12.5px] px-3 py-1.5 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent flex items-center gap-1.5"
+            onClick={startCreate}
+          >
+            <Icon name="plus" size={14} /> {t("skills.create")}
+          </button>
+        </div>
+      ) : (
+        <div className="mb-3 rounded-lg border border-lineStrong bg-paper p-3 space-y-2">
+          <input
+            className={SEARCH_INPUT}
+            placeholder={t("skills.name_ph")}
+            value={newName}
+            spellCheck={false}
+            onChange={(e) => setNewName(e.target.value)}
+          />
+          <input
+            className={SEARCH_INPUT}
+            placeholder={t("skills.desc_ph")}
+            value={newDesc}
+            spellCheck={false}
+            onChange={(e) => setNewDesc(e.target.value)}
+          />
+          <textarea
+            className={SEARCH_INPUT + " min-h-[80px] resize-y font-mono text-[12px]"}
+            placeholder={t("skills.body_ph")}
+            value={newBody}
+            spellCheck={false}
+            onChange={(e) => setNewBody(e.target.value)}
+          />
+          <div className="flex justify-end gap-2">
+            <button
+              className="text-[12.5px] px-3 py-1.5 rounded-lg border border-line text-muted hover:text-ink"
+              onClick={() => setCreating(false)}
+              disabled={busy}
+            >
+              {t("common.cancel")}
+            </button>
+            <button
+              className="text-[12.5px] px-3 py-1.5 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
+              onClick={submitCreate}
+              disabled={busy || !newName.trim()}
+            >
+              {t("common.create")}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {skills.length === 0 && !creating ? (
+        <EmptyKind kind={t("customize.skills_title")} t={t} />
+      ) : (
+        <div className="divide-y divide-line">
+          {skills.map((s) => {
+            const isPlugin = s.scope === "plugin";
+            const isEditing = editing === s.name;
+            return (
+              <div key={s.name} className="py-2.5">
+                <div className="flex items-center gap-3">
+                  <Icon name="file" size={14} className="text-faint shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[13px] font-medium text-ink">{s.name}</span>
+                      {scopeBadge(s)}
+                    </div>
+                    {s.description && (
+                      <div className="text-[11.5px] text-faint truncate">{s.description}</div>
+                    )}
+                  </div>
+
+                  {/* Enabled toggle (folder-CRUD skills only; plugin skills are read-only) */}
+                  {!isPlugin && s.enabled !== undefined && (
+                    <label className="switch shrink-0" title={t("skills.toggle_aria")}>
+                      <input
+                        type="checkbox"
+                        checked={s.enabled}
+                        onChange={async () => {
+                          await updateSkill(s.name, { enabled: !s.enabled });
+                          onRefresh();
+                        }}
+                      />
+                    </label>
+                  )}
+
+                  {/* Reveal folder */}
+                  <button
+                    className="text-faint hover:text-accent p-1"
+                    title={t("skills.reveal_aria", { name: s.name })}
+                    onClick={async () => {
+                      const r = await revealSkill(s.name);
+                      if (!r.ok) alert(r.error);
+                    }}
+                  >
+                    <Icon name="folder" size={14} />
+                  </button>
+
+                  {/* Edit (folder-CRUD only) */}
+                  {!isPlugin && (
+                    <button
+                      className={
+                        "p-1 " + (isEditing ? "text-accent" : "text-faint hover:text-accent")
+                      }
+                      title={t("skills.edit_aria", { name: s.name })}
+                      onClick={() => (isEditing ? setEditing(null) : startEdit(s))}
+                    >
+                      <Icon name="pencil" size={14} />
+                    </button>
+                  )}
+
+                  {/* Delete — folder-CRUD delete for writable, marketplace uninstall otherwise */}
+                  <button
+                    className="text-faint hover:text-danger p-1"
+                    title={t("common.delete_aria", { title: s.name })}
+                    onClick={async () => {
+                      if (s.writable === false || isPlugin) {
+                        await uninstallSkill(s.name);
+                      } else {
+                        await deleteSkill(s.name);
+                      }
+                      onRefresh();
+                    }}
+                  >
+                    <Icon name="trash" size={14} />
+                  </button>
+                </div>
+
+                {/* Inline edit form */}
+                {isEditing && (
+                  <div className="mt-2 ml-7 space-y-2">
+                    <input
+                      className={SEARCH_INPUT}
+                      placeholder={t("skills.desc_ph")}
+                      value={editDesc}
+                      spellCheck={false}
+                      onChange={(e) => setEditDesc(e.target.value)}
+                    />
+                    <textarea
+                      className={SEARCH_INPUT + " min-h-[80px] resize-y font-mono text-[12px]"}
+                      placeholder={t("skills.body_edit_ph")}
+                      value={editBody}
+                      spellCheck={false}
+                      onChange={(e) => setEditBody(e.target.value)}
+                    />
+                    <div className="flex justify-end gap-2">
+                      <button
+                        className="text-[12px] px-2.5 py-1 rounded-lg border border-line text-muted hover:text-ink"
+                        onClick={() => setEditing(null)}
+                        disabled={busy}
+                      >
+                        {t("common.cancel")}
+                      </button>
+                      <button
+                        className="text-[12px] px-2.5 py-1 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
+                        onClick={() => submitEdit(s.name)}
+                        disabled={busy}
+                      >
+                        {t("common.save")}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );

@@ -382,15 +382,133 @@ export async function signoutMcp(name: string): Promise<{ ok: boolean }> {
 }
 
 // -- skills -------------------------------------------------------------------
-// Skills follow the Anthropic SKILL.md format (progressive disclosure).
-// The backend currently only exposes list_skills (no install/uninstall yet — E1).
+// Skills follow the Anthropic SKILL.md format (progressive disclosure). Two layers coexist:
+// folder-CRUD (create/edit/delete/toggle inline) + marketplace install (sources, below).
+// Both land in state_dir()/skills/<name>/ where SkillLoader discovers them.
 export interface Skill {
   name: string;
   description: string;
+  scope?: "global" | "project" | "plugin";
+  source?: string;
+  enabled?: boolean;
+  writable?: boolean;
 }
 
-export async function getSkills(): Promise<Skill[]> {
-  const res = await fetch(`${httpBase()}/v1/skills`);
+export async function listSkills(workspace?: string): Promise<Skill[]> {
+  const url = new URL(`${httpBase()}/v1/skills`, location.origin);
+  if (workspace) url.searchParams.set("workspace", workspace);
+  const res = await fetch(url);
+  return (await res.json()).skills ?? [];
+}
+
+/** @deprecated use listSkills — kept for the CustomizeView refresh call site. */
+export const getSkills = listSkills;
+
+// Folder-CRUD: create/edit/delete/move/reveal skills via the folder-is-truth store.
+export async function createSkill(body: {
+  name: string;
+  description?: string;
+  instructions?: string;
+  scope?: "global" | "project";
+  workspace?: string;
+}): Promise<{ ok: boolean; error?: string; skill?: Skill }> {
+  const res = await fetch(`${httpBase()}/v1/skills`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+export async function updateSkill(
+  name: string,
+  changes: { description?: string; instructions?: string; enabled?: boolean; workspace?: string },
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function deleteSkill(
+  name: string,
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const url = `${httpBase()}/v1/skills/${encodeURIComponent(name)}`;
+  const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : "";
+  const res = await fetch(url + qs, { method: "DELETE" });
+  return res.json();
+}
+
+export async function moveSkill(
+  name: string,
+  toScope: "global" | "project",
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string; skill?: Skill }> {
+  const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: toScope, workspace }),
+  });
+  return res.json();
+}
+
+export async function revealSkill(
+  name: string,
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}/reveal`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workspace }),
+  });
+  return res.json();
+}
+
+// Session skills: the per-session mute state (the rail + composer popup read this).
+export interface SessionSkill {
+  name: string;
+  description: string;
+  scope: string;
+  enabled: boolean;
+}
+
+export async function getSessionSkills(
+  sessionId: string,
+  workspace?: string,
+): Promise<SessionSkill[]> {
+  const url = new URL(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/skills`, location.origin);
+  if (workspace) url.searchParams.set("workspace", workspace);
+  const res = await fetch(url);
+  return (await res.json()).skills ?? [];
+}
+
+export async function setSessionSkill(
+  sessionId: string,
+  skill: string,
+  enabled: boolean,
+  workspace?: string,
+): Promise<SessionSkill[]> {
+  const res = await fetch(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/skills`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ skill, enabled, workspace }),
+  });
+  return (await res.json()).skills ?? [];
+}
+
+export async function clearSessionSkill(
+  sessionId: string,
+  skill: string,
+  workspace?: string,
+): Promise<SessionSkill[]> {
+  const res = await fetch(`${httpBase()}/v1/sessions/${encodeURIComponent(sessionId)}/skills`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ skill, clear: true, workspace }),
+  });
   return (await res.json()).skills ?? [];
 }
 
@@ -472,8 +590,9 @@ export async function installSkill(
 }
 
 export async function uninstallSkill(name: string): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}`, {
-    method: "DELETE",
+  // Marketplace uninstall (E1) — distinct from DELETE /v1/skills/{name} (folder-CRUD).
+  const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}/uninstall`, {
+    method: "POST",
   });
   return res.json();
 }
@@ -2699,12 +2818,13 @@ export class Session {
    * exactly what the user sees — immune to set_model races across reconnects (a new cowork
    * session always reconnects once to adopt its scratch dir, which could drop a queued
    * set_model and leave the engine on a stale/resumed model; found 2026-07-04). */
-  userMessage(text: string, attachments?: unknown[], model?: string) {
+  userMessage(text: string, attachments?: unknown[], model?: string, skill?: string) {
     this.send({
       type: "user_message",
       text,
       ...(model ? { model } : {}),
       ...(attachments?.length ? { attachments } : {}),
+      ...(skill ? { skill } : {}),
     });
   }
 

@@ -414,7 +414,10 @@ def test_provider_builders(monkeypatch):
         "openai", {"base_url": "https://my.azure.example/openai/v1"}, None
     )
     assert o._base_url == "https://my.azure.example/openai/v1"
-    assert build_provider_client("openai", {}, None)._base_url is None
+    # No custom endpoint → native OpenAI routes to the Responses provider (no _base_url).
+    from coworker.providers import OpenAIResponsesProvider
+    native = build_provider_client("openai", {}, None)
+    assert isinstance(native, OpenAIResponsesProvider)
 
 
 def test_anthropic_gemini_capabilities():
