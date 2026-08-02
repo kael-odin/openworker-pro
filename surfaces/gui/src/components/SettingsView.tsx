@@ -20,6 +20,7 @@ import {
   downloadDictationModel,
   getAutostart,
   getDictationStatus,
+  getDictationStatusStrict,
   getKeepAwake,
   checkForUpdate,
   installUpdate,
@@ -202,8 +203,8 @@ function VoiceInputSection() {
     }).then((stop) => {
       unlisten = stop;
     });
-    void getDictationStatus().then(async (initial) => {
-      if (!active || !initial) return;
+    void getDictationStatusStrict().then(async (initial) => {
+      if (!active) return;
       publish(initial);
       // One-time migration for models installed by the first STT cut, before verification markers.
       if (initial.model_installed && !initial.model_verified) {
@@ -217,6 +218,9 @@ function VoiceInputSection() {
           if (active) setPhase("idle");
         }
       }
+    }).catch((err) => {
+      // Surface the failure instead of leaving status=null and the mic button silently disabled.
+      if (active) setError(voiceError(err));
     });
     return () => {
       active = false;
@@ -290,6 +294,17 @@ function VoiceInputSection() {
     }
   };
 
+  // Retry the initial status fetch after it failed (status stayed null). Without this the user is
+  // stuck on a silently-disabled mic button with no way to recover.
+  const retryLoad = async () => {
+    setError(null);
+    try {
+      publish(await getDictationStatusStrict());
+    } catch (err) {
+      setError(voiceError(err));
+    }
+  };
+
   const downloading = phase === "downloading" || !!status?.download_in_progress;
   const progressTotal = progress?.total_bytes || status?.model_bytes || 1;
   const progressPercent = Math.min(100, Math.round(((progress?.downloaded_bytes || 0) / progressTotal) * 100));
@@ -317,6 +332,7 @@ function VoiceInputSection() {
                 <div className="text-[13.5px] font-medium">{t("settings.voice_this_device")}</div>
                 <div className="text-[12px] text-muted mt-1">{status?.device_summary || t("settings.voice_checking")}</div>
                 {status?.compatibility_reason && <div className="text-[12px] text-red-600 mt-1.5">{status.compatibility_reason}</div>}
+                {!status && <button className={BTN_BORDERED + " mt-2"} onClick={() => void retryLoad()}>{t("settings.voice_retry")}</button>}
               </div>
               {status && (
                 <span className={"text-[11.5px] px-2 py-1 rounded-full " + (status.supported ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600")}>

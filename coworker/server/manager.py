@@ -102,6 +102,23 @@ def _grants_of(engine) -> dict[str, Any]:
     return {"tools": tools, "commands": commands} if (tools or commands) else {}
 
 
+def _parse_allowed_tools(value: Any) -> Optional[list[str]]:
+    """Normalize a request-body allowed_tools value into a clean list (or None to leave untouched).
+
+    Accepts a comma-separated string ("read_file, write_file"), a list of strings, or None.
+    Used by create_skill/update_skill so the frontmatter `allowed-tools` line is writable from
+    the Settings form. Returns None when the key is absent so update() can preserve the existing
+    list; returns [] for an empty string/list so the field can be cleared.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [t.strip() for t in value.split(",") if t.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(t).strip() for t in value if str(t).strip()]
+    return None
+
+
 def _approval_body(request) -> str:
     """Approval card body: the tool's reason (if any) plus a compact preview of its args, so a
     mirrored 'Run `write_file`?' shows the path/content rather than just the tool name.
@@ -5125,6 +5142,7 @@ class SessionManager:
                 instructions=str(body.get("instructions", "")),
                 scope=str(body.get("scope", "global") or "global"),
                 workspace=body.get("workspace") or None,
+                allowed_tools=_parse_allowed_tools(body.get("allowed_tools")),
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
@@ -5134,12 +5152,17 @@ class SessionManager:
         try:
             if "enabled" in body:
                 self.skill_store.set_enabled(name, bool(body["enabled"]))
-            if body.get("description") is not None or body.get("instructions") is not None:
+            if (
+                body.get("description") is not None
+                or body.get("instructions") is not None
+                or body.get("allowed_tools") is not None
+            ):
                 self.skill_store.update(
                     name,
                     description=body.get("description"),
                     instructions=body.get("instructions"),
                     workspace=body.get("workspace") or None,
+                    allowed_tools=_parse_allowed_tools(body.get("allowed_tools")),
                 )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}

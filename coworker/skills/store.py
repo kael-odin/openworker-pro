@@ -70,11 +70,19 @@ def _frontmatter_source(md: Path) -> str:
 
 
 def _write_skill_md(
-    folder: Path, *, name: str, description: str, instructions: str, source: str = ""
+    folder: Path,
+    *,
+    name: str,
+    description: str,
+    instructions: str,
+    source: str = "",
+    allowed_tools: Optional[list[str]] = None,
 ) -> None:
     lines = ["---", f"name: {name}", f"description: {description}"]
     if source:
         lines.append(f"source: {source}")
+    if allowed_tools:
+        lines.append("allowed-tools: " + ", ".join(allowed_tools))
     lines += ["---", "", instructions.strip(), ""]
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "SKILL.md").write_text("\n".join(lines), encoding="utf-8")
@@ -160,6 +168,7 @@ class SkillStore:
                     "name": skill.name,
                     "description": skill.description,
                     "instructions": skill.instructions,  # Settings editor prefill
+                    "allowed_tools": list(skill.allowed_tools),  # frontmatter allowed-tools
                     "scope": scope,
                     "source": _frontmatter_source(md) or "local",
                     "enabled": skill.name not in disabled,
@@ -183,6 +192,7 @@ class SkillStore:
         scope: str = GLOBAL_SCOPE,
         workspace: Optional[str | Path] = None,
         source: str = "",
+        allowed_tools: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         name = validate_name(name)
         description = (description or "").strip()
@@ -198,6 +208,7 @@ class SkillStore:
             description=description,
             instructions=instructions,
             source=source,
+            allowed_tools=allowed_tools,
         )
         return {"name": name, "scope": scope, "path": str(folder)}
 
@@ -208,6 +219,7 @@ class SkillStore:
         description: Optional[str] = None,
         instructions: Optional[str] = None,
         workspace: Optional[str | Path] = None,
+        allowed_tools: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Rewrite SKILL.md fields in place; sibling resource files are untouched."""
         folder, scope = self.find(name, workspace)
@@ -224,6 +236,11 @@ class SkillStore:
                 instructions if instructions is not None else current.instructions
             ),
             source=_frontmatter_source(folder / "SKILL.md"),
+            # Preserve existing allowed-tools when the caller doesn't supply them (e.g. the
+            # edit form only changed the description). An explicit [] clears the list.
+            allowed_tools=(
+                allowed_tools if allowed_tools is not None else current.allowed_tools
+            ),
         )
         return {"name": current.name, "scope": scope}
 

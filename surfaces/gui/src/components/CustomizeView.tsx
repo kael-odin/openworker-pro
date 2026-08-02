@@ -42,6 +42,8 @@ import {
   updateSkill,
   deleteSkill,
   revealSkill,
+  uploadSkillPreview,
+  confirmSkillUpload,
   type BrowserLogin,
   type Command,
   type Hook,
@@ -1048,23 +1050,33 @@ function SkillsPanel({
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [newBody, setNewBody] = useState("");
+  const [newTools, setNewTools] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [editDesc, setEditDesc] = useState("");
   const [editBody, setEditBody] = useState("");
+  const [editTools, setEditTools] = useState("");
   const [busy, setBusy] = useState(false);
+  // Import-skill-package flow: staged upload preview → confirm.
+  const [importPreview, setImportPreview] = useState<{ token: string; name: string; description: string; files: string[] } | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+
+  const parseTools = (s: string): string[] =>
+    s.split(",").map((t) => t.trim()).filter(Boolean);
 
   const startCreate = () => {
     setCreating(true);
     setNewName("");
     setNewDesc("");
     setNewBody("");
+    setNewTools("");
   };
 
   const submitCreate = async () => {
     const name = newName.trim();
     if (!name) return;
     setBusy(true);
-    const r = await createSkill({ name, description: newDesc.trim(), instructions: newBody });
+    const tools = parseTools(newTools);
+    const r = await createSkill({ name, description: newDesc.trim(), instructions: newBody, allowed_tools: tools });
     setBusy(false);
     if (!r.ok) {
       alert(r.error || "create failed");
@@ -1081,6 +1093,7 @@ function SkillsPanel({
     // body is optional (append). A full edit fetches the skill folder — but for
     // a clean panel we keep it to desc + body-overwrite here.
     setEditBody("");
+    setEditTools((s.allowed_tools || []).join(", "));
   };
 
   const submitEdit = async (name: string) => {
@@ -1088,6 +1101,7 @@ function SkillsPanel({
     const r = await updateSkill(name, {
       description: editDesc.trim(),
       instructions: editBody || undefined,
+      allowed_tools: parseTools(editTools),
     });
     setBusy(false);
     if (!r.ok) {
@@ -1095,6 +1109,41 @@ function SkillsPanel({
       return;
     }
     setEditing(null);
+    onRefresh();
+  };
+
+  const onPickImportFile = async (file: File | null | undefined) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const preview = await uploadSkillPreview(file);
+      if (!preview.ok || !preview.token) {
+        alert(preview.error || t("skills.import_failed"));
+        return;
+      }
+      setImportPreview({
+        token: preview.token,
+        name: preview.name || "",
+        description: preview.description || "",
+        files: preview.files || [],
+      });
+    } finally {
+      setBusy(false);
+      // Reset the input so picking the same file twice re-fires onChange.
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  };
+
+  const submitImport = async () => {
+    if (!importPreview) return;
+    setBusy(true);
+    const r = await confirmSkillUpload(importPreview.token);
+    setBusy(false);
+    if (!r.ok) {
+      alert(r.error || t("skills.import_failed"));
+      return;
+    }
+    setImportPreview(null);
     onRefresh();
   };
 
@@ -1114,9 +1163,16 @@ function SkillsPanel({
 
   return (
     <div>
-      {/* Create button / form */}
-      {!creating ? (
-        <div className="flex justify-end mb-3">
+      {/* Create / import buttons + forms */}
+      {!creating && !importPreview ? (
+        <div className="flex justify-end gap-2 mb-3">
+          <button
+            className="text-[12.5px] px-3 py-1.5 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent flex items-center gap-1.5"
+            onClick={() => importInputRef.current?.click()}
+            disabled={busy}
+          >
+            <Icon name="folder" size={14} /> {t("skills.import")}
+          </button>
           <button
             className="text-[12.5px] px-3 py-1.5 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent flex items-center gap-1.5"
             onClick={startCreate}
@@ -1124,7 +1180,49 @@ function SkillsPanel({
             <Icon name="plus" size={14} /> {t("skills.create")}
           </button>
         </div>
-      ) : (
+      ) : null}
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".zip,.skill,.md,.txt"
+        className="hidden"
+        onChange={(e) => void onPickImportFile(e.target.files?.[0])}
+      />
+
+      {/* Import preview / confirm */}
+      {importPreview && (
+        <div className="mb-3 rounded-lg border border-lineStrong bg-paper p-3 space-y-2">
+          <div className="text-[12.5px] font-medium text-ink">{t("skills.import_preview")}</div>
+          <div className="text-[12px] text-muted">
+            <span className="text-ink font-medium">{importPreview.name}</span>
+            {importPreview.description && <span className="ml-1.5">— {importPreview.description}</span>}
+          </div>
+          {importPreview.files.length > 0 && (
+            <div className="text-[11.5px] text-faint">
+              {t("skills.import_bundled", { count: importPreview.files.length })}
+              <span className="ml-1 truncate">{importPreview.files.join(", ")}</span>
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <button
+              className="text-[12.5px] px-3 py-1.5 rounded-lg border border-line text-muted hover:text-ink"
+              onClick={() => setImportPreview(null)}
+              disabled={busy}
+            >
+              {t("common.cancel")}
+            </button>
+            <button
+              className="text-[12.5px] px-3 py-1.5 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
+              onClick={submitImport}
+              disabled={busy}
+            >
+              {t("skills.import_confirm")}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {creating && (
         <div className="mb-3 rounded-lg border border-lineStrong bg-paper p-3 space-y-2">
           <input
             className={SEARCH_INPUT}
@@ -1146,6 +1244,13 @@ function SkillsPanel({
             value={newBody}
             spellCheck={false}
             onChange={(e) => setNewBody(e.target.value)}
+          />
+          <input
+            className={SEARCH_INPUT}
+            placeholder={t("skills.tools_ph")}
+            value={newTools}
+            spellCheck={false}
+            onChange={(e) => setNewTools(e.target.value)}
           />
           <div className="flex justify-end gap-2">
             <button
@@ -1184,6 +1289,9 @@ function SkillsPanel({
                     </div>
                     {s.description && (
                       <div className="text-[11.5px] text-faint truncate">{s.description}</div>
+                    )}
+                    {!!s.files && s.files > 0 && (
+                      <div className="text-[10.5px] text-faint">{t("skills.bundled_files", { count: s.files })}</div>
                     )}
                   </div>
 
@@ -1259,6 +1367,13 @@ function SkillsPanel({
                       value={editBody}
                       spellCheck={false}
                       onChange={(e) => setEditBody(e.target.value)}
+                    />
+                    <input
+                      className={SEARCH_INPUT}
+                      placeholder={t("skills.tools_ph")}
+                      value={editTools}
+                      spellCheck={false}
+                      onChange={(e) => setEditTools(e.target.value)}
                     />
                     <div className="flex justify-end gap-2">
                       <button

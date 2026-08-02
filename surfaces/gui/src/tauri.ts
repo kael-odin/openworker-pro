@@ -79,7 +79,15 @@ export const startWindowDrag = () => invoke<boolean>("start_window_drag");
 
 // Local dictation is native-only. The browser build deliberately keeps this unavailable rather
 // than silently sending microphone audio to a server.
+//
+// `getDictationStatus` uses the error-swallowing invoke() (returns null on failure) — fine for
+// best-effort status refresh inside an already-surfaced error flow, but the *initial* load must
+// NOT use it: a thrown Rust command would silently leave status=null, the mic button renders
+// disabled, and clicking it produces no feedback at all (the reported "button does nothing" bug).
+// Use `getDictationStatusStrict` for the initial load + retry so the error is visible.
 export const getDictationStatus = () => invoke<DictationStatus>("get_dictation_status");
+/** Throwing variant for the initial status load — surfaces Rust-side errors instead of null. */
+export const getDictationStatusStrict = () => invokeStrict<DictationStatus>("get_dictation_status");
 /** Instantaneous mic loudness 0..1 while recording (0 otherwise) — drives the composer's
  * live waveform. Cheap; poll at ~10Hz. */
 export const getDictationLevel = () => invoke<number>("dictation_level");

@@ -392,6 +392,20 @@ export interface Skill {
   source?: string;
   enabled?: boolean;
   writable?: boolean;
+  allowed_tools?: string[];
+  /** Bundled resource file count (resources beyond SKILL.md). */
+  files?: number;
+}
+
+/** Shape returned by the staged-upload preview (POST /v1/skills/upload). */
+export interface SkillUploadPreview {
+  ok: boolean;
+  error?: string;
+  token?: string;
+  name?: string;
+  description?: string;
+  instructions?: string;
+  files?: string[];
 }
 
 export async function listSkills(workspace?: string): Promise<Skill[]> {
@@ -409,6 +423,7 @@ export async function createSkill(body: {
   name: string;
   description?: string;
   instructions?: string;
+  allowed_tools?: string[];
   scope?: "global" | "project";
   workspace?: string;
 }): Promise<{ ok: boolean; error?: string; skill?: Skill }> {
@@ -422,12 +437,49 @@ export async function createSkill(body: {
 
 export async function updateSkill(
   name: string,
-  changes: { description?: string; instructions?: string; enabled?: boolean; workspace?: string },
+  changes: { description?: string; instructions?: string; allowed_tools?: string[]; enabled?: boolean; workspace?: string },
 ): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch(`${httpBase()}/v1/skills/${encodeURIComponent(name)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+/** Stage a skill package upload (.zip folder skill, or bare SKILL.md). Returns a preview;
+ * nothing is installed until confirmSkillUpload. The backend decodes base64 data. */
+export async function uploadSkillPreview(
+  file: File,
+): Promise<SkillUploadPreview> {
+  const buf = await file.arrayBuffer();
+  // Chunked base64 — spreading the whole Uint8Array into String.fromCharCode overflows the
+  // call stack on multi-MB zips. Process in 32KiB slices.
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  const dataB64 = btoa(binary);
+  const res = await fetch(`${httpBase()}/v1/skills/upload`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data_b64: dataB64, filename: file.name }),
+  });
+  return res.json();
+}
+
+/** Confirm a staged upload, installing it into the chosen scope. */
+export async function confirmSkillUpload(
+  token: string,
+  scope: "global" | "project" = "global",
+  workspace?: string,
+): Promise<{ ok: boolean; error?: string; skill?: { name: string; scope: string; path: string } }> {
+  const res = await fetch(`${httpBase()}/v1/skills/upload/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, scope, workspace }),
   });
   return res.json();
 }

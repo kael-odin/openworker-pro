@@ -66,6 +66,7 @@ def test_create_then_list_enriched(tmp_path):
             "name": "greet",
             "description": "says hello",
             "instructions": "Say hello warmly.",
+            "allowed_tools": [],
             "scope": "global",
             "source": "local",
             "enabled": True,
@@ -87,6 +88,38 @@ def test_create_duplicate_and_blank_rejected(tmp_path):
     ):
         res = client.post("/v1/skills", json=bad).json()
         assert res["ok"] is False and res["error"]
+
+
+def test_allowed_tools_roundtrip(tmp_path):
+    """allowed_tools is written to the SKILL.md frontmatter and read back on list/update.
+    A comma-string is accepted at the API boundary (the form sends a string); update with
+    allowed_tools omitted preserves the existing list; an explicit empty list clears it."""
+    client, _m, _p = _client(tmp_path)
+    client.post(
+        "/v1/skills",
+        json={
+            "name": "tooled",
+            "description": "has tools",
+            "instructions": "use the tools",
+            "allowed_tools": "read_file, write_file",
+        },
+    )
+    rows = {r["name"]: r for r in client.get("/v1/skills").json()["skills"]}
+    assert rows["tooled"]["allowed_tools"] == ["read_file", "write_file"]
+
+    # Update description only → allowed_tools must survive (not cleared).
+    assert client.patch(
+        "/v1/skills/tooled", json={"description": "still has tools"}
+    ).json()["ok"] is True
+    rows = {r["name"]: r for r in client.get("/v1/skills").json()["skills"]}
+    assert rows["tooled"]["allowed_tools"] == ["read_file", "write_file"]
+
+    # Explicit empty list clears the field.
+    assert client.patch(
+        "/v1/skills/tooled", json={"allowed_tools": []}
+    ).json()["ok"] is True
+    rows = {r["name"]: r for r in client.get("/v1/skills").json()["skills"]}
+    assert rows["tooled"]["allowed_tools"] == []
 
 
 def test_patch_edit_and_toggle(tmp_path):
