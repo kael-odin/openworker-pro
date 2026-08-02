@@ -49,9 +49,17 @@ def compute_next_run(
 
 def _tz(name: str):
     """Resolve a schedule timezone. 'local'/empty → the machine's local zone (right for a
-    local-first tool: when you say '8:05 PM' you mean *your* clock, not UTC)."""
+    local-first tool: when you say '8:05 PM' you mean *your* clock, not UTC).
+
+    'UTC' is handled with ``timezone.utc`` (always available, no system tz database needed) —
+    on Windows the ``zoneinfo`` module relies on the optional ``tzdata`` package, which may be
+    absent, so ``ZoneInfo('UTC')`` can raise ``ZoneInfoNotFoundError`` and silently fall back
+    to local time. Resolving UTC directly avoids that trap for the one zone every install needs.
+    """
     if not name or name.lower() == "local":
         return datetime.now().astimezone().tzinfo
+    if name.upper() == "UTC" or name.upper() in ("GMT", "Z", "Etc/UTC", "Etc/GMT"):
+        return timezone.utc
     try:
         return ZoneInfo(name)
     except Exception:
