@@ -48,6 +48,22 @@ def assert_safe_rel_path(path: str) -> str:
     return p
 
 
+def _strip_index_suffix(url: str) -> str:
+    """Remove a trailing ``/index.json`` (or ``/index.yml``) from a source URL.
+
+    The adapter joins ``{self.url}/index.json`` to fetch the catalog, so a source URL that
+    already ends in ``/index.json`` would request ``…/index.json/index.json`` and 404 silently
+    (the empty-store bug). Both the full-file and bare-directory forms should work.
+    """
+    if not url:
+        return url
+    lower = url.lower().rstrip("/")
+    for suffix in ("/index.json", "/index.yml", "/index.yaml"):
+        if lower.endswith(suffix):
+            return url[: -len(suffix)]
+    return url
+
+
 class DhpHttpAdapter:
     """Fetch DHP index + specs from an HTTP source URL.
 
@@ -56,7 +72,12 @@ class DhpHttpAdapter:
     """
 
     def __init__(self, url: str) -> None:
-        self.url = url.rstrip("/")
+        # Normalize: the source URL may point at the directory OR at the index file itself.
+        # fetch_index appends "/index.json", so strip a trailing index.json/.json here to
+        # avoid a double-suffix request (…/index.json/index.json → 404 → empty store).
+        # This is the silent empty-store root cause: a user pastes the full index URL and the
+        # store shows no digital humans because the doubled path 404s and the error is swallowed.
+        self.url = _strip_index_suffix(url).rstrip("/")
         self._index: Optional[list[RegistryEntry]] = None
         self._index_fetched_at: float = 0.0
         # LRU-ish spec cache: slug → (spec, fetched_at). Bounded by the number of slugs (≤ a few

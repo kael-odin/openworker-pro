@@ -24,7 +24,9 @@ from .spec import DigitalHumanSpec, SpecError, load_spec_file
 # The official DHP registry index, served via GitHub Pages.
 # Points to the fully-localized Chinese fork (kael-odin/digital-human-protocol-zh) so the preset
 # store shows Chinese names/descriptions out of the box.
-OFFICIAL_INDEX_URL = "https://kael-odin.github.io/digital-human-protocol-zh/index.json"
+# NOTE: this is the directory URL, not the index file itself — DhpHttpAdapter appends
+# "/index.json" at fetch time. Trailing "/index.json" here would double the suffix and 404 silently.
+OFFICIAL_INDEX_URL = "https://kael-odin.github.io/digital-human-protocol-zh"
 
 # Categories per spec/categories.md — used for grouping in the store UI. Free-form categories from
 # the index are preserved; this list drives the canonical group order.

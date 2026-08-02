@@ -868,6 +868,46 @@ def test_assert_safe_rel_path_rejects_traversal():
         assert_safe_rel_path("a/../../b")
 
 
+def test_http_adapter_strips_index_json_suffix(monkeypatch):
+    """A source URL ending in /index.json must not double the suffix.
+
+    fetch_index joins ``{self.url}/index.json``; a source URL that already ends in the
+    file name would request ``…/index.json/index.json`` and 404 silently — the empty-store
+    root cause. The adapter strips the suffix so both the directory and full-file forms work.
+    """
+    from coworker.digital_human.adapters import DhpHttpAdapter, _strip_index_suffix
+
+    # The suffix-stripping helper covers the directory, full-file, and trailing-slash forms.
+    # It strips only the index suffix; a residual trailing slash is cleaned by the adapter ctor.
+    assert _strip_index_suffix("https://x.io/dhp") == "https://x.io/dhp"
+    assert _strip_index_suffix("https://x.io/dhp/index.json") == "https://x.io/dhp"
+    assert _strip_index_suffix("https://x.io/dhp/index.JSON") == "https://x.io/dhp"
+    assert _strip_index_suffix("https://x.io/dhp/index.yml/") == "https://x.io/dhp/"
+    assert _strip_index_suffix("https://x.io/dhp/") == "https://x.io/dhp/"
+
+    # End-to-end: an adapter built from the full-file URL fetches the directory's index.json,
+    # not a doubled path. The fake client records the requested URL to prove it.
+    captured: list[str] = []
+    index_url = "https://x.io/dhp/index.json"
+
+    class _Client:
+        def get(self, url):
+            captured.append(url)
+            if url == index_url:
+                return _FakeResponse(json_data={"apps": [{"slug": "foo"}]})
+            return _FakeResponse(status=404)
+
+    monkeypatch.setattr(
+        "coworker.digital_human.adapters.httpx", type("M", (), {"Client": lambda *a, **k: _Client()})
+    )
+    # Source URL points at the index file itself (what a user pastes) — must still resolve.
+    adapter = DhpHttpAdapter("https://x.io/dhp/index.json")
+    entries = adapter.fetch_index()
+    assert len(entries) == 1 and entries[0].slug == "foo"
+    # The request hit the canonical index URL, not a doubled path.
+    assert captured == [index_url]
+
+
 # -- multi-source registry ----------------------------------------------------
 
 
