@@ -1,11 +1,21 @@
-"""Rules (allow/deny/ask) + Hooks (pre_run/post_run) — 批次 E2."""
+"""Rules (allow/deny/ask) + Hooks (pre_run/post_run + pre_tool/post_tool/on_message)."""
 
 from __future__ import annotations
 
 import json
 import sys
 
-from coworker.hooks import EVENTS, HookStore, POST_RUN, PRE_RUN
+from coworker.hooks import (
+    EVENTS,
+    ON_MESSAGE,
+    POST_RUN,
+    POST_TOOL,
+    PRE_RUN,
+    PRE_TOOL,
+    RUN_EVENTS,
+    TOOL_EVENTS,
+    HookStore,
+)
 from coworker.permissions import PermissionEngine, Decision
 from coworker.risk import RiskClass
 from coworker.rules import ACTIONS, ALLOW, ASK, DENY, RuleStore
@@ -144,7 +154,7 @@ def test_hook_store_add_and_list():
 def test_hook_store_add_rejects_invalid_event():
     _prefs, store = _prefs_and_hook_store()
     try:
-        store.add("x", "pre_tool", "echo")
+        store.add("x", "bogus_event", "echo")
     except ValueError:
         return
     assert False, "expected ValueError for invalid event"
@@ -177,7 +187,10 @@ def test_hook_store_persisted_in_prefs_key():
 
 
 def test_events_constant():
-    assert EVENTS == (PRE_RUN, POST_RUN)
+    # Run-level + tool-level events, in declared order.
+    assert EVENTS == (PRE_RUN, POST_RUN, PRE_TOOL, POST_TOOL, ON_MESSAGE)
+    assert RUN_EVENTS == (PRE_RUN, POST_RUN)
+    assert TOOL_EVENTS == (PRE_TOOL, POST_TOOL, ON_MESSAGE)
 
 
 def test_hook_fire_runs_matching_hook_and_returns_result():
@@ -250,6 +263,134 @@ def test_hook_fire_passes_context_on_stdin():
     assert len(results) == 1
     assert results[0]["ok"] is True
     assert "My Task" in results[0]["stdout"]
+
+
+# -- Tool-level hooks (pre_tool / post_tool / on_message) --------------------
+
+
+def test_hook_store_add_tool_event_with_match_tool():
+    _prefs, store = _prefs_and_hook_store()
+    h = store.add("guard-write", PRE_TOOL, "echo no", match="*", match_tool="write_file")
+    assert h["event"] == PRE_TOOL
+    assert h["match_tool"] == "write_file"
+    # Persisted round-trip.
+    assert store.list()[0]["match_tool"] == "write_file"
+
+
+def test_hook_store_add_run_event_normalizes_match_tool():
+    _prefs, store = _prefs_and_hook_store()
+    # Run events don't have a tool name to match; match_tool is forced to "*".
+    h = store.add("pre", PRE_RUN, "echo pre", match="*", match_tool="write_file")
+    assert h["match_tool"] == "*"
+
+
+def test_hook_store_update_match_tool_only_for_tool_events():
+    _prefs, store = _prefs_and_hook_store()
+    h = store.add("t", PRE_TOOL, "echo", match="*")
+    # Updating match_tool on a tool event works.
+    updated = store.update(h["id"], {"match_tool": "shell"})
+    assert updated["match_tool"] == "shell"
+    # Switching the event to a run event resets match_tool to "*".
+    switched = store.update(h["id"], {"event": PRE_RUN})
+    assert switched["event"] == PRE_RUN
+    assert switched["match_tool"] == "*"
+
+
+def test_hook_fire_pre_tool_skips_call_on_skip_stdout():
+    _prefs, store = _prefs_and_hook_store()
+    store.add("guard", PRE_TOOL, 'printf \'%s\' \'{"skip": true}\'', match="*")
+    results = store.fire(
+        PRE_TOOL,
+        {"task_name": "x", "event": PRE_TOOL, "tool_name": "write_file"},
+    )
+    assert len(results) == 1
+    assert results[0].get("skip") is True
+
+
+def test_hook_fire_pre_tool_skip_carries_custom_result():
+    _prefs, store = _prefs_and_hook_store()
+    store.add(
+        "guard",
+        PRE_TOOL,
+        'printf \'%s\' \'{"skip": true, "result": {"blocked": "policy"}}\'',
+        match="*",
+    )
+    results = store.fire(
+        PRE_TOOL,
+        {"task_name": "x", "event": PRE_TOOL, "tool_name": "shell"},
+    )
+    assert results[0].get("skip") is True
+    assert results[0].get("result") == {"blocked": "policy"}
+
+
+def test_hook_fire_tool_event_filters_on_match_tool():
+    _prefs, store = _prefs_and_hook_store()
+    store.add("write-only", POST_TOOL, "echo done", match="*", match_tool="write_file")
+    # Non-matching tool name → hook doesn't fire.
+    assert (
+        store.fire(
+            POST_TOOL,
+            {"task_name": "x", "event": POST_TOOL, "tool_name": "read_file"},
+        )
+        == []
+    )
+    # Matching tool name → fires.
+    results = store.fire(
+        POST_TOOL,
+        {"task_name": "x", "event": POST_TOOL, "tool_name": "write_file"},
+    )
+    assert len(results) == 1
+
+
+def test_hook_fire_tool_event_match_tool_glob():
+    _prefs, store = _prefs_and_hook_store()
+    store.add("all-writes", PRE_TOOL, "echo", match="*", match_tool="write_*")
+    results = store.fire(
+        PRE_TOOL,
+        {"task_name": "x", "event": PRE_TOOL, "tool_name": "write_file"},
+    )
+    assert len(results) == 1
+    # A non-write tool doesn't match the write_* glob.
+    assert (
+        store.fire(
+            PRE_TOOL,
+            {"task_name": "x", "event": PRE_TOOL, "tool_name": "read_file"},
+        )
+        == []
+    )
+
+
+def test_hook_fire_on_message_event():
+    _prefs, store = _prefs_and_hook_store()
+    store.add("logger", ON_MESSAGE, "echo logged", match="*")
+    results = store.fire(
+        ON_MESSAGE,
+        {
+            "task_name": "x",
+            "event": ON_MESSAGE,
+            "text": "hello",
+            "tool_calls": [],
+        },
+    )
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+
+
+def test_hook_fire_tool_event_passes_tool_name_on_stdin():
+    _prefs, store = _prefs_and_hook_store()
+    py = sys.executable.replace("\\", "/")
+    store.add(
+        "ctx",
+        PRE_TOOL,
+        f'"{py}" -c "import sys,json; d=json.load(sys.stdin); print(d[\\"tool_name\\"])"',
+        match="*",
+    )
+    results = store.fire(
+        PRE_TOOL,
+        {"task_name": "x", "event": PRE_TOOL, "tool_name": "shell"},
+    )
+    assert results[0]["ok"] is True
+    assert "shell" in results[0]["stdout"]
 
 
 # -- Tolerant loading (malformed entries skipped) -----------------------------

@@ -551,6 +551,10 @@ class SessionManager:
             persona_registry=self.personas,
             command_loader=self._engine_command_loader(),
             live_delivery=self._live_delivery,
+            # Tool-level hooks (pre_tool/post_tool/on_message) — the same HookStore that
+            # fires pre_run/post_run. Firer is None when no tool-event hooks are
+            # registered, so the hot path skips the subprocess call entirely.
+            tool_hook_firer=self._tool_hook_firer(),
         )
         # An automation run rebuilt here (manual "Run now" over WS, durable resume) still
         # carries its task's standing allowances — the rules live on the task record.
@@ -1512,10 +1516,24 @@ class SessionManager:
         self.browser_logins.add(entry)
         # Tell the caller whether Playwright is available so the frontend can pick the
         # right capture flow (headed window vs cookie paste) without a separate probe.
-        from ..browser_login_capture import try_playwright_available
+        # Surface the probe error too: when Playwright is *installed but broken* the
+        # boolean alone reads as "not installed" and the "install playwright" hint is
+        # misleading — the error string tells the user what's actually wrong.
+        from ..browser_login_capture import (
+            playwright_probe_error,
+            try_playwright_available,
+        )
 
-        return {"ok": True, "id": login_id, "entry": entry.to_dict(),
-                "playwright_available": try_playwright_available()}
+        result: dict[str, Any] = {
+            "ok": True,
+            "id": login_id,
+            "entry": entry.to_dict(),
+            "playwright_available": try_playwright_available(),
+        }
+        probe_err = playwright_probe_error()
+        if probe_err:
+            result["playwright_error"] = probe_err
+        return result
 
     def begin_browser_login_capture(self, login_id: str) -> dict[str, Any]:
         from ..browser_logins import safe_id
@@ -3255,6 +3273,10 @@ class SessionManager:
             persona_registry=self.personas,
             command_loader=self._engine_command_loader(),
             live_delivery=self._live_delivery,
+            # Tool-level hooks (pre_tool/post_tool/on_message) — the same HookStore that
+            # fires pre_run/post_run. Firer is None when no tool-event hooks are
+            # registered, so the hot path skips the subprocess call entirely.
+            tool_hook_firer=self._tool_hook_firer(),
         )
         self._seed_task_permissions(engine, task)
         return engine
@@ -4043,6 +4065,8 @@ class SessionManager:
                 "plugins": [p.to_dict() for p in spec.requires_plugins],
                 "commands": [c.to_dict() for c in spec.requires_commands],
                 "subagents": [s.to_dict() for s in spec.requires_subagents],
+                "rules": [r.to_dict() for r in spec.requires_rules],
+                "hooks": [h.to_dict() for h in spec.requires_hooks],
                 "permissions": list(spec.permissions),
                 "browser_login": list(spec.browser_login),
                 "has_schedule": spec.primary_schedule is not None,
@@ -4080,6 +4104,15 @@ class SessionManager:
             source = getattr(entry, "source_id", "") or ""
 
         # Dependency/capability manifest: every external thing this spec pulls in.
+        # Rules + hooks are soft deps: preflight reports whether each is already
+        # registered (configured: True/False) so the GUI can flag needs_attention.
+        # A missing rule/hook does NOT block install — the user may add it manually.
+        registered_rules = {
+            (r["pattern"], r["action"]) for r in self.rule_store.list(enabled_only=True)
+        }
+        registered_hook_keys = {
+            (h["event"], h.get("match_tool", "*")) for h in self.hooks.list(enabled_only=True)
+        }
         manifest = {
             "source": source,
             "version": version,
@@ -4089,6 +4122,20 @@ class SessionManager:
             "requires_skills": [s.to_dict() for s in spec.requires_skills],
             "requires_commands": [c.to_dict() for c in spec.requires_commands],
             "requires_subagents": [s.to_dict() for s in spec.requires_subagents],
+            "requires_rules": [
+                {
+                    **r.to_dict(),
+                    "configured": (r.pattern, r.action) in registered_rules,
+                }
+                for r in spec.requires_rules
+            ],
+            "requires_hooks": [
+                {
+                    **h.to_dict(),
+                    "configured": (h.event, h.match_tool) in registered_hook_keys,
+                }
+                for h in spec.requires_hooks
+            ],
             "permissions": list(spec.permissions),
             "browser_login": list(spec.browser_login),
             "config_secret_keys": [f.key for f in spec.config_schema if f.is_secret],
@@ -4111,11 +4158,26 @@ class SessionManager:
             sort_keys=True, ensure_ascii=False,
         )
         digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
+        # Soft-dep gaps: rules/hooks the spec wants but aren't registered yet. These don't
+        # block install (the user may add them manually or accept the default path), but the
+        # GUI surfaces them so the user knows the DH's intended guardrails won't be active.
+        needs_attention: list[str] = []
+        for r in manifest["requires_rules"]:
+            if not r["configured"]:
+                needs_attention.append(
+                    f"rule {r['pattern']!r} → {r['action']} (not registered)"
+                )
+        for h in manifest["requires_hooks"]:
+            if not h["configured"]:
+                needs_attention.append(
+                    f"hook {h['event']} on {h.get('match_tool', '*')} (not registered)"
+                )
         return {
             "ok": True,
             "manifest": manifest,
             "approval_digest": digest,
             "mcp_confirmation_required": mcp_registering_plugins,
+            "needs_attention": needs_attention,
             "missing_required_config": missing,
         }
 
@@ -4935,6 +4997,21 @@ class SessionManager:
                 dirs.append(cd)
         return dirs
 
+    def _tool_hook_firer(self):
+        """Return a firer for tool-level hooks (pre_tool/post_tool/on_message), or None.
+
+        Returns None when no enabled tool-event hook is registered, so the engine's hot
+        path skips the subprocess call entirely. The firer is the HookStore.fire bound
+        method — it runs external commands (30s timeout, best-effort) and never raises.
+        """
+        from ..hooks import TOOL_EVENTS
+
+        has_tool_hook = any(
+            h["enabled"] and h["event"] in TOOL_EVENTS
+            for h in self.hooks.list(enabled_only=True)
+        )
+        return self.hooks.fire if has_tool_hook else None
+
     def _engine_command_loader(self):
         """Build a CommandLoader that scans both standalone commands and plugin-contributed ones.
 
@@ -5219,10 +5296,16 @@ class SessionManager:
         return self.hooks.list()
 
     def add_hook(
-        self, name: str, event: str, command: str, *, match: str = "*"
+        self,
+        name: str,
+        event: str,
+        command: str,
+        *,
+        match: str = "*",
+        match_tool: str = "*",
     ) -> dict[str, Any]:
         try:
-            h = self.hooks.add(name, event, command, match=match)
+            h = self.hooks.add(name, event, command, match=match, match_tool=match_tool)
             return {"ok": True, "hook": h}
         except ValueError as e:
             return {"ok": False, "error": str(e)}

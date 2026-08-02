@@ -47,7 +47,7 @@ class ScriptedProvider(ProviderClient):
         return ModelCapabilities()
 
 
-def _engine(tmp_path, turns, *, approver=None, loop=False, max_iterations=12):
+def _engine(tmp_path, turns, *, approver=None, loop=False, max_iterations=12, tool_hook_firer=None):
     provider = ScriptedProvider(turns, loop=loop)
     registry = ToolRegistry()
     registry.register_all(ai.toolkits.files(root=str(tmp_path), allow_write=True))
@@ -59,6 +59,7 @@ def _engine(tmp_path, turns, *, approver=None, loop=False, max_iterations=12):
         model="gpt-5.5",
         approver=approver,
         max_iterations=max_iterations,
+        tool_hook_firer=tool_hook_firer,
     )
     return engine, provider
 
@@ -439,3 +440,126 @@ def test_outbound_replaces_images_for_non_vision_models(tmp_path):
     assert all(p["type"] != "image_url" for p in parts)
     assert "not viewable" in parts[-1]["text"]
     assert engine.messages[-1]["content"][1]["type"] == "image_url"  # history untouched
+
+
+# -- tool-level hooks (pre_tool / post_tool / on_message) ---------------------
+
+
+def test_pre_tool_hook_fires_with_tool_name_and_arguments(tmp_path):
+    """pre_tool fires before the registry runs, with the tool name + arguments."""
+    seen: list[dict] = []
+
+    def firer(event, ctx):
+        seen.append({"event": event, **ctx})
+
+    engine, _ = _engine(
+        tmp_path,
+        [_tool_turn("list_files", {}), _text_turn("done")],
+        tool_hook_firer=firer,
+    )
+    _collect(engine, "list the files")
+
+    pre = [s for s in seen if s["event"] == "pre_tool"]
+    assert len(pre) == 1
+    assert pre[0]["tool_name"] == "list_files"
+    assert pre[0]["arguments"] == {}
+
+
+def test_pre_tool_hook_skip_short_circuits_the_call(tmp_path):
+    """A pre_tool hook returning skip:true prevents the tool from running; the
+    hook's result becomes the tool's answer."""
+    import coworker.hooks as hk
+
+    calls: list[str] = []
+    firer_calls: list[dict] = []
+
+    def firer(event, ctx):
+        firer_calls.append({"event": event, **ctx})
+        if event == hk.PRE_TOOL:
+            return [{"id": "h1", "name": "guard", "event": hk.PRE_TOOL, "skip": True,
+                     "result": {"blocked": "by hook"}}]
+        return []
+
+    # A tool that would record a side effect if it ran.
+    registry = ToolRegistry()
+
+    def boom():
+        calls.append("ran")
+        return {"ok": True}
+
+    boom.__name__ = "boom"
+    boom.__aisuite_tool_metadata__ = ai.ToolMetadata(
+        name="boom", category="filesystem", risk_level="low", requires_approval=False
+    )
+    boom.__coworker_schema__ = {"type": "object", "properties": {}}
+    registry.register(boom)
+    permissions = PermissionEngine(workspace_root=tmp_path)
+    engine = TurnEngine(
+        provider=ScriptedProvider([_tool_turn("boom", {}), _text_turn("done")]),
+        registry=registry,
+        permissions=permissions,
+        model="gpt-5.5",
+        tool_hook_firer=firer,
+    )
+    events = _collect(engine, "go")
+
+    # The tool never ran.
+    assert calls == []
+    # The tool result in history is the hook's blocked dict.
+    tool_msgs = [m for m in engine.messages if m.get("role") == "tool"]
+    assert tool_msgs and "blocked" in str(tool_msgs[-1].get("content", ""))
+    # post_tool still fired (with status "skipped").
+    post = [c for c in firer_calls if c["event"] == "post_tool"]
+    assert len(post) == 1
+    assert post[0]["status"] == "skipped"
+
+
+def test_post_tool_hook_fires_with_status_and_result(tmp_path):
+    """post_tool fires after the call returns, carrying the status + result preview."""
+    seen: list[dict] = []
+
+    def firer(event, ctx):
+        if event == "post_tool":
+            seen.append({"tool_name": ctx["tool_name"], "status": ctx["status"]})
+
+    engine, _ = _engine(
+        tmp_path,
+        [_tool_turn("list_files", {}), _text_turn("done")],
+        tool_hook_firer=firer,
+    )
+    _collect(engine, "list files")
+
+    assert len(seen) == 1
+    assert seen[0]["tool_name"] == "list_files"
+    assert seen[0]["status"] == "ok"
+
+
+def test_on_message_hook_fires_when_assistant_message_lands(tmp_path):
+    """on_message fires when an assistant turn is appended to history."""
+    seen: list[dict] = []
+
+    def firer(event, ctx):
+        if event == "on_message":
+            seen.append({"text": ctx.get("text", ""), "tool_calls": ctx.get("tool_calls", [])})
+
+    engine, _ = _engine(
+        tmp_path,
+        [_text_turn("hello there"), _text_turn("done")],
+        tool_hook_firer=firer,
+    )
+    _collect(engine, "hi")
+
+    # The first assistant turn ("hello there") fires on_message. The second ("done")
+    # may or may not depending on iteration, so assert at least the first.
+    assert any(s["text"] == "hello there" for s in seen)
+
+
+def test_no_firer_means_no_hook_overhead(tmp_path):
+    """When tool_hook_firer is None (default), the engine runs normally and never
+    touches the hooks subsystem — the hot path is unaffected."""
+    engine, _ = _engine(
+        tmp_path,
+        [_tool_turn("list_files", {}), _text_turn("done")],
+    )
+    events = _collect(engine, "list files")
+    assert EventType.TOOL_FINISHED in _types(events)

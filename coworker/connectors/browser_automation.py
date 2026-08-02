@@ -183,11 +183,17 @@ class _BrowserController:
 
     def _teardown_context_locked(self) -> None:
         """Close just the context/page (keep the browser process alive for rebuild)."""
+        import logging
+
+        log = logging.getLogger("coworker.connectors.browser_automation")
         try:
             if self._context is not None:
                 self._context.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            # A teardown failure (e.g. the browser process already died) shouldn't block
+            # a rebuild, but it used to be swallowed silently — log it so a stuck browser
+            # session is diagnosable instead of a mystery.
+            log.debug("browser context close failed during teardown: %s", exc)
         finally:
             self._context = None
             self._page = None

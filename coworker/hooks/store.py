@@ -9,13 +9,24 @@ E2 ships the two most useful event points first:
   ``run.status`` is determined (``ok`` / ``error``). The natural extension of the
   existing ``NotifyRouter.dispatch_run`` path.
 
-Later batches add tool-level hooks (``pre_tool`` / ``post_tool`` / ``on_message``).
+E2 shipped ``pre_run`` / ``post_run`` (schedule run before/after). This module also
+implements the tool-level hooks promised in the original E2 doc:
+
+- ``pre_tool``  — fired before each authorized tool call executes (after permission
+  check, before ``registry.execute``). A hook may short-circuit the call by writing
+  ``{"skip": true}`` (optionally ``{"result": ...}``) to stdout; the call is then
+  answered with that result instead of running. Mirrors Claude Code's PreToolUse.
+- ``post_tool`` — fired after the call returns (ok or error), with the result/status.
+- ``on_message`` — fired when an assistant message is appended to the history (the
+  natural observation point for logging/auditing what the model said).
 
 A Hook = a glob ``match`` (which task/session names trigger it) + a ``command`` (script
 path or inline shell) + an ``event``. When the hook fires, a context dict is serialized
 to JSON and passed to the command on stdin, so the script can read task name, run id,
-status, etc. Commands run in a subprocess with a 30s timeout — hooks must never block
-the agent loop.
+status, tool name, arguments, etc. Commands run in a subprocess with a 30s timeout —
+hooks must never block the agent loop. Tool events also match on ``match_tool`` (glob
+against the tool name; ``"*"`` or absent = all tools) so a hook can target just
+``write_file`` without a separate per-tool event type.
 """
 
 from __future__ import annotations
@@ -30,7 +41,13 @@ from typing import Any, Callable, Optional
 
 PRE_RUN = "pre_run"
 POST_RUN = "post_run"
-EVENTS = (PRE_RUN, POST_RUN)
+PRE_TOOL = "pre_tool"
+POST_TOOL = "post_tool"
+ON_MESSAGE = "on_message"
+# Run-level events (schedule before/after) vs tool-level events (per call/message).
+RUN_EVENTS = (PRE_RUN, POST_RUN)
+TOOL_EVENTS = (PRE_TOOL, POST_TOOL, ON_MESSAGE)
+EVENTS = RUN_EVENTS + TOOL_EVENTS
 
 # Hooks are best-effort: a slow or hanging hook must not stall the run. 30s ceiling.
 _HOOK_TIMEOUT = 30
@@ -44,6 +61,9 @@ class Hook:
     match: str  # glob against the task/session name; "*" = all
     command: str  # shell command or script path
     enabled: bool = True
+    # For tool events only: glob against the tool name ("*" or "" = all tools).
+    # Ignored for run events (they don't have a tool name to match).
+    match_tool: str = "*"
 
 
 def _new_id() -> str:
@@ -77,6 +97,7 @@ class HookStore:
                         match=str(h.get("match", "*")),
                         command=str(h["command"]),
                         enabled=bool(h.get("enabled", True)),
+                        match_tool=str(h.get("match_tool", "*")),
                     )
                 )
             except (KeyError, TypeError):
@@ -92,6 +113,7 @@ class HookStore:
                 "match": h.match,
                 "command": h.command,
                 "enabled": h.enabled,
+                "match_tool": h.match_tool,
             }
             for h in hooks
         ]
@@ -110,6 +132,7 @@ class HookStore:
                 "match": h.match,
                 "command": h.command,
                 "enabled": h.enabled,
+                "match_tool": h.match_tool,
             }
             for h in hooks
         ]
@@ -122,6 +145,7 @@ class HookStore:
         *,
         match: str = "*",
         enabled: bool = True,
+        match_tool: str = "*",
     ) -> dict[str, Any]:
         if event not in EVENTS:
             raise ValueError(f"invalid event {event!r}; expected one of {EVENTS}")
@@ -131,8 +155,19 @@ class HookStore:
             raise ValueError("name must not be empty")
         if not command:
             raise ValueError("command must not be empty")
+        # match_tool only applies to tool events; normalize run-event hooks to "*".
+        if event in RUN_EVENTS:
+            match_tool = "*"
         hooks = self._hooks()
-        hook = Hook(id=_new_id(), name=name, event=event, match=match or "*", command=command, enabled=enabled)
+        hook = Hook(
+            id=_new_id(),
+            name=name,
+            event=event,
+            match=match or "*",
+            command=command,
+            enabled=enabled,
+            match_tool=match_tool or "*",
+        )
         hooks.append(hook)
         self._write(hooks)
         return {
@@ -142,6 +177,7 @@ class HookStore:
             "match": hook.match,
             "command": hook.command,
             "enabled": hook.enabled,
+            "match_tool": hook.match_tool,
         }
 
     def update(self, hook_id: str, changes: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -158,8 +194,13 @@ class HookStore:
                     if e not in EVENTS:
                         raise ValueError(f"invalid event {e!r}")
                     h.event = e
+                    # Switching to a run event drops any tool-specific match.
+                    if e in RUN_EVENTS:
+                        h.match_tool = "*"
                 if "match" in changes:
                     h.match = str(changes["match"]) or "*"
+                if "match_tool" in changes and h.event in TOOL_EVENTS:
+                    h.match_tool = str(changes["match_tool"]) or "*"
                 if "command" in changes:
                     c = str(changes["command"]).strip()
                     if not c:
@@ -175,6 +216,7 @@ class HookStore:
                     "match": h.match,
                     "command": h.command,
                     "enabled": h.enabled,
+                    "match_tool": h.match_tool,
                 }
         return None
 
@@ -195,18 +237,29 @@ class HookStore:
         ``stderr``, ``returncode``, ``error``). Never raises — a hook failure is recorded
         in the result, not propagated, so the run is unaffected.
 
-        ``context`` always includes ``event`` and ``task_name`` (best-effort); for
-        ``pre_run`` a hook may write ``{"skip": true}`` to stdout to abort the run
-        (recorded as ``skip: true`` in the result).
+        ``context`` always includes ``event`` and ``task_name`` (best-effort). For tool
+        events (``pre_tool`` / ``post_tool`` / ``on_message``) ``context`` also carries
+        ``tool_name``; a hook with ``match_tool`` set filters on it (``"*"`` = all).
+
+        Skip semantics (Claude Code PreToolUse model):
+        - ``pre_run``  — ``{"skip": true}`` aborts the whole run.
+        - ``pre_tool`` — ``{"skip": true}`` skips just this tool call. If ``"result"`` is
+          present it becomes the tool's answer (else a generic skip result); recorded as
+          ``skip: true`` + ``result`` in the hook result.
         """
         results: list[dict[str, Any]] = []
         task_name = str(context.get("task_name", ""))
+        tool_name = str(context.get("tool_name", ""))
         ctx_json = json.dumps(context, ensure_ascii=False)
         for h in self._hooks():
             if not h.enabled or h.event != event:
                 continue
             if not fnmatchcase(task_name, h.match):
                 continue
+            # Tool events also filter on the tool name (glob); run events ignore it.
+            if event in TOOL_EVENTS and h.match_tool and h.match_tool != "*":
+                if not fnmatchcase(tool_name, h.match_tool):
+                    continue
             res: dict[str, Any] = {"id": h.id, "name": h.name, "event": event}
             try:
                 proc = subprocess.run(
@@ -224,12 +277,14 @@ class HookStore:
                 res["returncode"] = proc.returncode
                 res["stdout"] = proc.stdout.strip()
                 res["stderr"] = proc.stderr.strip()
-                # pre_run skip: a hook may request abort by emitting {"skip": true}.
-                if event == PRE_RUN and proc.stdout.strip():
+                # Skip semantics: pre_run aborts the run; pre_tool skips the call.
+                if event in (PRE_RUN, PRE_TOOL) and proc.stdout.strip():
                     try:
                         parsed = json.loads(proc.stdout)
                         if isinstance(parsed, dict) and parsed.get("skip"):
                             res["skip"] = True
+                            if event == PRE_TOOL and "result" in parsed:
+                                res["result"] = parsed["result"]
                     except (json.JSONDecodeError, ValueError):
                         pass
             except subprocess.TimeoutExpired:

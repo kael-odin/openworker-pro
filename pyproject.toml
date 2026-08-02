@@ -15,13 +15,20 @@ dependencies = [
     "textual>=1.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    # aisuite (toolkits/tracing). Originally pinned to a git commit on andrewyng/aisuite that
-    # exposed an aisuite.agents submodule (tool decorator + ToolMetadata); that repo is no
-    # longer reachable and the commit was never published to PyPI. The PyPI release (0.1.14)
-    # restructured the package and dropped aisuite.agents. coworker/tools/_aisuite_compat.py
-    # bridges this: tries the real import, then falls back to a local equivalent, so either
-    # aisuite works. Install from PyPI if the pinned commit is unavailable.
-    "aisuite>=0.1.14",
+    # aisuite — pinned to GitHub main, NOT PyPI. PyPI 0.1.14 is a stripped
+    # provider-routing-only client (Client/Message/Tools/framework/mcp/providers) that
+    # drops the entire `aisuite.agents` (tool/ToolMetadata/Runner/StateStore/ArtifactStore/
+    # tool policies) and `aisuite.toolkits` (files/git factories) and `aisuite.tracing`
+    # submodules. openworker-pro was born inside the aisuite repo at commit 1b4bbf3 and
+    # depends on those APIs at runtime (~25 modules stamp `ai.ToolMetadata`, catalog.py
+    # and subagent.py call `ai.toolkits.files()`/`.git()`).
+    #
+    # GitHub main ships the full package. coworker/tools/_aisuite_compat.py and
+    # _toolkits_compat.py remain as defensive fallbacks (no-ops when the real submodules
+    # are present) so the codebase still imports cleanly if a future install falls back
+    # to PyPI. Prefer the git ref so the upstream StateStore/ArtifactStore/tool-policy
+    # layer is available for direct use rather than only via the shim's subset.
+    "aisuite @ git+https://github.com/andrewyng/aisuite.git@main",
     "docstring_parser",
     "pyyaml>=6",  # persona manifest frontmatter (YAML)
     "pydantic>=2",

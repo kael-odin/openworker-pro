@@ -150,6 +150,9 @@ def build_engine(
     persona_registry: Optional[Any] = None,
     command_loader: Optional[CommandLoader] = None,
     live_delivery: Optional[Any] = None,
+    # Tool-level hook firer (pre_tool/post_tool/on_message). None = no hooks wired.
+    # The manager passes its HookStore.fire bound method so hooks persist with prefs.
+    tool_hook_firer: Optional[Any] = None,
 ) -> TurnEngine:
     ws = Path(workspace).expanduser().resolve() if workspace else None
     if agent.needs_workspace and ws is None:
@@ -355,6 +358,7 @@ def build_engine(
         approver=approver,
         # Stop kills the in-flight foreground shell command, not just the loop.
         interrupt_hooks=[executor.interrupt_now] if executor is not None else None,
+        tool_hook_firer=tool_hook_firer,
         max_iterations=(
             max_iterations if max_iterations is not None else config.max_iterations
         ),

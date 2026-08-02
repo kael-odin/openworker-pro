@@ -451,9 +451,14 @@ def test_requires_plugins_commands_subagents_parsed():
     assert s.requires_commands[0].id == "review"
     assert len(s.requires_subagents) == 1
     assert s.requires_subagents[0].id == "researcher"
-    # to_dict surfaces all five requires kinds.
+    # to_dict surfaces all seven requires kinds (rules/hooks are soft deps, included
+    # even when the spec declares none — empty lists, same as the other kinds).
     d = s.to_dict()
-    assert set(d["requires"].keys()) == {"mcps", "skills", "plugins", "commands", "subagents"}
+    assert set(d["requires"].keys()) == {
+        "mcps", "skills", "plugins", "commands", "subagents", "rules", "hooks"
+    }
+    assert d["requires"]["rules"] == []
+    assert d["requires"]["hooks"] == []
 
 
 def test_subscription_shorthand():
@@ -926,6 +931,16 @@ class _FakeManager:
         self.task_store = _FakeTaskStore()
         self.secrets = SecretStore(tmp_path / "secrets.json")
         self.dhp_instances = InstanceStore(tmp_path / "dh.json", secrets=self.secrets)
+        # preflight_digital_human checks whether requires_rules/requires_hooks are
+        # already registered against the rule/hook stores. Bind real stores on an
+        # empty prefs dict so the soft-dep probe works under the fake.
+        from coworker.rules import RuleStore
+        from coworker.hooks import HookStore
+
+        self._prefs: dict = {}
+        self._save_prefs = lambda: None
+        self.rule_store = RuleStore(self._prefs, self._save_prefs)
+        self.hooks = HookStore(self._prefs, self._save_prefs)
         # Build a registry from a local source with one spec.
         repo = tmp_path / "repo"
         (repo / "packages" / "digital-humans" / "news").mkdir(parents=True)
@@ -1201,6 +1216,64 @@ def test_install_without_digest_is_refused(tmp_path):
     assert not result["ok"]
     assert "re-approve" in result["error"] or "approval" in result["error"].lower()
     assert "approval_digest" in result  # caller gets the digest to show + resubmit
+
+
+# -- requires_rules / requires_hooks soft-dep preflight (Task #31) ------------
+
+
+def test_preflight_rules_and_hooks_soft_deps(tmp_path):
+    """requires_rules/requires_hooks are soft deps: preflight reports each as
+    configured:True/False and surfaces unconfigured ones in needs_attention,
+    but never blocks install (the manifest is still ok with a valid digest)."""
+    from coworker.server.manager import SessionManager
+
+    mgr = _FakeManager(tmp_path)
+    # A spec that expects one rule + one hook.
+    repo = tmp_path / "repo2"
+    (repo / "packages" / "digital-humans" / "guarded").mkdir(parents=True)
+    (repo / "packages" / "digital-humans" / "guarded" / "spec.yaml").write_text(
+        "name: Guarded\nversion: '1.0.0'\nauthor: a\ndescription: d\ntype: automation\nsystem_prompt: x.\n"
+        "store:\n  slug: guarded\n"
+        "subscriptions:\n  - source:\n      type: schedule\n      config:\n        every: 24h\n"
+        "requires:\n"
+        "  rules:\n"
+        "    - pattern: write_file\n      action: deny\n      reason: read-only DH\n"
+        "  hooks:\n"
+        "    - event: pre_tool\n      command: audit.sh\n      match_tool: write_*\n",
+        encoding="utf-8",
+    )
+    (repo / "index.json").write_text(
+        json.dumps({"apps": [{"slug": "guarded", "name": "Guarded", "path": "packages/digital-humans/guarded"}]}),
+        encoding="utf-8",
+    )
+    from coworker.digital_human.sources import RegistrySource
+    from coworker.digital_human.store import DhpRegistry
+
+    mgr.dhp_registry = DhpRegistry([RegistrySource(id="local", name="L", url=str(repo), source_type="local")])
+
+    pf = SessionManager.preflight_digital_human(mgr, "guarded", {})
+    assert pf["ok"], pf
+    m = pf["manifest"]
+    assert len(m["requires_rules"]) == 1
+    assert m["requires_rules"][0]["pattern"] == "write_file"
+    assert m["requires_rules"][0]["action"] == "deny"
+    assert m["requires_rules"][0]["configured"] is False
+    assert len(m["requires_hooks"]) == 1
+    assert m["requires_hooks"][0]["event"] == "pre_tool"
+    assert m["requires_hooks"][0]["match_tool"] == "write_*"
+    assert m["requires_hooks"][0]["configured"] is False
+    # Both surface in needs_attention as unconfigured soft gaps.
+    assert any("write_file" in n and "deny" in n for n in pf["needs_attention"])
+    assert any("pre_tool" in n for n in pf["needs_attention"])
+
+    # Register the matching rule + hook, re-preflight → both configured, no attention.
+    mgr.rule_store.add(pattern="write_file", action="deny")
+    mgr.hooks.add("audit", "pre_tool", "audit.sh", match="*", match_tool="write_*")
+    pf2 = SessionManager.preflight_digital_human(mgr, "guarded", {})
+    assert pf2["ok"], pf2
+    assert pf2["manifest"]["requires_rules"][0]["configured"] is True
+    assert pf2["manifest"]["requires_hooks"][0]["configured"] is True
+    assert pf2["needs_attention"] == []
 
 
 def test_install_with_matching_digest_succeeds(tmp_path):

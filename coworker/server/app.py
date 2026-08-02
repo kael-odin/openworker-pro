@@ -674,9 +674,9 @@ def create_app(manager: SessionManager) -> FastAPI:
         return manager.remove_rule(rule_id)
 
     # -- Hooks (pre_run/post_run, 批次 E2) ----------------------------------------
-    # CRUD for run-lifecycle hooks. A hook fires on pre_run (before engine build, can
-    # skip) or post_run (after status determined). CRUD only — firing is internal to
-    # _run_scheduled_task.
+    # CRUD for agent-loop hooks. Run-level events fire on pre_run/post_run (schedule
+    # around a digital human run); tool-level events fire on pre_tool (may skip the
+    # call) / post_tool / on_message. CRUD only — firing is internal to the engine.
     @app.get("/v1/hooks")
     def hooks() -> dict[str, Any]:
         return {"hooks": manager.list_hooks()}
@@ -686,6 +686,7 @@ def create_app(manager: SessionManager) -> FastAPI:
         return manager.add_hook(
             body.get("name", ""), body.get("event", ""), body.get("command", ""),
             match=body.get("match", "*"),
+            match_tool=body.get("match_tool", "*"),
         )
 
     @app.patch("/v1/hooks/{hook_id}")

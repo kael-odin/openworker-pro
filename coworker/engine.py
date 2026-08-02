@@ -45,6 +45,13 @@ class PermissionRequest:
 
 Approver = Callable[[PermissionRequest], Awaitable[ApprovalOutcome]]
 
+# A tool-level hook firer: ``(event, context) -> list[result]``. The engine calls it
+# for pre_tool / post_tool / on_message events. ``None`` (the default) means no hooks
+# are registered and the call is skipped entirely — zero overhead on the hot path.
+# ``event`` is one of the ``coworker.hooks`` tool-event constants; ``context`` carries
+# task_name/session_id/tool_name/arguments/result as appropriate. See hooks/store.py.
+ToolHookFirer = Callable[[str, dict[str, Any]], list[dict[str, Any]]]
+
 
 async def _deny_all(_request: PermissionRequest) -> ApprovalOutcome:
     return ApprovalOutcome.DENY
@@ -77,6 +84,9 @@ class TurnEngine:
         # Called (thread-safe, best-effort) when the user stops the turn — e.g. the
         # executor's kill for a running shell command.
         interrupt_hooks: Optional[list[Callable[[], None]]] = None,
+        # Tool-level hook firer (pre_tool / post_tool / on_message). None = no hooks
+        # wired; the engine never calls into the hooks subsystem in that case.
+        tool_hook_firer: Optional[ToolHookFirer] = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -124,6 +134,11 @@ class TurnEngine:
         # TOOL_FINISHED event can carry the note to the tool card (§25).
         self._standing_notes: dict[str, str] = {}
         self._interrupt_hooks: list[Callable[[], None]] = list(interrupt_hooks or [])
+        # Tool-level hooks (pre_tool/post_tool/on_message). None → no hooks, hot path
+        # skips the firer call entirely. The firer is the hooks store's ``fire`` bound
+        # method (or any callable with the same signature); it runs subprocesses and is
+        # therefore invoked in a worker thread (pre/post_tool) or inline (on_message).
+        self._tool_hook_firer: Optional[ToolHookFirer] = tool_hook_firer
 
     # -- external controls ------------------------------------------------------
     def request_interrupt(self) -> None:
@@ -398,6 +413,23 @@ class TurnEngine:
                 payload["reasoning"] = turn.reasoning
             if turn.usage is not None:
                 payload["usage"] = {"model": self.model, **turn.usage.as_dict()}
+            # on_message hooks fire when an assistant message lands in history
+            # (best-effort; never blocks the loop). Carries the text + tool-call names
+            # so a hook can audit/log what the model said without the full message blob.
+            if self._tool_hook_firer is not None:
+                try:
+                    self._tool_hook_firer(
+                        "on_message",
+                        {
+                            "event": "on_message",
+                            "task_name": self.audit_context.get("agent", ""),
+                            "session_id": self.audit_context.get("session_id", ""),
+                            "text": turn.text or "",
+                            "tool_calls": [tc.name for tc in turn.tool_calls],
+                        },
+                    )
+                except Exception:
+                    pass
             yield Event(EventType.ASSISTANT_MESSAGE, payload)
 
             if not turn.tool_calls:
@@ -768,8 +800,39 @@ class TurnEngine:
 
         yield True
 
+    def _tool_hook_context(self, tool_call: ToolCall) -> dict[str, Any]:
+        """Build the context dict passed to pre_tool / post_tool hooks."""
+        ctx = {
+            "event": "",  # filled by caller
+            "task_name": self.audit_context.get("agent", ""),
+            "session_id": self.audit_context.get("session_id", ""),
+            "tool_name": tool_call.name,
+            "tool_call_id": tool_call.id,
+            "arguments": tool_call.arguments,
+        }
+        ws = self.audit_context.get("workspace")
+        if ws:
+            ctx["workspace"] = ws
+        return ctx
+
     def _execute_sync(self, tool_call: ToolCall) -> tuple[Any, str]:
-        """Execute one authorized call (runs in a worker thread)."""
+        """Execute one authorized call (runs in a worker thread).
+
+        pre_tool hooks fire first (best-effort, subprocess, 30s ceiling). If any
+        requests ``skip``, the call is answered with the hook's ``result`` (or a
+        generic skip dict) and never reaches the registry — mirroring Claude Code's
+        PreToolUse short-circuit. Hook failures never block execution.
+        """
+        if self._tool_hook_firer is not None:
+            ctx = self._tool_hook_context(tool_call)
+            ctx["event"] = "pre_tool"
+            try:
+                for res in self._tool_hook_firer("pre_tool", ctx):
+                    if isinstance(res, dict) and res.get("skip"):
+                        result = res.get("result", {"skipped": "pre_tool hook"})
+                        return result, "skipped"
+            except Exception:
+                pass  # a hook error must never block the tool
         try:
             return self.registry.execute(tool_call.name, tool_call.arguments), "ok"
         except Exception as exc:
@@ -811,6 +874,18 @@ class TurnEngine:
             result=result,
             result_preview=_preview(result),
         )
+        # post_tool hooks fire after the result is recorded in history (best-effort;
+        # a hook failure is logged in the result, never propagated). The result
+        # preview (not the full object, which may be large) goes to the hook.
+        if self._tool_hook_firer is not None:
+            ctx = self._tool_hook_context(tool_call)
+            ctx["event"] = "post_tool"
+            ctx["status"] = status
+            ctx["result_preview"] = _preview(result)
+            try:
+                self._tool_hook_firer("post_tool", ctx)
+            except Exception:
+                pass
         rule = self._standing_notes.pop(tool_call.id, "")
         return Event(
             EventType.TOOL_FINISHED,

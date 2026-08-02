@@ -30,24 +30,64 @@ from .browser_logins import BrowserLoginEntry, safe_id
 
 # Cache the Playwright-availability probe (import test) — it's process-stable.
 _playwright_available: Optional[bool] = None
+# The error message captured during the probe (None when the import succeeded or was
+# never run). Surfaces *why* Playwright is unavailable so the GUI/manager can tell the
+# user "playwright is installed but its native deps are broken" vs "not installed".
+_playwright_probe_error: Optional[str] = None
 _probe_lock = threading.Lock()
 
 
 def try_playwright_available() -> bool:
-    """True if ``playwright.sync_api`` can be imported. Cached after the first probe."""
-    global _playwright_available
+    """True if ``playwright.sync_api`` can be imported. Cached after the first probe.
+
+    The probe used to swallow every exception silently, so a Playwright install whose
+    native browser deps were broken (greenlet/asyncio import-time failures, missing
+    OS libraries) looked identical to "not installed" — the user got a "install
+    playwright" hint that was already satisfied. The error is now captured into
+    ``playwright_probe_error()`` and logged so the cause is diagnosable.
+    """
+    global _playwright_available, _playwright_probe_error
     if _playwright_available is not None:
         return _playwright_available
     with _probe_lock:
         if _playwright_available is not None:
             return _playwright_available
+        import logging
+
+        log = logging.getLogger("coworker.browser_login_capture")
         try:
             import playwright.sync_api  # noqa: F401
 
             _playwright_available = True
-        except Exception:
+            _playwright_probe_error = None
+        except ImportError as exc:
+            # The common, expected case: the optional dep isn't installed. Debug-level
+            # is enough — the GUI already nudges the user to install it.
             _playwright_available = False
+            _playwright_probe_error = str(exc)
+            log.debug("playwright not installed: %s", exc)
+        except Exception as exc:
+            # Installed but broken — native deps, a partial install, or an incompatible
+            # greenlet/anyio version. This is the case that was silently swallowed; warn
+            # so it shows up in logs without the user having to guess.
+            _playwright_available = False
+            _playwright_probe_error = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "playwright is installed but unusable (%s). "
+                "Try `python -m playwright install chromium` or reinstall playwright.",
+                _playwright_probe_error,
+            )
     return _playwright_available
+
+
+def playwright_probe_error() -> Optional[str]:
+    """The error captured by the last ``try_playwright_available`` probe, or None.
+
+    None when Playwright imported cleanly. Useful for surfacing a precise diagnostic
+    (e.g. "playwright is installed but its native deps failed to load") instead of a
+    generic "install playwright" message.
+    """
+    return _playwright_probe_error
 
 
 def profile_dir(profiles_root: Path, login_id: str) -> Path:

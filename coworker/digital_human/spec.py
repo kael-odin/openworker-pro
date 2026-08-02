@@ -188,6 +188,51 @@ class SubagentDependency:
 
 
 @dataclass
+class RuleDependency:
+    """A permission rule the digital human expects to be in effect for its runs.
+
+    ``pattern`` is the tool/target pattern (same syntax as ``RuleStore``), ``action``
+    is allow/deny/ask. Unlike MCP/skill deps, a missing rule is a *soft* gap: it doesn't
+    block install (the user may want to add it manually or accept the default-ask path),
+    but preflight surfaces it in the manifest as ``needs_attention`` so the user knows the
+    DH's intended permissions won't be auto-applied.
+    """
+
+    pattern: str
+    action: str = "ask"
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {"pattern": self.pattern, "action": self.action, "reason": self.reason}
+
+
+@dataclass
+class HookDependency:
+    """A hook (pre_run/post_run/pre_tool/post_tool/on_message) the digital human expects
+    to be registered for its runs.
+
+    Like rules, a missing hook is a *soft* gap: preflight surfaces it as
+    ``needs_attention`` rather than blocking install. ``match_tool`` applies to tool
+    events (``"*"`` = all tools); ignored for run events.
+    """
+
+    event: str
+    command: str
+    match: str = "*"
+    match_tool: str = "*"
+    reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "event": self.event,
+            "command": self.command,
+            "match": self.match,
+            "match_tool": self.match_tool,
+            "reason": self.reason,
+        }
+
+
+@dataclass
 class SubscriptionDef:
     """One trigger source. ``cron`` is the resolved openworker cron expression (from ``every`` or
     ``cron``); ``every`` retains the raw interval for the UI. Non-schedule sources keep ``cron=None``
@@ -233,6 +278,9 @@ class DigitalHumanSpec:
     requires_plugins: list[PluginDependency] = field(default_factory=list)
     requires_commands: list[CommandDependency] = field(default_factory=list)
     requires_subagents: list[SubagentDependency] = field(default_factory=list)
+    # Soft dependencies (preflight surfaces as needs_attention, not install-blocking):
+    requires_rules: list[RuleDependency] = field(default_factory=list)
+    requires_hooks: list[HookDependency] = field(default_factory=list)
     filters: list[dict[str, Any]] = field(default_factory=list)
     memory_schema: dict[str, Any] = field(default_factory=dict)
     output: dict[str, Any] = field(default_factory=dict)
@@ -288,6 +336,8 @@ class DigitalHumanSpec:
                 "plugins": [p.to_dict() for p in self.requires_plugins],
                 "commands": [c.to_dict() for c in self.requires_commands],
                 "subagents": [s.to_dict() for s in self.requires_subagents],
+                "rules": [r.to_dict() for r in self.requires_rules],
+                "hooks": [h.to_dict() for h in self.requires_hooks],
             },
             "filters": list(self.filters),
             "memory_schema": dict(self.memory_schema),
@@ -520,9 +570,11 @@ def _parse_requires(
     list[PluginDependency],
     list[CommandDependency],
     list[SubagentDependency],
+    list[RuleDependency],
+    list[HookDependency],
 ]:
     if raw is None:
-        return [], [], [], [], []
+        return [], [], [], [], [], [], []
     if not isinstance(raw, dict):
         raise SpecError(f"spec {slug_hint!r}: `requires` must be a mapping")
 
@@ -587,7 +639,54 @@ def _parse_requires(
             )
         )
 
-    return mcps, skills, plugins, commands, subagents
+    # Rules + hooks are soft dependencies — they don't block install, but preflight
+    # surfaces them as needs_attention. They use object form (no shorthand): a rule is
+    # {pattern, action, reason}, a hook is {event, command, match, match_tool, reason}.
+    rules: list[RuleDependency] = []
+    rules_raw = raw.get("rules")
+    if rules_raw is not None:
+        if not isinstance(rules_raw, list):
+            raise SpecError(f"spec {slug_hint!r}: requires.rules must be a list")
+        for item in rules_raw:
+            if not isinstance(item, dict) or not item.get("pattern"):
+                raise SpecError(
+                    f"spec {slug_hint!r}: requires.rules entries need `pattern`"
+                )
+            action = str(item.get("action", "ask")).strip().lower()
+            if action not in ("allow", "deny", "ask"):
+                raise SpecError(
+                    f"spec {slug_hint!r}: requires.rules action {action!r} must be allow/deny/ask"
+                )
+            rules.append(
+                RuleDependency(
+                    pattern=str(item["pattern"]).strip(),
+                    action=action,
+                    reason=str(item.get("reason", "")).strip(),
+                )
+            )
+
+    hooks: list[HookDependency] = []
+    hooks_raw = raw.get("hooks")
+    if hooks_raw is not None:
+        if not isinstance(hooks_raw, list):
+            raise SpecError(f"spec {slug_hint!r}: requires.hooks must be a list")
+        for item in hooks_raw:
+            if not isinstance(item, dict) or not item.get("event") or not item.get("command"):
+                raise SpecError(
+                    f"spec {slug_hint!r}: requires.hooks entries need `event` and `command`"
+                )
+            event = str(item["event"]).strip()
+            hooks.append(
+                HookDependency(
+                    event=event,
+                    command=str(item["command"]).strip(),
+                    match=str(item.get("match", "*")) or "*",
+                    match_tool=str(item.get("match_tool", "*")) or "*",
+                    reason=str(item.get("reason", "")).strip(),
+                )
+            )
+
+    return mcps, skills, plugins, commands, subagents, rules, hooks
 
 
 def _normalize_dep_list(raw: Any, ctx: str) -> list[dict[str, Any]]:
@@ -675,7 +774,7 @@ def parse_spec(text: str, *, source: Optional[str] = None) -> DigitalHumanSpec:
         raise SpecError(f"spec {slug_hint!r}: only `automation` may declare `subscriptions`")
 
     config_schema = _parse_config_schema(config_raw, slug_hint)
-    requires_mcps, requires_skills, requires_plugins, requires_commands, requires_subagents = _parse_requires(requires_raw, slug_hint)
+    requires_mcps, requires_skills, requires_plugins, requires_commands, requires_subagents, requires_rules, requires_hooks = _parse_requires(requires_raw, slug_hint)
 
     extra = {k: v for k, v in meta.items() if k not in _KNOWN_KEYS}
 
@@ -695,6 +794,8 @@ def parse_spec(text: str, *, source: Optional[str] = None) -> DigitalHumanSpec:
         requires_plugins=requires_plugins,
         requires_commands=requires_commands,
         requires_subagents=requires_subagents,
+        requires_rules=requires_rules,
+        requires_hooks=requires_hooks,
         filters=_as_dict_list(meta.get("filters"), f"spec {slug_hint!r}: filters"),
         memory_schema=meta.get("memory_schema") if isinstance(meta.get("memory_schema"), dict) else {},
         output=meta.get("output") if isinstance(meta.get("output"), dict) else {},
