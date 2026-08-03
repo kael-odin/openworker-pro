@@ -58,6 +58,11 @@ def _git_clone_or_pull(source: SkillSource, cache_root: Path) -> Path:
 
     Clones shallowly on first use; on subsequent calls, refreshes via ``git pull`` only if the
     cache is older than _CACHE_TTL (so browsing the catalog doesn't hammer GitHub).
+
+    A failed ``pull --ff-only`` (exit 128 — common when the upstream force-pushed or the
+    shallow clone diverged) is recovered by wiping the cache and re-cloning, rather than
+    surfacing a hard error. This is what fixes "git pull returned non-zero exit status 128"
+    on the Anthropic official skill source.
     """
     cache_dir = cache_root / source.id
     if cache_dir.is_dir() and (time.monotonic() - _clone_age(cache_dir)) < _CACHE_TTL:
@@ -65,10 +70,20 @@ def _git_clone_or_pull(source: SkillSource, cache_root: Path) -> Path:
     try:
         if cache_dir.is_dir():
             # Refresh in place. --ff-only avoids surprise merge commits on a cache we own.
-            subprocess.run(
-                ["git", "-C", str(cache_dir), "pull", "--ff-only", "--depth", "1"],
-                check=True, capture_output=True, timeout=60,
-            )
+            # On failure (exit 128 — upstream force-push / shallow divergence), wipe + re-clone
+            # rather than leaving the user stuck on a permanently-broken source.
+            try:
+                subprocess.run(
+                    ["git", "-C", str(cache_dir), "pull", "--ff-only", "--depth", "1"],
+                    check=True, capture_output=True, timeout=60,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                cache_dir.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", source.url, str(cache_dir)],
+                    check=True, capture_output=True, timeout=120,
+                )
         else:
             cache_dir.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(
@@ -95,33 +110,61 @@ def _clone_age(cache_dir: Path) -> float:
 
 
 def _list_git_skills(clone_dir: Path) -> list[dict[str, Any]]:
-    """Discover installable skills in a cloned repo: any subfolder with a SKILL.md.
+    """Discover installable skills in a cloned repo: any folder containing a SKILL.md.
 
     Reads the SKILL.md frontmatter for name/description so the catalog matches what install
-    will actually lay down. Top-level ``SKILL.md`` (a single-skill repo) is also supported.
+    will actually lay down. Supports three layouts:
+
+    * Single-skill repo: ``SKILL.md`` at root.
+    * Flat multi-skill: immediate subfolders each with a ``SKILL.md`` (e.g. ``pdf/SKILL.md``).
+    * Nested multi-skill (Anthropic's layout): ``skills/<name>/SKILL.md`` — the real skills
+      live under a ``skills/`` subdirectory, not at the top level. Without recursing into
+      ``skills/``, the catalog only showed the ``template/`` placeholder and missed the real
+      document skills (docx/pdf/pptx/xlsx).
     """
     from .base import _parse_skill  # reuse the existing frontmatter parser
 
     out: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
     # Single-skill repo: SKILL.md at root.
     root_md = clone_dir / "SKILL.md"
     if root_md.is_file():
         try:
             sk = _parse_skill(root_md)
             out.append({"name": sk.name, "description": sk.description, "path": ""})
+            seen_paths.add("")
         except Exception:
             pass
-    # Multi-skill repo: each immediate subfolder with a SKILL.md.
+
+    # Multi-skill: walk for SKILL.md files. We look at immediate subfolders AND one level of
+    # nesting (skills/<name>/SKILL.md) to cover both the flat and Anthropic layouts without
+    # descending into vendored noise (node_modules, .git, etc.).
+    def _scan_subfolders(parent: Path) -> None:
+        if not parent.is_dir():
+            return
+        for sub in sorted(parent.iterdir()):
+            if not sub.is_dir() or sub.name.startswith("."):
+                continue
+            md = sub / "SKILL.md"
+            if md.is_file():
+                rel = sub.relative_to(clone_dir).as_posix()
+                if rel in seen_paths:
+                    continue
+                seen_paths.add(rel)
+                try:
+                    sk = _parse_skill(md)
+                    out.append({"name": sk.name or sub.name, "description": sk.description, "path": rel})
+                except Exception:
+                    out.append({"name": sub.name, "description": "", "path": rel})
+
+    # Immediate subfolders (flat layout).
+    _scan_subfolders(clone_dir)
+    # One level deeper (Anthropic layout: skills/<name>/SKILL.md).
     for sub in sorted(clone_dir.iterdir()):
-        if not sub.is_dir() or sub.name.startswith("."):
-            continue
-        md = sub / "SKILL.md"
-        if md.is_file():
-            try:
-                sk = _parse_skill(md)
-                out.append({"name": sk.name or sub.name, "description": sk.description, "path": sub.name})
-            except Exception:
-                out.append({"name": sub.name, "description": "", "path": sub.name})
+        if sub.is_dir() and not sub.name.startswith(".") and sub.name != ".git":
+            _scan_subfolders(sub)
+
     return out
 
 

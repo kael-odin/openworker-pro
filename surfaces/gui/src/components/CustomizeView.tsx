@@ -64,12 +64,12 @@ import { BrowserLoginModal } from "./BrowserLoginModal";
 import { loginExpiryChip } from "./loginExpiryChip";
 import { useT } from "../i18n/I18nProvider";
 
-// The §28 page shell: full-bleed main, centered ≤4xl column — same as Connectors/Activity.
+// The §28 page shell: full-bleed main, centered ≤5xl column — same as Connectors/Activity.
 function Shell({ children }: { children: React.ReactNode }) {
   return (
     <main className="flex-1 min-w-0 flex bg-paper">
       <div className="flex-1 min-w-0 overflow-y-auto hairline-scroll">
-        <div className="max-w-4xl mx-auto px-7 py-6">{children}</div>
+        <div className="max-w-5xl mx-auto px-7 py-6">{children}</div>
       </div>
     </main>
   );
@@ -1224,22 +1224,24 @@ function SkillsPanel({
 
       {creating && (
         <div className="mb-3 rounded-lg border border-lineStrong bg-paper p-3 space-y-2">
-          <input
-            className={SEARCH_INPUT}
-            placeholder={t("skills.name_ph")}
-            value={newName}
-            spellCheck={false}
-            onChange={(e) => setNewName(e.target.value)}
-          />
-          <input
-            className={SEARCH_INPUT}
-            placeholder={t("skills.desc_ph")}
-            value={newDesc}
-            spellCheck={false}
-            onChange={(e) => setNewDesc(e.target.value)}
-          />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <input
+              className={SEARCH_INPUT}
+              placeholder={t("skills.name_ph")}
+              value={newName}
+              spellCheck={false}
+              onChange={(e) => setNewName(e.target.value)}
+            />
+            <input
+              className={SEARCH_INPUT}
+              placeholder={t("skills.desc_ph")}
+              value={newDesc}
+              spellCheck={false}
+              onChange={(e) => setNewDesc(e.target.value)}
+            />
+          </div>
           <textarea
-            className={SEARCH_INPUT + " min-h-[80px] resize-y font-mono text-[12px]"}
+            className={SEARCH_INPUT + " min-h-[200px] resize-y font-mono text-[12px]"}
             placeholder={t("skills.body_ph")}
             value={newBody}
             spellCheck={false}
@@ -1362,7 +1364,7 @@ function SkillsPanel({
                       onChange={(e) => setEditDesc(e.target.value)}
                     />
                     <textarea
-                      className={SEARCH_INPUT + " min-h-[80px] resize-y font-mono text-[12px]"}
+                      className={SEARCH_INPUT + " min-h-[180px] resize-y font-mono text-[12px]"}
                       placeholder={t("skills.body_edit_ph")}
                       value={editBody}
                       spellCheck={false}

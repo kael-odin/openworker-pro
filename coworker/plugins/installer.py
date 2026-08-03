@@ -83,6 +83,11 @@ def _git_clone_or_pull(url: str, cache_dir: Path, *, ref: str = "", sha: str = "
 
     A pinned ``sha`` forces a full (non-shallow) fetch + checkout so the exact commit is
     present; without ``sha`` a shallow clone (``--depth 1``) is used and refreshed via pull.
+
+    A failed ``pull --ff-only`` (exit 128 — common when the upstream force-pushed or the
+    shallow clone diverged) is recovered by wiping the cache and re-cloning, rather than
+    surfacing a hard error. This is what fixes "git pull returned non-zero exit status 128"
+    on the Claude official plugin marketplace source.
     """
     if cache_dir.is_dir() and not sha and (time.monotonic() - _clone_age(cache_dir)) < _CACHE_TTL:
         return cache_dir
@@ -93,29 +98,50 @@ def _git_clone_or_pull(url: str, cache_dir: Path, *, ref: str = "", sha: str = "
                 _run_git(["git", "-C", str(cache_dir), "fetch", "--depth", "1", "origin", sha], timeout=90)
                 _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
             else:
-                _run_git(["git", "-C", str(cache_dir), "pull", "--ff-only", "--depth", "1"], timeout=60)
+                _try_pull_or_reclone(url, cache_dir)
         else:
-            cache_dir.parent.mkdir(parents=True, exist_ok=True)
-            if sha:
-                # Clone first (shallow is fine, we fetch the sha explicitly), then pin.
-                _run_git(["git", "clone", "--depth", "1", url, str(cache_dir)], timeout=120)
-                try:
-                    _run_git(["git", "-C", str(cache_dir), "fetch", "--depth", "1", "origin", sha], timeout=90)
-                    _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
-                except PluginInstallError:
-                    # sha fetch can fail if the shallow clone doesn't contain it; unshallow + retry.
-                    _run_git(["git", "-C", str(cache_dir), "fetch", "--unshallow"], timeout=180)
-                    _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
-            elif ref:
-                _run_git(["git", "clone", "--depth", "1", "--branch", ref, url, str(cache_dir)], timeout=120)
-            else:
-                _run_git(["git", "clone", "--depth", "1", url, str(cache_dir)], timeout=120)
+            _clone_fresh(url, cache_dir, ref=ref, sha=sha)
     except PluginInstallError:
         raise
     except Exception as e:
         raise PluginInstallError(f"failed to clone {url}: {e}") from e
     _mark_clone_age(cache_dir)
     return cache_dir
+
+
+def _try_pull_or_reclone(url: str, cache_dir: Path) -> None:
+    """Refresh a cached clone via ``pull --ff-only``; on failure, wipe + re-clone.
+
+    A shallow clone's ``pull --ff-only`` fails (exit 128) when the remote no longer
+    fast-forwards — e.g. after an upstream force-push, or if the shallow history doesn't
+    contain the merge base. Rather than leaving the user stuck on a permanently-broken
+    source, delete the cache and start fresh.
+    """
+    try:
+        _run_git(["git", "-C", str(cache_dir), "pull", "--ff-only", "--depth", "1"], timeout=60)
+    except PluginInstallError:
+        # The pull failed (likely exit 128). Wipe the stale cache and re-clone from scratch.
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        _clone_fresh(url, cache_dir)
+
+
+def _clone_fresh(url: str, cache_dir: Path, *, ref: str = "", sha: str = "") -> None:
+    """Clone ``url`` into ``cache_dir`` (shallow, or pinned to ``sha``/``ref``)."""
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    if sha:
+        # Clone first (shallow is fine, we fetch the sha explicitly), then pin.
+        _run_git(["git", "clone", "--depth", "1", url, str(cache_dir)], timeout=120)
+        try:
+            _run_git(["git", "-C", str(cache_dir), "fetch", "--depth", "1", "origin", sha], timeout=90)
+            _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
+        except PluginInstallError:
+            # sha fetch can fail if the shallow clone doesn't contain it; unshallow + retry.
+            _run_git(["git", "-C", str(cache_dir), "fetch", "--unshallow"], timeout=180)
+            _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
+    elif ref:
+        _run_git(["git", "clone", "--depth", "1", "--branch", ref, url, str(cache_dir)], timeout=120)
+    else:
+        _run_git(["git", "clone", "--depth", "1", url, str(cache_dir)], timeout=120)
 
 
 # -- marketplace.json parsing -------------------------------------------------

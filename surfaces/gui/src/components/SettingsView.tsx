@@ -28,6 +28,7 @@ import {
   listenDictationDownloadProgress,
   markDictationTestPassed,
   pickFolder,
+  refreshVoiceCompatibility,
   setAutostart,
   setKeepAwake,
   startDictation,
@@ -76,7 +77,7 @@ const INPUT =
   "flex-1 min-w-0 px-3 py-2 rounded-lg border border-line bg-paper text-[13px] text-ink outline-none focus:border-accent";
 const BTN_ACCENT = "text-[12.5px] px-3 py-2 rounded-lg bg-accent text-white shrink-0 disabled:opacity-40";
 const BTN_BORDERED =
-  "text-[12.5px] px-3 py-2 rounded-lg border border-line bg-paper hover:border-lineStrong shrink-0";
+  "text-[12.5px] px-3 py-2 rounded-lg border border-line bg-paper hover:border-lineStrong shrink-0 disabled:opacity-40 disabled:cursor-not-allowed";
 
 const SET_TABS: { key: SetTab; label: string; icon: "sliders" | "code" | "mic" | "sparkle" | "bell" | "bot" }[] = [
   { key: "appearance", label: "settings.tab_general", icon: "sliders" },
@@ -271,7 +272,13 @@ function VoiceInputSection() {
   };
 
   const toggleTest = async () => {
-    if (!status?.supported || !status.model_verified) return;
+    if (!status?.supported) return;
+    // If the model isn't verified yet, surface a clear hint instead of silently doing nothing.
+    // The button looks clickable, so a no-op read as "broken" — tell the user what to do first.
+    if (!status.model_verified) {
+      setError(t("settings.voice_test_needs_model"));
+      return;
+    }
     setError(null);
     try {
       if (status.recording) {
@@ -305,6 +312,21 @@ function VoiceInputSection() {
     }
   };
 
+  // Force a fresh device-compatibility probe (deletes the persisted cache + re-detects).
+  // Device info rarely changes, so the probe is cached to `voice_compat.json` and only
+  // refreshed on demand — this is what stops "every time I open Voice Input it re-checks".
+  const recheckDevice = async () => {
+    setError(null);
+    setPhase("verifying");
+    try {
+      publish(await refreshVoiceCompatibility());
+    } catch (err) {
+      setError(voiceError(err));
+    } finally {
+      setPhase("idle");
+    }
+  };
+
   const downloading = phase === "downloading" || !!status?.download_in_progress;
   const progressTotal = progress?.total_bytes || status?.model_bytes || 1;
   const progressPercent = Math.min(100, Math.round(((progress?.downloaded_bytes || 0) / progressTotal) * 100));
@@ -332,7 +354,19 @@ function VoiceInputSection() {
                 <div className="text-[13.5px] font-medium">{t("settings.voice_this_device")}</div>
                 <div className="text-[12px] text-muted mt-1">{status?.device_summary || t("settings.voice_checking")}</div>
                 {status?.compatibility_reason && <div className="text-[12px] text-red-600 mt-1.5">{status.compatibility_reason}</div>}
-                {!status && <button className={BTN_BORDERED + " mt-2"} onClick={() => void retryLoad()}>{t("settings.voice_retry")}</button>}
+                <div className="flex items-center gap-2 mt-2">
+                  {!status && <button className={BTN_BORDERED} onClick={() => void retryLoad()}>{t("settings.voice_retry")}</button>}
+                  {status && (
+                    <button
+                      className={BTN_BORDERED}
+                      disabled={phase === "verifying"}
+                      onClick={() => void recheckDevice()}
+                      title={t("settings.voice_recheck_help")}
+                    >
+                      {phase === "verifying" ? t("settings.voice_checking") : t("settings.voice_recheck")}
+                    </button>
+                  )}
+                </div>
               </div>
               {status && (
                 <span className={"text-[11.5px] px-2 py-1 rounded-full " + (status.supported ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600")}>
@@ -389,8 +423,13 @@ function VoiceInputSection() {
                 </div>
               </div>
               {ready && <span className="text-[11.5px] px-2 py-1 rounded-full bg-green-50 text-green-700">{t("settings.voice_ready")}</span>}
-              <button className={BTN_BORDERED} disabled={!status?.supported || !status?.model_verified || phase === "transcribing"} onClick={() => void toggleTest()}>
-                {status?.recording ? t("settings.voice_stop_check") : phase === "transcribing" ? t("settings.voice_transcribing") : ready ? t("settings.voice_test_again") : t("settings.voice_test_mic")}
+              <button
+                className={BTN_BORDERED}
+                disabled={!status?.supported || phase === "transcribing" || phase === "testing"}
+                title={!status?.supported ? t("settings.voice_unsupported") : !status?.model_verified ? t("settings.voice_test_needs_model") : t("settings.voice_mic_test")}
+                onClick={() => void toggleTest()}
+              >
+                {status?.recording ? t("settings.voice_stop_check") : phase === "transcribing" ? t("settings.voice_transcribing") : phase === "testing" ? t("settings.voice_listening") : ready ? t("settings.voice_test_again") : t("settings.voice_test_mic")}
               </button>
             </div>
             {status?.recording && <div className="border-t border-line px-4 py-3 text-[12px] text-accent" role="status">{t("settings.voice_listening")}</div>}

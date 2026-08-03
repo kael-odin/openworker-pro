@@ -88,6 +88,9 @@ export const startWindowDrag = () => invoke<boolean>("start_window_drag");
 export const getDictationStatus = () => invoke<DictationStatus>("get_dictation_status");
 /** Throwing variant for the initial status load — surfaces Rust-side errors instead of null. */
 export const getDictationStatusStrict = () => invokeStrict<DictationStatus>("get_dictation_status");
+/** Force a fresh device-compatibility probe (deletes the persisted cache + re-detects).
+ * Used by the "re-check device" button in Settings. Returns the refreshed status. */
+export const refreshVoiceCompatibility = () => invokeStrict<DictationStatus>("refresh_voice_compatibility");
 /** Instantaneous mic loudness 0..1 while recording (0 otherwise) — drives the composer's
  * live waveform. Cheap; poll at ~10Hz. */
 export const getDictationLevel = () => invoke<number>("dictation_level");

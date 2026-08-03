@@ -294,9 +294,54 @@ struct VoiceInputStatus {
     compatibility_reason: Option<String>,
 }
 
+/// Persisted voice-input compatibility probe. Device details (OS version, arch) don't change
+/// between launches, so the probe runs once and is cached to `voice_compat.json` under the
+/// state dir. Without this every `get_dictation_status` call spawned a `cmd /C ver` process —
+/// the UI froze for a beat on each Settings open, Composer mount, and mic click, and the user
+/// saw "正在检查兼容性…" flash every time. The cache is invalidated only by an explicit
+/// "re-check" (the `refresh_voice_compatibility` command).
+#[derive(Clone, Serialize, serde::Deserialize)]
+struct VoiceCompatCache {
+    summary: String,
+    supported: bool,
+    reason: Option<String>,
+}
+
+fn voice_compat_path() -> PathBuf {
+    state_dir().join("voice_compat.json")
+}
+
+fn read_voice_compat_cache() -> Option<VoiceCompatCache> {
+    let path = voice_compat_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<VoiceCompatCache>(&text).ok()
+}
+
+fn write_voice_compat_cache(cache: &VoiceCompatCache) {
+    let path = voice_compat_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string(cache).unwrap_or_default());
+}
+
 fn voice_input_status(dictation: &Dictation) -> VoiceInputStatus {
     let status = dictation.status();
-    let (supported, device_summary, compatibility_reason) = voice_input_compatibility();
+    // Read the cached compatibility probe (or run + cache it on first launch). The probe
+    // spawns a shell process; doing this on every status fetch was the cause of the
+    // "clicking Voice Input lags" report.
+    let (supported, device_summary, compatibility_reason) = match read_voice_compat_cache() {
+        Some(cache) => (cache.supported, cache.summary, cache.reason),
+        None => {
+            let (supported, summary, reason) = voice_input_compatibility();
+            write_voice_compat_cache(&VoiceCompatCache {
+                summary: summary.clone(),
+                supported,
+                reason: reason.clone(),
+            });
+            (supported, summary, reason)
+        }
+    };
     VoiceInputStatus {
         recording: status.recording,
         model_installed: status.model_installed,
@@ -308,6 +353,34 @@ fn voice_input_status(dictation: &Dictation) -> VoiceInputStatus {
         supported,
         device_summary,
         compatibility_reason,
+    }
+}
+
+/// Force a fresh compatibility probe (delete the cache + re-detect). Wired to the
+/// "re-check device" button in Settings so the user can refresh after a system upgrade
+/// or OS migration without restarting the app.
+#[tauri::command]
+fn refresh_voice_compatibility(state: tauri::State<Arc<Dictation>>) -> VoiceInputStatus {
+    let _ = std::fs::remove_file(voice_compat_path());
+    let (supported, summary, reason) = voice_input_compatibility();
+    write_voice_compat_cache(&VoiceCompatCache {
+        summary: summary.clone(),
+        supported,
+        reason: reason.clone(),
+    });
+    // The dictation model state is unchanged; only the compatibility fields refresh.
+    let status = state.status();
+    VoiceInputStatus {
+        recording: status.recording,
+        model_installed: status.model_installed,
+        model_verified: status.model_verified,
+        test_passed: status.test_passed,
+        download_in_progress: status.download_in_progress,
+        model_name: status.model_name,
+        model_bytes: status.model_bytes,
+        supported,
+        device_summary: summary,
+        compatibility_reason: reason,
     }
 }
 
@@ -345,11 +418,16 @@ fn voice_input_compatibility() -> (bool, String, Option<String>) {
 
 #[cfg(target_os = "windows")]
 fn voice_input_compatibility() -> (bool, String, Option<String>) {
+    // `cmd /C ver` emits in the OEM code page (GBK on zh-CN Windows), which mojibakes
+    // when read as UTF-8. Prepend `chcp 65001` so the ver output is UTF-8 — no new deps.
+    // The `>nul` swallows chcp's own "Active code page: 65001" line so it doesn't leak
+    // into the version string.
     let version = Command::new("cmd")
-        .args(["/C", "ver"])
+        .args(["/C", "chcp 65001 >nul && ver"])
         .output()
         .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Windows (unknown version)".to_owned());
     let build = version
         .split(|character: char| !character.is_ascii_digit() && character != '.')
@@ -610,6 +688,7 @@ pub fn run() {
             set_keep_awake,
             start_window_drag,
             get_dictation_status,
+            refresh_voice_compatibility,
             start_dictation,
             stop_dictation,
             cancel_dictation,

@@ -90,11 +90,30 @@ class PluginSourceManager:
         self._prefs["plugin_sources"] = [s.to_dict() for s in sources]
         self._save()
 
+    def _deleted_builtins(self) -> set[str]:
+        raw = self._prefs.get("deleted_builtin_plugin_sources")
+        if not isinstance(raw, list):
+            return set()
+        return {str(x) for x in raw}
+
+    def _write_deleted_builtins(self, ids: set[str]) -> None:
+        self._prefs["deleted_builtin_plugin_sources"] = sorted(ids)
+        self._save()
+
     def ensure_builtins(self) -> None:
-        """Re-assert builtin sources. Idempotent; preserves user edits to a builtin's enabled flag."""
+        """Re-assert builtin sources — *unless* the user has explicitly deleted one.
+
+        Idempotent; preserves user edits to a builtin's enabled flag. A builtin that was
+        deleted (via ``remove``) stays deleted across restarts because it's recorded in the
+        ``deleted_builtin_plugin_sources`` pref — the user chose "deleted means deleted, no
+        auto-restore".
+        """
+        deleted = self._deleted_builtins()
         sources = [PluginSource.from_dict(d) for d in self._raw()]
         seen_ids = {s.id for s in sources}
         for builtin in BUILTIN_SOURCES:
+            if builtin.id in deleted:
+                continue  # user deleted this builtin — don't re-assert
             if builtin.id in seen_ids:
                 for s in sources:
                     if s.id == builtin.id:
@@ -109,7 +128,10 @@ class PluginSourceManager:
 
     def list(self, *, enabled_only: bool = False) -> list[PluginSource]:
         sources = [PluginSource.from_dict(d) for d in self._raw()]
-        if not sources:
+        # The BUILTIN_SOURCES fallback only applies on a truly fresh state (no prefs key at
+        # all). Once ensure_builtins() has run, an empty list means the user deleted every
+        # source — don't resurrect builtins that were explicitly removed.
+        if not sources and not self._raw() and not self._deleted_builtins():
             sources = list(BUILTIN_SOURCES)
         if enabled_only:
             sources = [s for s in sources if s.enabled]
@@ -163,8 +185,14 @@ class PluginSourceManager:
     def remove(self, source_id: str) -> bool:
         sources = [PluginSource.from_dict(d) for d in self._raw()]
         target = next((s for s in sources if s.id == source_id), None)
-        if target is None or target.is_default:
-            return False  # builtins cannot be deleted — only disabled
+        if target is None:
+            return False
+        # All sources are deletable, including builtins. A deleted builtin is recorded so
+        # ensure_builtins() doesn't re-assert it on the next startup — "deleted means deleted".
+        if target.is_default:
+            deleted = self._deleted_builtins()
+            deleted.add(target.id)
+            self._write_deleted_builtins(deleted)
         sources = [s for s in sources if s.id != source_id]
         self._write(sources)
         return True

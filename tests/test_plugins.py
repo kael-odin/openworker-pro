@@ -46,13 +46,21 @@ def test_source_manager_ensure_builtins_seeds_official_source():
     assert "claude-plugins-official" in sources[0].url
 
 
-def test_source_manager_builtin_cannot_be_deleted_only_disabled():
+def test_source_manager_builtin_deletable_and_not_reasserted():
     prefs, mgr = _prefs_and_mgr()
     mgr.ensure_builtins()
-    assert mgr.remove("claude-official") is False
-    mgr.update("claude-official", {"enabled": False})
-    assert mgr.get("claude-official").enabled is False
-    assert mgr.list(enabled_only=True) == []
+    # Builtins are now deletable (user chose "deleted means deleted, no auto-restore").
+    assert mgr.remove("claude-official") is True
+    assert mgr.get("claude-official") is None
+    # ensure_builtins() must NOT re-assert a deleted builtin — the deletion is recorded
+    # in the deleted_builtin_plugin_sources pref so it survives restarts.
+    mgr.ensure_builtins()
+    assert mgr.get("claude-official") is None
+    # Disabling still works for sources that remain.
+    mgr.add("Temp", "https://example.com/foo.git")
+    # The deleted-builtin record is persisted in prefs.
+    deleted = prefs.get("deleted_builtin_plugin_sources") or []
+    assert "claude-official" in deleted
 
 
 def test_source_manager_add_update_remove_user_source():

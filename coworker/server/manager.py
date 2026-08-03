@@ -5305,7 +5305,7 @@ class SessionManager:
 
     def remove_skill_source(self, source_id: str) -> dict[str, Any]:
         if not self.skill_sources.remove(source_id):
-            return {"ok": False, "error": "source not found or is built-in (disable it instead)"}
+            return {"ok": False, "error": "source not found"}
         return {"ok": True, "id": source_id}
 
     def list_skill_catalog(self, source_id: str) -> dict[str, Any]:
@@ -5375,7 +5375,7 @@ class SessionManager:
 
     def remove_plugin_source(self, source_id: str) -> dict[str, Any]:
         if not self.plugin_sources.remove(source_id):
-            return {"ok": False, "error": "source not found or is built-in (disable it instead)"}
+            return {"ok": False, "error": "source not found"}
         return {"ok": True, "id": source_id}
 
     def list_plugin_catalog(self, source_id: str) -> dict[str, Any]:

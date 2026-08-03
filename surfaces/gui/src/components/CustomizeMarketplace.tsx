@@ -10,6 +10,7 @@ import { useEffect, useState } from "react";
 import {
   addPluginSource,
   addPersonaSource,
+  addSkillSource,
   getDhpSources,
   getPersonaCatalog,
   getPersonaSources,
@@ -22,8 +23,10 @@ import {
   installSkill,
   removePluginSource,
   removePersonaSource,
+  removeSkillSource,
   updatePluginSource,
   updatePersonaSource,
+  updateSkillSource,
   type DhpSource,
   type PersonaCatalogItem,
   type PersonaSource,
@@ -202,6 +205,8 @@ export function CustomizeMarketplace({ onClose }: { onClose: () => void }) {
 // Skills tab (E1): pick a source → browse its catalog → install. The catalog is fetched on
 // demand (git sources clone on first browse, so the first click can take a few seconds). Each
 // item shows whether it's already installed; install writes to state_dir()/skills/<name>/.
+// Sources are fully manageable here (add/toggle/delete, mirroring PluginBrowseSection) — the
+// backend + api.ts had full CRUD from the start, this wires it up.
 function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const { t } = useT();
   const [sources, setSources] = useState<SkillSource[]>([]);
@@ -212,14 +217,30 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const [installing, setInstalling] = useState<string>("");
   const [justInstalled, setJustInstalled] = useState<string>("");
 
-  useEffect(() => {
+  // Inline source-add form state.
+  const [showAdd, setShowAdd] = useState(false);
+  const [addName, setAddName] = useState("");
+  const [addUrl, setAddUrl] = useState("");
+  const [addType, setAddType] = useState("http");
+  const [addBusy, setAddBusy] = useState(false);
+
+  const loadSources = () => {
     getSkillSources()
       .then((r) => {
         setSources(r ?? []);
-        const first = (r ?? []).find((s) => s.enabled);
-        if (first) setSelId(first.id);
+        // Keep selId valid; default to the first enabled source.
+        const stillThere = (r ?? []).find((s) => s.id === selId && s.enabled);
+        if (!stillThere) {
+          const first = (r ?? []).find((s) => s.enabled);
+          setSelId(first ? first.id : "");
+        }
       })
       .catch(() => setSources([]));
+  };
+
+  useEffect(() => {
+    loadSources();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Load the catalog when the selected source changes.
@@ -258,34 +279,142 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
     }
   };
 
-  if (sources.length === 0) {
+  const addSource = async () => {
+    if (!addName.trim() || !addUrl.trim()) return;
+    setAddBusy(true);
+    const r = await addSkillSource(addName.trim(), addUrl.trim(), addType);
+    setAddBusy(false);
+    if (r.ok) {
+      setAddName("");
+      setAddUrl("");
+      setAddType("http");
+      setShowAdd(false);
+      loadSources();
+    } else {
+      setErr(r.error || "failed to add source");
+    }
+  };
+
+  const toggleSource = async (s: SkillSource) => {
+    await updateSkillSource(s.id, { enabled: !s.enabled });
+    loadSources();
+  };
+
+  const deleteSource = async (s: SkillSource) => {
+    await removeSkillSource(s.id);
+    loadSources();
+  };
+
+  if (sources.length === 0 && !showAdd) {
     return (
-      <div className="text-[12.5px] text-faint py-6 text-center">
-        {t("customize.marketplace_empty")}
+      <div className="py-6 text-center">
+        <div className="text-[12.5px] text-faint mb-3">{t("customize.marketplace_empty")}</div>
+        <button
+          className="text-[12px] px-2.5 py-1 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent"
+          onClick={() => setShowAdd(true)}
+        >
+          + {t("customize.marketplace_add_source")}
+        </button>
       </div>
     );
   }
 
   return (
     <div>
-      {/* Source picker */}
-      <div className="flex flex-wrap gap-1.5 mb-3">
-        {sources.filter((s) => s.enabled).map((s) => (
+      {/* Source picker + manage */}
+      <div className="mb-3">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {sources.filter((s) => s.enabled).map((s) => (
+            <button
+              key={s.id}
+              className={
+                "text-[12px] px-2.5 py-1 rounded-full border transition-colors " +
+                (selId === s.id
+                  ? "bg-accent text-white border-accent"
+                  : "bg-paper border-line text-muted hover:text-ink")
+              }
+              onClick={() => setSelId(s.id)}
+              title={s.url}
+            >
+              {s.name}
+              {s.is_default && <span className="opacity-70"> · {t("customize.marketplace_source_default")}</span>}
+            </button>
+          ))}
+          {sources.filter((s) => !s.enabled).length > 0 && (
+            <span className="text-[11px] text-faint">
+              +{sources.filter((s) => !s.enabled).length} disabled
+            </span>
+          )}
           <button
-            key={s.id}
-            className={
-              "text-[12px] px-2.5 py-1 rounded-full border transition-colors " +
-              (selId === s.id
-                ? "bg-accent text-white border-accent"
-                : "bg-paper border-line text-muted hover:text-ink")
-            }
-            onClick={() => setSelId(s.id)}
-            title={s.url}
+            className="text-[11.5px] px-2 py-1 rounded-full border border-line border-dashed text-muted hover:text-accent hover:border-accent"
+            onClick={() => setShowAdd((v) => !v)}
           >
-            {s.name}
-            {s.is_default && <span className="opacity-70"> · {t("customize.marketplace_source_default")}</span>}
+            + {t("customize.marketplace_add_source")}
           </button>
-        ))}
+        </div>
+
+        {/* Source management (toggle + delete). All sources are deletable, including builtins. */}
+        {sources.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {sources.map((s) => (
+              <div key={s.id} className="flex items-center gap-2 text-[11.5px] text-faint">
+                <span className={"w-1.5 h-1.5 rounded-full " + (s.enabled ? "bg-accent" : "bg-faint")} />
+                <span className="truncate flex-1 min-w-0" title={s.url}>{s.url}</span>
+                <span className="text-[10px] px-1 rounded bg-paper border border-line shrink-0">{s.source_type}</span>
+                <button
+                  className="text-muted hover:text-accent"
+                  onClick={() => toggleSource(s)}
+                  title={s.enabled ? "Disable" : "Enable"}
+                >
+                  {s.enabled ? "●" : "○"}
+                </button>
+                <button
+                  className="text-faint hover:text-danger p-0.5"
+                  title={t("common.delete_aria", { title: s.name })}
+                  onClick={() => deleteSource(s)}
+                >
+                  <Icon name="trash" size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Add-source form */}
+        {showAdd && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 p-2 rounded-lg border border-line bg-paper">
+            <input
+              className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-1"
+              placeholder={t("customize.marketplace_source_name_ph")}
+              value={addName}
+              spellCheck={false}
+              onChange={(e) => setAddName(e.target.value)}
+            />
+            <input
+              className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-[2]"
+              placeholder={t("customize.marketplace_source_url_ph")}
+              value={addUrl}
+              spellCheck={false}
+              onChange={(e) => setAddUrl(e.target.value)}
+            />
+            <select
+              className="px-2 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent"
+              value={addType}
+              onChange={(e) => setAddType(e.target.value)}
+            >
+              <option value="http">http</option>
+              <option value="git">git</option>
+              <option value="local">local</option>
+            </select>
+            <button
+              className="text-[12px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-50"
+              disabled={addBusy || !addName.trim() || !addUrl.trim()}
+              onClick={addSource}
+            >
+              {t("customize.marketplace_add_source")}
+            </button>
+          </div>
+        )}
       </div>
 
       {err && (
@@ -498,15 +627,13 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
                 >
                   {s.enabled ? "●" : "○"}
                 </button>
-                {!s.is_default && (
-                  <button
-                    className="text-faint hover:text-danger p-0.5"
-                    title={t("common.delete_aria", { title: s.name })}
-                    onClick={() => deleteSource(s)}
-                  >
-                    <Icon name="trash" size={12} />
-                  </button>
-                )}
+                <button
+                  className="text-faint hover:text-danger p-0.5"
+                  title={t("common.delete_aria", { title: s.name })}
+                  onClick={() => deleteSource(s)}
+                >
+                  <Icon name="trash" size={12} />
+                </button>
               </div>
             ))}
           </div>
@@ -776,15 +903,13 @@ function PersonaBrowseSection({ onInstalled }: { onInstalled: () => void }) {
                 >
                   {s.enabled ? "●" : "○"}
                 </button>
-                {!s.is_default && (
-                  <button
-                    className="text-faint hover:text-danger p-0.5"
-                    title={t("common.delete_aria", { title: s.name })}
-                    onClick={() => deleteSource(s)}
-                  >
-                    <Icon name="trash" size={12} />
-                  </button>
-                )}
+                <button
+                  className="text-faint hover:text-danger p-0.5"
+                  title={t("common.delete_aria", { title: s.name })}
+                  onClick={() => deleteSource(s)}
+                >
+                  <Icon name="trash" size={12} />
+                </button>
               </div>
             ))}
           </div>
