@@ -4086,13 +4086,18 @@ class SessionManager:
 
     # -- digital humans (DHP bridge, 批次 B) ------------------------------------
     def list_digital_humans(self, category: Optional[str] = None) -> dict[str, Any]:
-        """Catalog listing from the DHP registry (index.json entries, no full specs)."""
+        """Catalog listing from the DHP registry (index.json entries, no full specs).
+
+        Surfaces per-source load errors in ``source_errors`` so the UI can show *why* the catalog
+        is empty (e.g. the official source's HTTP fetch failed) instead of a silent blank store.
+        """
         entries = self.dhp_registry.list(category=category)
         installed = {i.slug for i in self.dhp_instances.list()}
         return {
             "ok": True,
             "humans": [dict(e.to_dict(), installed=e.slug in installed) for e in entries],
             "categories": self.dhp_registry.categories(),
+            "source_errors": self.dhp_registry.source_errors(),
         }
 
     def get_digital_human(self, slug: str) -> dict[str, Any]:
@@ -4363,9 +4368,17 @@ class SessionManager:
 
         ok = self.dhp_sources.remove(source_id)
         if not ok:
-            return {"ok": False, "error": "source not found or is builtin (disable instead)"}
+            return {"ok": False, "error": "source not found"}
         self.dhp_registry = DhpRegistry(self.dhp_sources.list(enabled_only=True))
         return {"ok": True}
+
+    def reset_dhp_sources(self) -> dict[str, Any]:
+        """Restore all builtin DHP sources (undoes deletions). The 'reset to defaults' escape hatch."""
+        from ..digital_human import DhpRegistry
+
+        sources = self.dhp_sources.reset()
+        self.dhp_registry = DhpRegistry(self.dhp_sources.list(enabled_only=True))
+        return {"ok": True, "sources": [s.to_dict() for s in sources]}
 
     # -- DHP instance edit (批次 D2) -------------------------------------------
     def update_digital_human(self, instance_id: str, changes: dict[str, Any]) -> dict[str, Any]:

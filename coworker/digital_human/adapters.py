@@ -94,7 +94,12 @@ class DhpHttpAdapter:
         return f"{self.url}/{safe}"
 
     def fetch_index(self, *, force: bool = False) -> list[RegistryEntry]:
-        """Return the catalog entries. Cached for the process lifetime unless ``force``."""
+        """Return the catalog entries. Cached for the process lifetime unless ``force``.
+
+        On network failure, returns the stale cache if one exists; on a first-load failure
+        (no cache), **raises** so :class:`DhpRegistry._ensure_loaded` records the error and the
+        store UI shows a diagnostic instead of a silently-empty list.
+        """
         if self._index is not None and not force and (time.monotonic() - self._index_fetched_at) < self._spec_ttl:
             return self._index or []
         url = f"{self.url}/index.json"
@@ -103,11 +108,12 @@ class DhpHttpAdapter:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            # Network failure is not fatal at startup — return the stale cache (or empty on first
-            # load). The GUI shows "source unreachable" via list_digital_humans; we don't crash here.
+            # Stale cache is better than nothing — return it so the store stays usable
+            # during a transient outage.
             if self._index is not None:
                 return self._index
-            return []
+            # First load with no cache: raise so the registry records the error for the UI.
+            raise RuntimeError(f"failed to fetch {url}: {e}") from e
         entries: list[RegistryEntry] = []
         for item in (data.get("apps") or []) if isinstance(data, dict) else []:
             if isinstance(item, dict):

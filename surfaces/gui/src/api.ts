@@ -3109,7 +3109,12 @@ export interface DigitalHumanInstance {
 
 export async function getDigitalHumans(
   category?: string,
-): Promise<{ ok: boolean; humans: DigitalHumanEntry[]; categories: string[] }> {
+): Promise<{
+  ok: boolean;
+  humans: DigitalHumanEntry[];
+  categories: string[];
+  source_errors?: { source_id: string; error: string }[];
+}> {
   const q = category ? `?category=${encodeURIComponent(category)}` : "";
   const res = await fetch(`${httpBase()}/v1/digital-humans${q}`);
   return res.json();
@@ -3264,6 +3269,11 @@ export async function removeDhpSource(sourceId: string): Promise<{ ok: boolean; 
     `${httpBase()}/v1/digital-humans/sources/${encodeURIComponent(sourceId)}`,
     { method: "DELETE" },
   );
+  return res.json();
+}
+
+export async function resetDhpSources(): Promise<{ ok: boolean; sources: DhpSource[] }> {
+  const res = await fetch(`${httpBase()}/v1/digital-humans/sources/reset`, { method: "POST" });
   return res.json();
 }
 

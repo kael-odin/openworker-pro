@@ -7,6 +7,7 @@ import {
   addDhpSource,
   updateDhpSource,
   removeDhpSource,
+  resetDhpSources,
   type DhpSource,
 } from "../api";
 import { useT } from "../i18n/I18nProvider";
@@ -79,6 +80,11 @@ export function DhpSourcesSection() {
     await reload();
   };
 
+  const reset = async () => {
+    await resetDhpSources();
+    await reload();
+  };
+
   return (
     <>
       <div className={GRP_H}>{t("dhp_sources.title")}</div>
@@ -125,16 +131,14 @@ export function DhpSourcesSection() {
                   />
                 </div>
               </label>
-              {!src.is_default && (
-                <button
-                  type="button"
-                  onClick={() => remove(src.id)}
-                  className="text-faint hover:text-danger transition-colors shrink-0"
-                  title={t("dhp_sources.remove")}
-                >
-                  <Icon name="trash" size={16} />
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => remove(src.id)}
+                className="text-faint hover:text-danger transition-colors shrink-0"
+                title={src.is_default ? t("dhp_sources.remove_official") : t("dhp_sources.remove")}
+              >
+                <Icon name="trash" size={16} />
+              </button>
             </div>
           ))
         )}
@@ -181,13 +185,23 @@ export function DhpSourcesSection() {
       </div>
 
       {!showAdd && !loading && (
-        <button
-          className="mt-2 flex items-center gap-1.5 text-[12.5px] text-accent hover:underline"
-          onClick={() => setShowAdd(true)}
-        >
-          <Icon name="plus" size={16} />
-          {t("dhp_sources.add")}
-        </button>
+        <div className="mt-2 flex items-center gap-3">
+          <button
+            className="flex items-center gap-1.5 text-[12.5px] text-accent hover:underline"
+            onClick={() => setShowAdd(true)}
+          >
+            <Icon name="plus" size={16} />
+            {t("dhp_sources.add")}
+          </button>
+          <button
+            className="flex items-center gap-1.5 text-[12.5px] text-muted hover:text-ink"
+            onClick={reset}
+            title={t("dhp_sources.reset_help")}
+          >
+            <Icon name="refresh" size={14} />
+            {t("dhp_sources.reset")}
+          </button>
+        </div>
       )}
     </>
   );

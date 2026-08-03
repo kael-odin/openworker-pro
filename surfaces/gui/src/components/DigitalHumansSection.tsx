@@ -113,11 +113,13 @@ export function DigitalHumansSection() {
   const [mcpAck, setMcpAck] = useState(false);
   const [instances, setInstances] = useState<DigitalHumanInstance[]>([]);
   const [editing, setEditing] = useState<DigitalHumanInstance | null>(null);
+  const [sourceErrors, setSourceErrors] = useState<{ source_id: string; error: string }[]>([]);
 
   const reload = () => {
     getDigitalHumans().then((r) => {
       setHumans(r.humans);
       setCategories(r.categories);
+      setSourceErrors(r.source_errors || []);
     }).catch(() => {});
     getDigitalHumanInstances().then((r) => setInstances(r.instances)).catch(() => {});
   };
@@ -273,6 +275,19 @@ export function DigitalHumansSection() {
     <section className="px-6 py-4">
       {/* 源管理（最顶：列表空时用户第一反应是查源） */}
       <DhpSourcesSection />
+
+      {/* 源加载错误：某个源不可达时给出诊断，而非静默空白 */}
+      {sourceErrors.filter((e) => e.error).length > 0 && (
+        <div className="mt-2 rounded-lg border border-warnInk/30 bg-warnSoft/60 p-2.5 space-y-1">
+          <div className="text-[11.5px] font-medium text-warnInk">{t("digital.source_error_title")}</div>
+          {sourceErrors.filter((e) => e.error).map((e) => (
+            <div key={e.source_id} className="text-[11px] text-warnInk">
+              <span className="font-mono">{e.source_id}</span>: {e.error}
+            </div>
+          ))}
+          <div className="text-[10.5px] text-muted">{t("digital.source_error_hint")}</div>
+        </div>
+      )}
 
       {/* 商店列表 */}
       <div className={GRP_H}>{t("digital.store_title")}</div>

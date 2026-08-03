@@ -69,17 +69,38 @@ def _parse_skill(md: Path) -> Skill:
         if end != -1:
             frontmatter = text[3:end]
             body = text[end + 4 :].lstrip("\n")
-            for line in frontmatter.splitlines():
-                if ":" not in line:
-                    continue
-                key, value = line.split(":", 1)
-                key, value = key.strip().lower(), value.strip()
-                if key == "name" and value:
-                    name = value
-                elif key == "description":
-                    description = value
-                elif key in ("allowed-tools", "allowed_tools"):
-                    allowed = [t.strip() for t in value.split(",") if t.strip()]
+            # Parse frontmatter as YAML so block scalars (``description: >-`` with a
+            # folded multi-line value — used by ModelScope's SKILL.md files) and quoted
+            # strings resolve correctly. The hand-rolled line splitter only read the
+            # first line, turning a folded description into the literal token ``>-``.
+            try:
+                import yaml
+
+                meta = yaml.safe_load(frontmatter) or {}
+                if isinstance(meta, dict):
+                    if meta.get("name"):
+                        name = str(meta["name"])
+                    if meta.get("description"):
+                        description = str(meta["description"]).strip()
+                    at = meta.get("allowed-tools") or meta.get("allowed_tools")
+                    if isinstance(at, list):
+                        allowed = [str(t).strip() for t in at if str(t).strip()]
+                    elif isinstance(at, str) and at:
+                        allowed = [t.strip() for t in at.split(",") if t.strip()]
+            except Exception:
+                # Fallback: the old line-by-line parser, for SKILL.md files whose
+                # frontmatter isn't valid YAML (rare) or when pyyaml is unavailable.
+                for line in frontmatter.splitlines():
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    key, value = key.strip().lower(), value.strip()
+                    if key == "name" and value:
+                        name = value
+                    elif key == "description" and not description:
+                        description = value
+                    elif key in ("allowed-tools", "allowed_tools") and not allowed:
+                        allowed = [t.strip() for t in value.split(",") if t.strip()]
     return Skill(
         name=name,
         description=description,

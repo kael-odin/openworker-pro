@@ -64,6 +64,11 @@ class SkillSource:
 # folders; we expose it as a local-clone-via-git source (the fetcher clones it on demand).
 # A community HTTP index can be added here once one exists. Re-asserted on every startup so
 # the source list is never empty — same guard as DHP's empty-store fix.
+#
+# ModelScope (魔搭社区) skills repo (https://github.com/modelscope/modelscope-skills) is a
+# Claude-Code-compatible plugin marketplace whose skills/ folder holds SKILL.md subfolders
+# (ms-hub, ms-studio-deploy). The 魔搭 skill center at https://www.modelscope.cn/skills
+# mirrors this catalog. Added as a default so the ModelScope skills appear out-of-the-box.
 BUILTIN_SOURCES: list[SkillSource] = [
     SkillSource(
         id="anthropic-official",
@@ -72,6 +77,14 @@ BUILTIN_SOURCES: list[SkillSource] = [
         enabled=True,
         is_default=True,
         source_type="git",  # cloned via git on demand
+    ),
+    SkillSource(
+        id="modelscope-skills",
+        name="魔搭社区技能中心",
+        url="https://github.com/modelscope/modelscope-skills.git",
+        enabled=True,
+        is_default=True,
+        source_type="git",
     ),
 ]
 

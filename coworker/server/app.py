@@ -1950,6 +1950,10 @@ def create_app(manager: SessionManager) -> FastAPI:
     def digital_human_sources_remove(source_id: str) -> dict[str, Any]:
         return manager.remove_dhp_source(source_id)
 
+    @app.post("/v1/digital-humans/sources/reset")
+    def digital_human_sources_reset() -> dict[str, Any]:
+        return manager.reset_dhp_sources()
+
     @app.get("/v1/digital-humans/instances")
     def digital_human_instances() -> dict[str, Any]:
         return manager.list_dh_instances()

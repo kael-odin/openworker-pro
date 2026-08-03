@@ -55,11 +55,24 @@ class PluginSource:
 # whose .claude-plugin/marketplace.json lists ~100+ plugins across categories (security,
 # development, database, productivity, ...). Re-asserted on every startup so the source
 # list is never empty — same guard as DHP / skills.
+#
+# ModelScope (魔搭社区) skills repo ships a Claude-Code-compatible
+# .claude-plugin/marketplace.json listing ms-hub / ms-studio-deploy — the ModelScope
+# skill center (https://www.modelscope.cn/skills) mirrors this catalog. Added as a second
+# default so the 魔搭 skills appear out-of-the-box alongside the Anthropic catalog.
 BUILTIN_SOURCES: list[PluginSource] = [
     PluginSource(
         id="claude-official",
         name="Claude 官方插件市场",
         url="https://github.com/anthropics/claude-plugins-official.git",
+        enabled=True,
+        is_default=True,
+        source_type="git",
+    ),
+    PluginSource(
+        id="modelscope-skills",
+        name="魔搭社区技能中心",
+        url="https://github.com/modelscope/modelscope-skills.git",
         enabled=True,
         is_default=True,
         source_type="git",

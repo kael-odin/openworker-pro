@@ -113,6 +113,9 @@ class DhpRegistry:
         self._entry_index: dict[str, tuple[str, RegistryEntry]] = {}  # slug → (source_id, entry)
         self._loaded = False
         self._spec_cache: dict[str, DigitalHumanSpec] = {}
+        # source_id → error message (empty string = loaded ok). Surfaced to the UI so a source
+        # that fails to load shows a diagnostic instead of a silently-empty store.
+        self._source_errors: dict[str, str] = {}
 
         # Backward-compat: the legacy constructor was DhpRegistry(repo_dir) — a positional path.
         # Detect a str/Path passed as the first arg and treat it as repo_dir.
@@ -148,13 +151,19 @@ class DhpRegistry:
             return
         self._loaded = True
         self._entry_index.clear()
+        self._source_errors.clear()
         # Default-source entries take precedence on slug collision (first source in list wins).
         # We iterate in the source order given (SourceManager sorts default-first).
         for source_id, adapter in self._adapters.items():
             try:
                 entries = adapter.fetch_index()
-            except Exception:
+            except Exception as e:
+                # Record the error so the UI can show *why* the store is empty instead of
+                # silently returning []. This is the fix for "configured source but no
+                # digital humans show up" — the user sees a diagnostic message.
+                self._source_errors[source_id] = f"{type(e).__name__}: {e}"
                 continue
+            self._source_errors[source_id] = ""  # loaded ok
             for entry in entries:
                 if entry.slug and entry.slug not in self._entry_index:
                     entry.source_id = source_id
@@ -183,6 +192,16 @@ class DhpRegistry:
         self._ensure_loaded()
         present = {e.category for _, e in self._entry_index.values() if e.category}
         return [c for c in CATEGORY_ORDER if c in present] + sorted(present - set(CATEGORY_ORDER))
+
+    def source_errors(self) -> list[dict[str, str]]:
+        """Per-source load errors (empty list if all sources loaded ok).
+
+        Each item: ``{source_id, error}`` where ``error`` is ``""`` on success. Surfaced by
+        ``list_digital_humans`` so the store UI can show *why* the catalog is empty instead of
+        a silent blank — the root-cause diagnostic for "no digital humans show up".
+        """
+        self._ensure_loaded()
+        return [{"source_id": sid, "error": msg} for sid, msg in self._source_errors.items()]
 
     def get(self, slug: str) -> Optional[RegistryEntry]:
         self._ensure_loaded()
@@ -214,6 +233,7 @@ class DhpRegistry:
                 pass
         self._entry_index.clear()
         self._spec_cache.clear()
+        self._source_errors.clear()
         self._loaded = False
 
 

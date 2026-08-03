@@ -734,15 +734,24 @@ def test_source_manager_seeds_builtins_when_empty(tmp_path):
     assert saved  # save was called
 
 
-def test_source_manager_builtin_cannot_be_removed(tmp_path):
+def test_source_manager_builtin_deletable_and_resettable(tmp_path):
     from coworker.digital_human.sources import SourceManager
 
     prefs: dict = {}
     sm = SourceManager(prefs, lambda: None)
     sm.ensure_builtins()
     builtin_id = sm.list()[0].id
-    assert sm.remove(builtin_id) is False  # builtin is undeletable
-    assert sm.list()[0].id == builtin_id  # still there
+    # Builtins are deletable (user chose "deleted means deleted"). The deletion is recorded
+    # so ensure_builtins() doesn't re-assert it.
+    assert sm.remove(builtin_id) is True
+    assert all(s.id != builtin_id for s in sm.list())
+    sm.ensure_builtins()
+    assert all(s.id != builtin_id for s in sm.list())
+    # The deleted-builtin record is persisted in prefs.
+    assert builtin_id in (prefs.get("deleted_builtin_dhp_sources") or [])
+    # reset() restores all builtins (the "reset to defaults" escape hatch).
+    sources = sm.reset()
+    assert any(s.id == builtin_id for s in sources)
 
 
 def test_source_manager_add_toggle_remove_custom(tmp_path):
@@ -841,7 +850,7 @@ def test_http_adapter_fetch_index_and_spec(monkeypatch):
     assert spec.system_prompt.strip() == "hi"
 
 
-def test_http_adapter_network_failure_returns_empty(monkeypatch):
+def test_http_adapter_network_failure_raises_on_first_load(monkeypatch):
     from coworker.digital_human.adapters import DhpHttpAdapter
 
     class _BoomClient:
@@ -852,8 +861,10 @@ def test_http_adapter_network_failure_returns_empty(monkeypatch):
         "coworker.digital_human.adapters.httpx", type("M", (), {"Client": lambda *a, **k: _BoomClient()})
     )
     adapter = DhpHttpAdapter("https://example.com/dhp")
-    # First load with no cache → empty list, not a crash.
-    assert adapter.fetch_index() == []
+    # First load with no cache → raises (the registry records this so the UI shows a diagnostic
+    # instead of a silently-empty store).
+    with pytest.raises(RuntimeError, match="no network"):
+        adapter.fetch_index()
 
 
 def test_assert_safe_rel_path_rejects_traversal():
