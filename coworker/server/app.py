@@ -702,9 +702,15 @@ def create_app(manager: SessionManager) -> FastAPI:
     def remove_skill_source(source_id: str) -> dict[str, Any]:
         return manager.remove_skill_source(source_id)
 
+    @app.post("/v1/skills/sources/reset")
+    def reset_skill_sources() -> dict[str, Any]:
+        return manager.reset_skill_sources()
+
     @app.get("/v1/skills/sources/{source_id}/catalog")
-    def skill_source_catalog(source_id: str) -> dict[str, Any]:
-        return manager.list_skill_catalog(source_id)
+    def skill_source_catalog(
+        source_id: str, page: int = 1, page_size: int = 100, query: str = ""
+    ) -> dict[str, Any]:
+        return manager.list_skill_catalog(source_id, page=page, page_size=page_size, query=query)
 
     @app.post("/v1/skills/install")
     def install_skill(body: dict) -> dict[str, Any]:
@@ -798,6 +804,8 @@ def create_app(manager: SessionManager) -> FastAPI:
         return manager.add_plugin_source(
             body.get("name", ""), body.get("url", ""),
             source_type=body.get("source_type", "git"),
+            ref=body.get("ref", ""),
+            sparse_path=body.get("sparse_path", ""),
         )
 
     @app.patch("/v1/plugins/sources/{source_id}")
@@ -807,6 +815,10 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.delete("/v1/plugins/sources/{source_id}")
     def remove_plugin_source(source_id: str) -> dict[str, Any]:
         return manager.remove_plugin_source(source_id)
+
+    @app.post("/v1/plugins/sources/reset")
+    def reset_plugin_sources() -> dict[str, Any]:
+        return manager.reset_plugin_sources()
 
     @app.get("/v1/plugins/sources/{source_id}/catalog")
     def plugin_source_catalog(source_id: str) -> dict[str, Any]:
@@ -1051,6 +1063,44 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.post("/v1/mcp/reload")
     async def mcp_reload() -> dict[str, Any]:
         return await manager.reload_mcp()
+
+    # -- MCP marketplace sources (魔搭 MCP plaza, ~9.8k servers) -----------------
+    # Mirrors the skill/plugin source routes: CRUD a source list, browse a source's catalog
+    # (paginated + searchable), and install a server by name from the catalog.
+    @app.get("/v1/mcp/sources")
+    def mcp_sources() -> dict[str, Any]:
+        return {"sources": manager.list_mcp_sources()}
+
+    @app.post("/v1/mcp/sources")
+    def add_mcp_source(body: dict) -> dict[str, Any]:
+        return manager.add_mcp_source(
+            body.get("name", ""), body.get("url", ""),
+            source_type=body.get("source_type", "modelscope"),
+        )
+
+    @app.patch("/v1/mcp/sources/{source_id}")
+    def update_mcp_source(source_id: str, body: dict) -> dict[str, Any]:
+        return manager.update_mcp_source(source_id, body)
+
+    @app.delete("/v1/mcp/sources/{source_id}")
+    def remove_mcp_source(source_id: str) -> dict[str, Any]:
+        return manager.remove_mcp_source(source_id)
+
+    @app.post("/v1/mcp/sources/reset")
+    def reset_mcp_sources() -> dict[str, Any]:
+        return manager.reset_mcp_sources()
+
+    @app.get("/v1/mcp/sources/{source_id}/catalog")
+    def mcp_source_catalog(
+        source_id: str, page: int = 1, page_size: int = 30, query: str = "", category: str = ""
+    ) -> dict[str, Any]:
+        return manager.list_mcp_catalog(
+            source_id, page=page, page_size=page_size, query=query, category=category
+        )
+
+    @app.post("/v1/mcp/sources/{source_id}/install")
+    def install_mcp_from_catalog(source_id: str, body: dict) -> dict[str, Any]:
+        return manager.install_mcp_from_catalog(source_id, body.get("name", ""))
 
     # -- connectors (Slack / Telegram / …) --------------------------------------
     @app.get("/v1/connectors")

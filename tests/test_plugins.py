@@ -63,6 +63,21 @@ def test_source_manager_builtin_deletable_and_not_reasserted():
     assert "claude-official" in deleted
 
 
+def test_source_manager_reset_restores_deleted_builtin():
+    """reset() clears the deleted-builtin record and brings back all builtins."""
+    prefs, mgr = _prefs_and_mgr()
+    mgr.ensure_builtins()
+    mgr.remove("claude-official")
+    assert mgr.get("claude-official") is None
+    sources = mgr.reset()
+    assert any(s.id == "claude-official" for s in sources)
+    # The deleted-builtin record is cleared so ensure_builtins() won't re-delete it.
+    assert "claude-official" not in (prefs.get("deleted_builtin_plugin_sources") or [])
+    # reset() is idempotent — calling again is a no-op (builtin already present).
+    sources2 = mgr.reset()
+    assert any(s.id == "claude-official" for s in sources2)
+
+
 def test_source_manager_add_update_remove_user_source():
     prefs, mgr = _prefs_and_mgr()
     mgr.ensure_builtins()
@@ -82,6 +97,99 @@ def test_source_manager_add_rejects_empty_name_or_url():
         mgr.add("", "http://x")
     with pytest.raises(ValueError):
         mgr.add("x", "")
+
+
+def test_source_manager_prunes_stale_former_builtin():
+    """A source that was once a builtin (is_default=True) but is no longer in
+    BUILTIN_SOURCES should be pruned on ensure_builtins(). This handles the
+    modelscope-skills migration: it was mis-filed as a plugin source in a prior
+    release, persisted to prefs, then removed from BUILTIN_SOURCES. User-added
+    sources (is_default=False) are never pruned."""
+    prefs, mgr = _prefs_and_mgr()
+    # Simulate a stale former-builtin left over in prefs from a prior release.
+    prefs["plugin_sources"] = [
+        PluginSource(
+            id="claude-official",
+            name="Claude 官方插件市场",
+            url="https://github.com/anthropics/claude-plugins-official.git",
+            is_default=True,
+            source_type="git",
+        ).to_dict(),
+        PluginSource(
+            id="modelscope-skills",  # former builtin, no longer in BUILTIN_SOURCES
+            name="魔搭社区技能中心",
+            url="https://github.com/modelscope/modelscope-skills.git",
+            is_default=True,
+            source_type="git",
+        ).to_dict(),
+    ]
+    mgr.ensure_builtins()
+    ids = [s.id for s in mgr.list()]
+    assert "claude-official" in ids
+    assert "modelscope-skills" not in ids  # pruned — no longer a plugin builtin
+
+
+def test_source_manager_preserves_user_sources_through_prune():
+    """User-added sources (is_default=False, id starting 'src-') must survive the
+    former-builtin prune — only is_default=True stale entries are removed."""
+    prefs, mgr = _prefs_and_mgr()
+    mgr.ensure_builtins()
+    user_src = mgr.add("My Community", "https://github.com/foo/bar.git")
+    assert user_src.is_default is False
+    mgr.ensure_builtins()  # re-run should not prune user sources
+
+
+# -- Codex 3-field plugin source (ref + sparse_path) --------------------------
+
+
+def test_plugin_source_ref_and_sparse_path_roundtrip():
+    """PluginSource with ref + sparse_path serializes/deserializes losslessly."""
+    src = PluginSource(
+        id="src-test", name="Test", url="https://github.com/org/repo.git",
+        source_type="git", ref="main", sparse_path="plugins/codex",
+    )
+    d = src.to_dict()
+    assert d["ref"] == "main"
+    assert d["sparse_path"] == "plugins/codex"
+    restored = PluginSource.from_dict(d)
+    assert restored.ref == "main"
+    assert restored.sparse_path == "plugins/codex"
+
+
+def test_plugin_source_from_dict_backwards_compatible_no_ref():
+    """Old prefs without ref/sparse_path deserialize to empty strings (not errors)."""
+    old = {"id": "src-x", "name": "X", "url": "https://x.git", "source_type": "git"}
+    src = PluginSource.from_dict(old)
+    assert src.ref == ""
+    assert src.sparse_path == ""
+
+
+def test_plugin_source_add_with_ref_and_sparse_path():
+    """add() persists ref + sparse_path from the Codex-style 3-field form."""
+    prefs, mgr = _prefs_and_mgr()
+    mgr.ensure_builtins()
+    src = mgr.add(
+        "Codex Marketplace", "https://github.com/openai/plugins.git",
+        ref="main", sparse_path="plugins/codex",
+    )
+    assert src.ref == "main"
+    assert src.sparse_path == "plugins/codex"
+    # Verify it's persisted in the raw prefs.
+    raw = prefs["plugin_sources"]
+    entry = next(r for r in raw if r["id"] == src.id)
+    assert entry["ref"] == "main"
+    assert entry["sparse_path"] == "plugins/codex"
+
+
+def test_plugin_source_update_ref_and_sparse_path():
+    """update() can change ref and sparse_path."""
+    prefs, mgr = _prefs_and_mgr()
+    mgr.ensure_builtins()
+    src = mgr.add("X", "https://github.com/x/y.git")
+    updated = mgr.update(src.id, {"ref": "v1.2", "sparse_path": "src/plugins"})
+    assert updated.ref == "v1.2"
+    assert updated.sparse_path == "src/plugins"
+    assert mgr.get(src.id) is not None
 
 
 # -- PluginRegistry ------------------------------------------------------------
@@ -250,6 +358,70 @@ def test_install_unknown_plugin_raises(tmp_path: Path):
     src = PluginSource(id="mp", name="MP", url=str(repo), source_type="git")
     with pytest.raises(PluginInstallError):
         install_plugin(src, "nonexistent", plugins_dir=tmp_path / "p", cache_root=tmp_path / "c", mcp_register=None)
+
+
+# -- _force_rmtree + _is_incomplete_clone (Windows-safe helpers) ---------------
+
+def test_force_rmtree_removes_readonly_files(tmp_path: Path):
+    """_force_rmtree must clear the read-only bit on .git-style files before removing.
+
+    Git stores pack files as read-only on Windows; a plain shutil.rmtree raises
+    PermissionError [WinError 5] on them. The helper's onexc/onerror handler clears
+    the bit and retries, so the whole tree comes down. This test creates a read-only
+    file (simulating a .git pack file) and confirms _force_rmtree removes it.
+    """
+    import os
+    import stat
+
+    from coworker.plugins.installer import _force_rmtree
+
+    d = tmp_path / "plugin-with-git"
+    git_dir = d / ".git" / "objects" / "pack"
+    git_dir.mkdir(parents=True)
+    pack = git_dir / "pack-abc.idx"
+    pack.write_bytes(b"pack data")
+    # Make it read-only (mimicking git's pack file permissions on Windows).
+    os.chmod(pack, stat.S_IREAD)
+    # A plain rmtree would fail on the read-only file; _force_rmtree must succeed.
+    _force_rmtree(d)
+    assert not d.exists()
+
+
+def test_is_incomplete_clone_detects_git_only_dir(tmp_path: Path):
+    """_is_incomplete_clone returns True when a cache dir has .git but no working tree.
+
+    A clone interrupted mid-way (network drop, schannel TLS error) leaves .git but no
+    checked-out files. This state must be detected so _git_clone_or_pull wipes and
+    re-clones instead of trying `git pull` on a never-checked-out repo (exit 128).
+    """
+    from coworker.plugins.installer import _is_incomplete_clone
+
+    # Incomplete: only .git, no working tree files.
+    incomplete = tmp_path / "incomplete"
+    (incomplete / ".git").mkdir(parents=True)
+    assert _is_incomplete_clone(incomplete) is True
+
+    # Complete: .git + at least one working-tree file.
+    complete = tmp_path / "complete"
+    (complete / ".git").mkdir(parents=True)
+    (complete / "README.md").write_text("hello")
+    assert _is_incomplete_clone(complete) is False
+
+    # Not a clone at all (no .git).
+    no_git = tmp_path / "no-git"
+    no_git.mkdir()
+    (no_git / "file.txt").write_text("data")
+    assert _is_incomplete_clone(no_git) is False
+
+
+def test_is_incomplete_clone_ignores_clone_age_marker(tmp_path: Path):
+    """The .ow_clone_ts marker doesn't count as a working-tree file."""
+    from coworker.plugins.installer import _is_incomplete_clone
+
+    d = tmp_path / "marked"
+    (d / ".git").mkdir(parents=True)
+    (d / ".ow_clone_ts").write_text("12345.0")
+    assert _is_incomplete_clone(d) is True
 
 
 def test_safe_name_rejects_traversal():

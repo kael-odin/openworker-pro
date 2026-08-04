@@ -47,6 +47,25 @@ def test_source_manager_builtin_deletable_and_not_reasserted():
     assert "anthropic-official" in deleted
 
 
+def test_source_manager_reset_restores_deleted_builtin():
+    """reset() clears the deleted-builtin record and brings back all builtins,
+    including the mattpocock-skills source added to BUILTIN_SOURCES."""
+    prefs, mgr = _prefs_and_mgr()
+    mgr.ensure_builtins()
+    mgr.remove("anthropic-official")
+    mgr.remove("mattpocock-skills")
+    assert mgr.get("anthropic-official") is None
+    assert mgr.get("mattpocock-skills") is None
+    sources = mgr.reset()
+    ids = [s.id for s in sources]
+    assert "anthropic-official" in ids
+    assert "mattpocock-skills" in ids
+    # The deleted-builtin record is cleared.
+    deleted = prefs.get("deleted_builtin_skill_sources") or []
+    assert "anthropic-official" not in deleted
+    assert "mattpocock-skills" not in deleted
+
+
 def test_source_manager_add_update_remove_user_source():
     prefs, mgr = _prefs_and_mgr()
     mgr.ensure_builtins()
@@ -209,3 +228,117 @@ def test_builtin_skill_protected_from_uninstall(tmp_path):
         assert "built-in" in str(e)
     # Folder is still there.
     assert (bdir / "SKILL.md").is_file()
+
+
+# -- SkillHub source (腾讯 SkillHub — public GET search + ZIP download) --------
+
+
+def test_skillhub_builtin_source_seeded():
+    """ensure_builtins() seeds the skillhub source alongside anthropic + modelscope."""
+    prefs, mgr = _prefs_and_mgr()
+    mgr.ensure_builtins()
+    sources = mgr.list()
+    ids = [s.id for s in sources]
+    assert "skillhub" in ids
+    sh = next(s for s in sources if s.id == "skillhub")
+    assert sh.source_type == "skillhub"
+    assert "skillhub.cn" in sh.url
+    assert sh.is_default
+
+
+def test_list_skillhub_skills_normalizes_search_results():
+    """_list_skillhub_skills parses the SkillHub search API response into the catalog shape."""
+    from unittest.mock import patch
+    from coworker.skills.installer import _list_skillhub_skills
+
+    source = SkillSource(
+        id="skillhub", name="test", url="https://api.skillhub.cn", source_type="skillhub",
+    )
+    fake_payload = {
+        "results": [
+            {
+                "slug": "skill-creator",
+                "displayName": "Skill Creator",
+                "description": "English desc",
+                "description_zh": "中文描述",
+                "category": "ai-agent",
+                "icon_url": "https://cdn.example.com/icon.png",
+                "installs": 3453,
+                "stars": 445,
+                "namespace": {"canonicalName": "@chindden/skill-creator"},
+                "version": "0.1.0",
+                "homepage": "https://skillhub.cn/skills/skill-creator",
+            },
+        ]
+    }
+    with patch("coworker.skills.installer._skillhub_get", return_value=fake_payload):
+        result = _list_skillhub_skills(source, page=1, page_size=10, query="skill")
+    assert result["total_count"] == 1
+    assert result["page"] == 1
+    assert "ai-agent" in result["categories"]
+    item = result["skills"][0]
+    assert item["name"] == "skill-creator"
+    assert item["display_name"] == "Skill Creator"
+    assert item["description"] == "中文描述"
+    assert item["icon"] == "https://cdn.example.com/icon.png"
+    assert item["downloads"] == 3453
+    assert item["stars"] == 445
+    assert item["author"] == "@chindden/skill-creator"
+
+
+def test_install_skillhub_skill_extracts_zip_bundle(tmp_path):
+    """_install_skillhub_skill downloads a ZIP and extracts the full bundle (SKILL.md + scripts)."""
+    import io
+    import zipfile
+    from unittest.mock import patch, MagicMock
+    from coworker.skills.installer import _install_skillhub_skill
+
+    # Build a fake SkillHub ZIP with SKILL.md + a script + references.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("SKILL.md", "---\nname: test-skill\ndescription: test\n---\nbody")
+        zf.writestr("scripts/run.py", "print('hi')")
+        zf.writestr("references/guide.md", "# Guide")
+        zf.writestr("_meta.json", '{"version": "1.0"}')
+    zip_bytes = buf.getvalue()
+
+    source = SkillSource(
+        id="skillhub", name="test", url="https://api.skillhub.cn", source_type="skillhub",
+    )
+    fake_resp = MagicMock()
+    fake_resp.content = zip_bytes
+    fake_resp.raise_for_status = lambda: None
+    with patch("coworker.skills.installer.httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.get.return_value = fake_resp
+        result = _install_skillhub_skill(source, "test-skill", skills_dir=tmp_path / "skills")
+    assert result["ok"] is True
+    dest = Path(result["path"])
+    assert (dest / "SKILL.md").is_file()
+    assert (dest / "scripts" / "run.py").is_file()
+    assert (dest / "references" / "guide.md").is_file()
+    assert (dest / "_meta.json").is_file()
+    # SKILL.md content is the real ZIP content, not empty.
+    assert "test-skill" in (dest / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_install_skillhub_skill_rejects_non_zip(tmp_path):
+    """If the download isn't a ZIP (PK header), install raises SkillInstallError."""
+    from unittest.mock import patch, MagicMock
+    from coworker.skills.installer import _install_skillhub_skill, SkillInstallError
+
+    source = SkillSource(
+        id="skillhub", name="test", url="https://api.skillhub.cn", source_type="skillhub",
+    )
+    fake_resp = MagicMock()
+    fake_resp.content = b"not a zip"
+    fake_resp.raise_for_status = lambda: None
+    with patch("coworker.skills.installer.httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.get.return_value = fake_resp
+        try:
+            _install_skillhub_skill(source, "bad", skills_dir=tmp_path / "skills")
+            assert False, "expected SkillInstallError"
+        except SkillInstallError as e:
+            assert "ZIP" in str(e) or "not a ZIP" in str(e)
+
+
+# -- Codex 3-field plugin source (ref + sparse_path) --------------------------

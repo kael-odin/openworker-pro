@@ -23,7 +23,9 @@ drops the registry entry.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -64,6 +66,50 @@ def _run_git(args: list[str], *, timeout: int = 120) -> None:
         raise PluginInstallError(f"git failed: {e}") from e
 
 
+def _force_rmtree(path: Path) -> None:
+    """``shutil.rmtree`` that survives Windows' read-only ``.git`` files.
+
+    Git stores pack files and object DB entries as read-only on Windows. A plain
+    ``shutil.rmtree`` aborts with ``PermissionError: [WinError 5]`` the moment it hits
+    one, which is why plugin uninstall and stale-cache cleanup silently fail on Windows
+    — the folder half-remains and every subsequent operation on it breaks. This wrapper
+    installs an ``onexc`` handler (3.12+) / ``onerror`` (older) that clears the read-only
+    bit and retries, so the whole tree comes down cleanly.
+    """
+    def _clear_readonly(_func, fpath, _exc_info):  # noqa: ANN001
+        try:
+            os.chmod(fpath, stat.S_IWRITE)
+        except (OSError, ValueError):
+            pass
+        try:
+            _func(fpath)
+        except OSError:
+            pass
+
+    kwargs: dict[str, Any] = {}
+    if hasattr(shutil, "onexc"):  # Python 3.12+
+        kwargs["onexc"] = _clear_readonly
+    else:  # Python 3.8–3.11
+        kwargs["onerror"] = _clear_readonly
+    shutil.rmtree(path, **kwargs)
+
+
+def _is_incomplete_clone(cache_dir: Path) -> bool:
+    """True if ``cache_dir`` has a ``.git`` dir but no checked-out working tree.
+
+    A clone interrupted mid-way (network drop, schannel TLS error on Windows) leaves a
+    ``.git`` directory but no actual files — so ``cache_dir.is_dir()`` is True and the
+    refresh path tries ``git pull`` on a repo that was never checked out, which fails with
+    exit 128. Detecting this lets us wipe and re-clone instead of looping on the error.
+    """
+    if not (cache_dir / ".git").exists():
+        return False
+    # A fully-checked-out clone has at least .git + the repo's own files. If the only
+    # top-level entry is .git (or .git + our .ow_clone_ts marker), the checkout never ran.
+    entries = [p.name for p in cache_dir.iterdir() if p.name != ".ow_clone_ts"]
+    return entries == [".git"] or (len(entries) == 1 and entries[0] == ".git")
+
+
 def _clone_age(cache_dir: Path) -> float:
     ts_file = cache_dir / ".ow_clone_ts"
     if not ts_file.is_file():
@@ -78,11 +124,17 @@ def _mark_clone_age(cache_dir: Path) -> None:
     (cache_dir / ".ow_clone_ts").write_text(str(time.monotonic()), encoding="utf-8")
 
 
-def _git_clone_or_pull(url: str, cache_dir: Path, *, ref: str = "", sha: str = "") -> Path:
+def _git_clone_or_pull(
+    url: str, cache_dir: Path, *, ref: str = "", sha: str = "", sparse_path: str = ""
+) -> Path:
     """Clone (or refresh) ``url`` into ``cache_dir``. If ``sha`` is given, check it out.
 
     A pinned ``sha`` forces a full (non-shallow) fetch + checkout so the exact commit is
     present; without ``sha`` a shallow clone (``--depth 1``) is used and refreshed via pull.
+
+    If ``sparse_path`` is set, a sparse checkout is configured so only that subdirectory
+    of the repo is materialized on disk (mirrors Codex's "稀疏路径" field — large monorepo
+    marketplaces like ``openai/plugins`` where the catalog lives under ``plugins/codex``).
 
     A failed ``pull --ff-only`` (exit 128 — common when the upstream force-pushed or the
     shallow clone diverged) is recovered by wiping the cache and re-cloning, rather than
@@ -90,17 +142,27 @@ def _git_clone_or_pull(url: str, cache_dir: Path, *, ref: str = "", sha: str = "
     on the Claude official plugin marketplace source.
     """
     if cache_dir.is_dir() and not sha and (time.monotonic() - _clone_age(cache_dir)) < _CACHE_TTL:
-        return cache_dir
+        # Even within TTL, a half-finished clone (`.git` but no working tree — from a
+        # network drop or Windows schannel TLS error) is unusable: `git pull` on it fails
+        # with exit 128. Detect and wipe so we re-clone instead of surfacing that error.
+        if _is_incomplete_clone(cache_dir):
+            _force_rmtree(cache_dir)
+        else:
+            return cache_dir
     try:
         if cache_dir.is_dir():
-            if sha:
+            if _is_incomplete_clone(cache_dir):
+                # Stale interrupted clone — wipe and start fresh (pull would fail).
+                _force_rmtree(cache_dir)
+                _clone_fresh(url, cache_dir, ref=ref, sha=sha, sparse_path=sparse_path)
+            elif sha:
                 # Pinned commit: fetch the specific sha (full depth) and check it out.
                 _run_git(["git", "-C", str(cache_dir), "fetch", "--depth", "1", "origin", sha], timeout=90)
                 _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
             else:
-                _try_pull_or_reclone(url, cache_dir)
+                _try_pull_or_reclone(url, cache_dir, ref=ref, sparse_path=sparse_path)
         else:
-            _clone_fresh(url, cache_dir, ref=ref, sha=sha)
+            _clone_fresh(url, cache_dir, ref=ref, sha=sha, sparse_path=sparse_path)
     except PluginInstallError:
         raise
     except Exception as e:
@@ -109,7 +171,7 @@ def _git_clone_or_pull(url: str, cache_dir: Path, *, ref: str = "", sha: str = "
     return cache_dir
 
 
-def _try_pull_or_reclone(url: str, cache_dir: Path) -> None:
+def _try_pull_or_reclone(url: str, cache_dir: Path, *, ref: str = "", sparse_path: str = "") -> None:
     """Refresh a cached clone via ``pull --ff-only``; on failure, wipe + re-clone.
 
     A shallow clone's ``pull --ff-only`` fails (exit 128) when the remote no longer
@@ -121,13 +183,33 @@ def _try_pull_or_reclone(url: str, cache_dir: Path) -> None:
         _run_git(["git", "-C", str(cache_dir), "pull", "--ff-only", "--depth", "1"], timeout=60)
     except PluginInstallError:
         # The pull failed (likely exit 128). Wipe the stale cache and re-clone from scratch.
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        _clone_fresh(url, cache_dir)
+        _force_rmtree(cache_dir)
+        _clone_fresh(url, cache_dir, ref=ref, sparse_path=sparse_path)
 
 
-def _clone_fresh(url: str, cache_dir: Path, *, ref: str = "", sha: str = "") -> None:
-    """Clone ``url`` into ``cache_dir`` (shallow, or pinned to ``sha``/``ref``)."""
+def _clone_fresh(url: str, cache_dir: Path, *, ref: str = "", sha: str = "", sparse_path: str = "") -> None:
+    """Clone ``url`` into ``cache_dir`` (shallow, or pinned to ``sha``/``ref``).
+
+    If ``sparse_path`` is set, only that subdirectory is checked out (sparse checkout).
+    """
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    if sparse_path:
+        # Sparse checkout: clone without checking out files, configure the cone, then
+        # checkout the ref (or HEAD). This materializes only ``sparse_path`` on disk.
+        _run_git(["git", "clone", "--no-checkout", "--filter=blob:none", url, str(cache_dir)], timeout=120)
+        _run_git(["git", "-C", str(cache_dir), "sparse-checkout", "set", sparse_path], timeout=60)
+        if sha:
+            try:
+                _run_git(["git", "-C", str(cache_dir), "fetch", "--depth", "1", "origin", sha], timeout=90)
+                _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
+            except PluginInstallError:
+                _run_git(["git", "-C", str(cache_dir), "fetch", "--unshallow"], timeout=180)
+                _run_git(["git", "-C", str(cache_dir), "checkout", sha], timeout=60)
+        elif ref:
+            _run_git(["git", "-C", str(cache_dir), "checkout", ref], timeout=60)
+        else:
+            _run_git(["git", "-C", str(cache_dir), "checkout", "HEAD"], timeout=60)
+        return
     if sha:
         # Clone first (shallow is fine, we fetch the sha explicitly), then pin.
         _run_git(["git", "clone", "--depth", "1", url, str(cache_dir)], timeout=120)
@@ -147,9 +229,18 @@ def _clone_fresh(url: str, cache_dir: Path, *, ref: str = "", sha: str = "") -> 
 # -- marketplace.json parsing -------------------------------------------------
 
 
-def _read_marketplace(clone_dir: Path) -> dict[str, Any]:
+def _marketplace_dir(clone_dir: Path, sparse_path: str = "") -> Path:
+    """The directory holding ``.claude-plugin/marketplace.json``.
+
+    If ``sparse_path`` is set (Codex-style "稀疏路径"), the marketplace.json lives inside
+    that subdirectory of the clone; otherwise it's at the repo root.
+    """
+    return clone_dir / sparse_path if sparse_path else clone_dir
+
+
+def _read_marketplace(clone_dir: Path, sparse_path: str = "") -> dict[str, Any]:
     """Read + parse ``.claude-plugin/marketplace.json`` from a cloned marketplace repo."""
-    mp = clone_dir / ".claude-plugin" / "marketplace.json"
+    mp = _marketplace_dir(clone_dir, sparse_path) / ".claude-plugin" / "marketplace.json"
     if not mp.is_file():
         raise PluginInstallError(
             f"not a plugin marketplace: .claude-plugin/marketplace.json not found"
@@ -194,10 +285,12 @@ def list_catalog(source: PluginSource, cache_root: Path) -> list[dict[str, Any]]
     """List installable plugins from a marketplace source (clones on demand).
 
     Returns a list of normalized plugin entries (name/description/category/source_info/...).
+    Honors ``source.ref`` (git branch/tag/commit) and ``source.sparse_path`` (sparse-checkout
+    subdirectory) — the Codex-style 3-field source form.
     """
     cache_dir = cache_root / source.id
-    _git_clone_or_pull(source.url, cache_dir)
-    data = _read_marketplace(cache_dir)
+    _git_clone_or_pull(source.url, cache_dir, ref=source.ref, sparse_path=source.sparse_path)
+    data = _read_marketplace(cache_dir, source.sparse_path)
     plugins = data.get("plugins") if isinstance(data, dict) else None
     if not isinstance(plugins, list):
         return []
@@ -210,18 +303,22 @@ def list_catalog(source: PluginSource, cache_root: Path) -> list[dict[str, Any]]
 
 
 def _resolve_source_folder(
-    source_info: dict[str, Any], *, marketplace_clone: Path, cache_root: Path, source_id: str, name: str
+    source_info: dict[str, Any], *, marketplace_clone: Path, marketplace_subdir: str = "",
+    cache_root: Path, source_id: str, name: str,
 ) -> Path:
     """Resolve the plugin's source folder from its ``source_info``.
 
     Returns the path inside a clone that holds ``.claude-plugin/plugin.json``.
+    ``marketplace_subdir`` is the sparse-path subdirectory local-string ``source`` paths
+    are relative to (when the marketplace itself lives under a subfolder of the repo).
     """
     kind = str(source_info.get("source") or "local")
+    market_base = marketplace_clone / marketplace_subdir if marketplace_subdir else marketplace_clone
 
     if kind == "local":
         # A path relative to the marketplace repo (e.g. "./plugins/foo").
         rel = str(source_info.get("path") or ".").lstrip("./")
-        folder = marketplace_clone / rel if rel else marketplace_clone
+        folder = market_base / rel if rel else market_base
         if not folder.is_dir():
             raise PluginInstallError(f"plugin {name!r}: local path {rel!r} not found in marketplace")
         return folder
@@ -332,8 +429,8 @@ def install_plugin(
     """
     safe = _safe_name(name)
     cache_dir = cache_root / source.id
-    _git_clone_or_pull(source.url, cache_dir)
-    data = _read_marketplace(cache_dir)
+    _git_clone_or_pull(source.url, cache_dir, ref=source.ref, sparse_path=source.sparse_path)
+    data = _read_marketplace(cache_dir, source.sparse_path)
 
     # Find the entry in the marketplace.
     entry = None
@@ -349,6 +446,7 @@ def install_plugin(
     src_folder = _resolve_source_folder(
         entry["source_info"],
         marketplace_clone=cache_dir,
+        marketplace_subdir=source.sparse_path,
         cache_root=cache_root,
         source_id=source.id,
         name=name,
@@ -421,7 +519,11 @@ def uninstall_plugin(
             except Exception:
                 pass  # best-effort: don't block uninstall on a stuck MCP server
     if dest.is_dir():
-        shutil.rmtree(dest)
+        # Use _force_rmtree: a plugin cloned from git carries a .git/ dir whose pack files
+        # are read-only on Windows, and a plain shutil.rmtree raises PermissionError
+        # [WinError 5] on them — which surfaces as "delete button does nothing" because
+        # the exception propagates up and the UI shows no feedback.
+        _force_rmtree(dest)
     if registry is not None:
         registry.remove(safe)
     return {"ok": True, "name": safe}

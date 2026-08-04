@@ -291,6 +291,13 @@ class SessionManager:
         self.plugin_sources.ensure_builtins()
         self._plugin_cache_root = base / "plugin_sources_cache"
         self.plugin_registry = PluginRegistry(self._prefs, self._save_prefs)
+        # MCP marketplace sources — same prefs-persisted SourceManager pattern as skills /
+        # plugins. The built-in ModelScope MCP plaza (~9.8k servers) is queried via the
+        # public agg API; install extracts the ServerConfig and registers it via add_mcp.
+        from ..mcp.sources import McpSourceManager
+
+        self.mcp_sources = McpSourceManager(self._prefs, self._save_prefs)
+        self.mcp_sources.ensure_builtins()
         # Browser login state (E5) — persisted login sessions (Playwright storageState or
         # pasted cookies) under state_dir()/browser_profiles/<id>/. When the agent opens a
         # browser URL whose host matches a captured login, browser_automation rebuilds
@@ -1256,6 +1263,85 @@ class SessionManager:
         await self.mcp.aclose()
         return {"ok": True}
 
+    # -- MCP marketplace sources (魔搭 MCP plaza, ~9.8k servers) -----------------
+    # Mirrors skill_sources / plugin_sources: CRUD a source list, browse a source's catalog
+    # (paginated + searchable via the ModelScope agg API), and install a server by name —
+    # install extracts the ServerConfig and registers it via add_mcp (the existing path).
+    def list_mcp_sources(self) -> list[dict[str, Any]]:
+        return [s.to_dict() for s in self.mcp_sources.list()]
+
+    def add_mcp_source(self, name: str, url: str, *, source_type: str = "modelscope") -> dict[str, Any]:
+        try:
+            src = self.mcp_sources.add(name, url, source_type=source_type)
+            return {"ok": True, "source": src.to_dict()}
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def update_mcp_source(self, source_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        src = self.mcp_sources.update(source_id, changes)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        return {"ok": True, "source": src.to_dict()}
+
+    def remove_mcp_source(self, source_id: str) -> dict[str, Any]:
+        if not self.mcp_sources.remove(source_id):
+            return {"ok": False, "error": "source not found"}
+        return {"ok": True, "id": source_id}
+
+    def reset_mcp_sources(self) -> dict[str, Any]:
+        """Restore all builtin MCP sources (undoes deletions). The 'reset to defaults' escape hatch."""
+        sources = self.mcp_sources.reset()
+        return {"ok": True, "sources": [s.to_dict() for s in sources]}
+
+    def list_mcp_catalog(
+        self, source_id: str, *, page: int = 1, page_size: int = 30, query: str = "", category: str = ""
+    ) -> dict[str, Any]:
+        """Browse installable MCP servers from one marketplace (fetches on demand)."""
+        from ..mcp.catalog import list_mcp_catalog as _list, McpCatalogError
+
+        src = self.mcp_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            result = _list(src, page=page, page_size=page_size, query=query, category=category)
+        except McpCatalogError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        installed = {m.get("name") for m in self.list_mcp() if m.get("name")}
+        return {
+            "ok": True,
+            "source": src.to_dict(),
+            "servers": [{**s, "installed": s["name"] in installed} for s in result["servers"]],
+            "total_count": result["total_count"],
+            "page": result["page"],
+            "page_size": result["page_size"],
+            "categories": result["categories"],
+        }
+
+    def install_mcp_from_catalog(self, source_id: str, name: str) -> dict[str, Any]:
+        """Install an MCP server from a marketplace catalog by name.
+
+        Resolves the server's ServerConfig (or DeployedUrl for hosted servers) and registers
+        it via :meth:`add_mcp` — the same path plugins use for their contributed MCP servers.
+        """
+        from ..mcp.catalog import install_mcp_from_catalog as _install, McpCatalogError
+
+        src = self.mcp_sources.get(source_id)
+        if src is None:
+            return {"ok": False, "error": "source not found"}
+        try:
+            result = _install(src, name)
+        except McpCatalogError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        config = result.get("config") or {}
+        if not config:
+            return {"ok": False, "error": f"no usable config for MCP server {name!r}"}
+        self.add_mcp(name, config)
+        return {"ok": True, "name": name}
+
     # -- connectors -------------------------------------------------------------
     async def _wechat_ilink_confirmed(self, _account_id: str) -> None:
         """Best-effort hot refresh after QR confirmation saves an account."""
@@ -1972,11 +2058,26 @@ class SessionManager:
                     args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
             elif sys.platform == "win32":
+                # The sidecar runs with CREATE_NO_WINDOW (see src-tauri lib.rs), so explorer
+                # spawned from it inherits that no-window context and may fail to open the
+                # folder (showing "location is not available"). DETACHED_PROCESS (0x8) sheds
+                # that flag so explorer opens on the interactive desktop. Paths must use
+                # backslashes for explorer's /select, parsing.
+                p_win = str(target).replace("/", "\\")
                 if mode == "reveal" and not is_dir:
-                    # Explorer wants the path glued to the switch: /select,<path>
-                    subprocess.Popen(["explorer", f"/select,{target}"])
+                    subprocess.Popen(
+                        ["explorer", f"/select,{p_win}"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=0x00000008,
+                    )
                 else:
-                    os.startfile(str(target))  # type: ignore[attr-defined]  # open in default app
+                    subprocess.Popen(
+                        ["explorer", p_win],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=0x00000008,
+                    )
             else:  # Linux/BSD
                 tgt = str(target.parent) if mode == "reveal" and not is_dir else str(target)
                 subprocess.Popen(
@@ -5062,14 +5163,36 @@ class SessionManager:
         self, name: str, workspace: Optional[str] = None
     ) -> dict[str, Any]:
         """Open the skill's folder in the OS file manager (§6 "Show folder" — the power-user
-        window into folder-is-truth). Same local-machine rationale as reveal_artifact."""
+        window into folder-is-truth). Same local-machine rationale as reveal_artifact.
+
+        For plugin-contributed skills (scope ``plugin``, living under
+        ``state_dir()/plugins/<n>/skills/<name>/``) the skill store's ``find()`` doesn't
+        search those dirs — it only knows project + global scope. So on a ``find`` miss we
+        fall back to scanning the plugin skill dirs, which lets "Show folder" work for
+        skills that ship with an installed plugin (e.g. hyperframes)."""
         import subprocess
         import sys
 
+        folder: Optional[Path] = None
         try:
             folder, _scope = self.skill_store.find(name, workspace or None)
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
+        except ValueError:
+            # Not in project/global scope — try plugin-contributed skill dirs.
+            folder = None
+        if folder is None:
+            for sd in self._plugin_skill_dirs():
+                candidate = sd / name
+                if (candidate / "SKILL.md").is_file():
+                    folder = candidate
+                    break
+        if folder is None:
+            return {"ok": False, "error": f"未知技能：{name}"}
+        # Guard: the folder must exist on disk before we ask the OS to open it. A skill
+        # row can briefly outlive its folder (e.g. install mid-write, or a stale row from
+        # a removed external drive). Without this check os.startfile/explorer surfaces a
+        # confusing "location is not available" shell dialog rather than a clean error.
+        if not folder.is_dir():
+            return {"ok": False, "error": f"技能文件夹不存在：{folder}"}
         try:
             if sys.platform == "darwin":
                 subprocess.Popen(
@@ -5078,9 +5201,36 @@ class SessionManager:
                     stderr=subprocess.DEVNULL,
                 )
             elif sys.platform == "win32":
-                import os
-
-                os.startfile(str(folder))  # type: ignore[attr-defined]
+                # The sidecar runs with CREATE_NO_WINDOW (see src-tauri lib.rs), so it has no
+                # attached console/desktop. Opening a folder from that context is finicky:
+                #   * os.startfile (ShellExecuteW) sometimes fires the shell's "location is not
+                #     available" dialog even when the path exists.
+                #   * A bare `subprocess.Popen(["explorer", path])` inherits the no-window context
+                #     and the existing explorer instance (on a different desktop session) may
+                #     reject the open-folder request.
+                # The reliable combo: spawn explorer.exe with DETACHED_PROCESS so it doesn't
+                # inherit the sidecar's no-window flag, and pass the folder via `/select,` on a
+                # file inside it (here the folder itself) — this makes explorer open the parent
+                # and select the target, which works even across desktop sessions. As a fallback
+                # (no file to select on), open the folder directly.
+                p = str(folder)
+                # explorer's `/select,<path>` needs backslashes on Windows.
+                p_win = p.replace("/", "\\")
+                try:
+                    subprocess.Popen(
+                        ["explorer", "/select," + p_win],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=0x00000008,  # DETACHED_PROCESS — shed CREATE_NO_WINDOW
+                    )
+                except OSError:
+                    # Fallback: open the folder itself (no selection).
+                    subprocess.Popen(
+                        ["explorer", p_win],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=0x00000008,
+                    )
             else:
                 subprocess.Popen(
                     ["xdg-open", str(folder)],
@@ -5321,22 +5471,47 @@ class SessionManager:
             return {"ok": False, "error": "source not found"}
         return {"ok": True, "id": source_id}
 
-    def list_skill_catalog(self, source_id: str) -> dict[str, Any]:
-        """Browse installable skills from one source (fetches/clones on demand)."""
+    def reset_skill_sources(self) -> dict[str, Any]:
+        """Restore all builtin skill sources (undoes deletions). The 'reset to defaults' escape hatch."""
+        sources = self.skill_sources.reset()
+        return {"ok": True, "sources": [s.to_dict() for s in sources]}
+
+    def list_skill_catalog(
+        self, source_id: str, *, page: int = 1, page_size: int = 100, query: str = ""
+    ) -> dict[str, Any]:
+        """Browse installable skills from one source (fetches/clones on demand).
+
+        For ``modelscope`` / ``skillhub`` sources the catalog is paginated; ``page``,
+        ``page_size`` and ``query`` are forwarded to the API and the response carries
+        ``total_count`` + ``categories``. For git/local/http sources these params are
+        ignored and the full (small) catalog is returned as before.
+        """
         from ..skills import list_catalog as _list_catalog
 
         src = self.skill_sources.get(source_id)
         if src is None:
             return {"ok": False, "error": "source not found"}
         try:
-            items = _list_catalog(src, self._skill_cache_root)
+            result = _list_catalog(src, self._skill_cache_root, page=page, page_size=page_size, query=query)
         except Exception as e:
             return {"ok": False, "error": str(e)}
         installed = {s["name"] for s in self.list_skills() if s.get("name")}
+        # modelscope/skillhub sources return a paginated dict; others return a flat list.
+        if isinstance(result, dict):
+            items = result.get("skills") or []
+            return {
+                "ok": True,
+                "source": src.to_dict(),
+                "skills": [{**it, "installed": it["name"] in installed} for it in items],
+                "total_count": result.get("total_count") or 0,
+                "page": result.get("page") or page,
+                "page_size": result.get("page_size") or page_size,
+                "categories": result.get("categories") or [],
+            }
         return {
             "ok": True,
             "source": src.to_dict(),
-            "skills": [{**it, "installed": it["name"] in installed} for it in items],
+            "skills": [{**it, "installed": it["name"] in installed} for it in result],
         }
 
     def install_skill(self, source_id: str, name: str) -> dict[str, Any]:
@@ -5373,9 +5548,14 @@ class SessionManager:
     def list_plugin_sources(self) -> list[dict[str, Any]]:
         return [s.to_dict() for s in self.plugin_sources.list()]
 
-    def add_plugin_source(self, name: str, url: str, *, source_type: str = "git") -> dict[str, Any]:
+    def add_plugin_source(
+        self, name: str, url: str, *, source_type: str = "git",
+        ref: str = "", sparse_path: str = "",
+    ) -> dict[str, Any]:
         try:
-            src = self.plugin_sources.add(name, url, source_type=source_type)
+            src = self.plugin_sources.add(
+                name, url, source_type=source_type, ref=ref, sparse_path=sparse_path,
+            )
             return {"ok": True, "source": src.to_dict()}
         except ValueError as e:
             return {"ok": False, "error": str(e)}
@@ -5390,6 +5570,11 @@ class SessionManager:
         if not self.plugin_sources.remove(source_id):
             return {"ok": False, "error": "source not found"}
         return {"ok": True, "id": source_id}
+
+    def reset_plugin_sources(self) -> dict[str, Any]:
+        """Restore all builtin plugin sources (undoes deletions). The 'reset to defaults' escape hatch."""
+        sources = self.plugin_sources.reset()
+        return {"ok": True, "sources": [s.to_dict() for s in sources]}
 
     def list_plugin_catalog(self, source_id: str) -> dict[str, Any]:
         """Browse installable plugins from one marketplace (clones on demand)."""

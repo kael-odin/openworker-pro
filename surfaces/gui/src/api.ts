@@ -581,6 +581,14 @@ export interface SkillCatalogItem {
   description: string;
   path: string;
   installed: boolean;
+  // ModelScope sources enrich each item with icon/category/downloads (git/http sources
+  // don't populate these — the UI degrades gracefully when they're absent).
+  category?: string;
+  icon?: string;
+  downloads?: number;
+  author?: string;
+  source_url?: string;
+  tags?: string[];
 }
 
 export async function getSkillSources(): Promise<SkillSource[]> {
@@ -622,10 +630,37 @@ export async function removeSkillSource(
   return res.json();
 }
 
+export async function resetSkillSources(): Promise<{
+  ok: boolean;
+  sources: SkillSource[];
+}> {
+  const res = await fetch(`${httpBase()}/v1/skills/sources/reset`, {
+    method: "POST",
+  });
+  return res.json();
+}
+
 export async function getSkillCatalog(
   sourceId: string,
-): Promise<{ ok: boolean; error?: string; source?: SkillSource; skills?: SkillCatalogItem[] }> {
-  const res = await fetch(`${httpBase()}/v1/skills/sources/${sourceId}/catalog`);
+  opts?: { page?: number; page_size?: number; query?: string },
+): Promise<{
+  ok: boolean;
+  error?: string;
+  source?: SkillSource;
+  skills?: SkillCatalogItem[];
+  total_count?: number;
+  page?: number;
+  page_size?: number;
+  categories?: string[];
+}> {
+  const params = new URLSearchParams();
+  if (opts?.page) params.set("page", String(opts.page));
+  if (opts?.page_size) params.set("page_size", String(opts.page_size));
+  if (opts?.query) params.set("query", opts.query);
+  const qs = params.toString();
+  const res = await fetch(
+    `${httpBase()}/v1/skills/sources/${sourceId}/catalog${qs ? `?${qs}` : ""}`,
+  );
   return res.json();
 }
 
@@ -649,6 +684,120 @@ export async function uninstallSkill(name: string): Promise<{ ok: boolean; error
   return res.json();
 }
 
+// -- MCP marketplace sources (魔搭 MCP plaza, ~9.8k servers) ------------------
+// Mirrors the skill source API: list/add/update/remove sources, browse a source's catalog
+// (paginated + searchable via the ModelScope agg API), and install a server by name —
+// install extracts the ServerConfig and registers it via add_mcp (the existing path).
+export interface McpSource {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  is_default: boolean;
+  source_type: string; // "modelscope" | "http"
+}
+
+export interface McpCatalogItem {
+  name: string;
+  path: string;
+  description: string;
+  icon: string;
+  category: string[];
+  tags: string[];
+  stars: number;
+  hosted: boolean;
+  verified: boolean;
+  source_url: string;
+  deployed_url: string;
+  installed: boolean;
+}
+
+export async function getMcpSources(): Promise<McpSource[]> {
+  const res = await fetch(`${httpBase()}/v1/mcp/sources`);
+  return (await res.json()).sources ?? [];
+}
+
+export async function addMcpSource(
+  name: string,
+  url: string,
+  sourceType = "modelscope",
+): Promise<{ ok: boolean; error?: string; source?: McpSource }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, source_type: sourceType }),
+  });
+  return res.json();
+}
+
+export async function updateMcpSource(
+  sourceId: string,
+  changes: Partial<McpSource>,
+): Promise<{ ok: boolean; error?: string; source?: McpSource }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/sources/${sourceId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  return res.json();
+}
+
+export async function removeMcpSource(
+  sourceId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/sources/${sourceId}`, {
+    method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function resetMcpSources(): Promise<{
+  ok: boolean;
+  sources: McpSource[];
+}> {
+  const res = await fetch(`${httpBase()}/v1/mcp/sources/reset`, {
+    method: "POST",
+  });
+  return res.json();
+}
+
+export async function getMcpCatalog(
+  sourceId: string,
+  opts?: { page?: number; page_size?: number; query?: string; category?: string },
+): Promise<{
+  ok: boolean;
+  error?: string;
+  source?: McpSource;
+  servers?: McpCatalogItem[];
+  total_count?: number;
+  page?: number;
+  page_size?: number;
+  categories?: string[];
+}> {
+  const params = new URLSearchParams();
+  if (opts?.page) params.set("page", String(opts.page));
+  if (opts?.page_size) params.set("page_size", String(opts.page_size));
+  if (opts?.query) params.set("query", opts.query);
+  if (opts?.category) params.set("category", opts.category);
+  const qs = params.toString();
+  const res = await fetch(
+    `${httpBase()}/v1/mcp/sources/${sourceId}/catalog${qs ? `?${qs}` : ""}`,
+  );
+  return res.json();
+}
+
+export async function installMcpFromCatalog(
+  sourceId: string,
+  name: string,
+): Promise<{ ok: boolean; error?: string; name?: string }> {
+  const res = await fetch(`${httpBase()}/v1/mcp/sources/${sourceId}/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  return res.json();
+}
+
 // -- Plugins (marketplace install/uninstall, E4) ------------------------------
 // Claude-Code-format plugins installed from marketplace sources. The official
 // claude-plugins-official.git is built in. Plugins land under state_dir()/plugins/<name>/;
@@ -660,6 +809,8 @@ export interface PluginSource {
   enabled: boolean;
   is_default: boolean;
   source_type: string; // "git"
+  ref?: string; // git ref (branch/tag/commit); "" = default branch
+  sparse_path?: string; // sparse-checkout subdirectory; "" = whole repo
 }
 
 export interface PluginCatalogItem {
@@ -700,11 +851,13 @@ export async function addPluginSource(
   name: string,
   url: string,
   sourceType = "git",
+  ref = "",
+  sparsePath = "",
 ): Promise<{ ok: boolean; error?: string; source?: PluginSource }> {
   const res = await fetch(`${httpBase()}/v1/plugins/sources`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, url, source_type: sourceType }),
+    body: JSON.stringify({ name, url, source_type: sourceType, ref, sparse_path: sparsePath }),
   });
   return res.json();
 }
@@ -726,6 +879,16 @@ export async function removePluginSource(
 ): Promise<{ ok: boolean; error?: string }> {
   const res = await fetch(`${httpBase()}/v1/plugins/sources/${sourceId}`, {
     method: "DELETE",
+  });
+  return res.json();
+}
+
+export async function resetPluginSources(): Promise<{
+  ok: boolean;
+  sources: PluginSource[];
+}> {
+  const res = await fetch(`${httpBase()}/v1/plugins/sources/reset`, {
+    method: "POST",
   });
   return res.json();
 }

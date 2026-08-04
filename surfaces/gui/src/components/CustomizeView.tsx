@@ -1047,35 +1047,53 @@ function SkillsPanel({
   onRefresh: () => void;
 }) {
   const [creating, setCreating] = useState(false);
+  const [wizardStep, setWizardStep] = useState(1); // 1=basics, 2=body, 3=tools
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [newBody, setNewBody] = useState("");
-  const [newTools, setNewTools] = useState("");
+  const [newTools, setNewTools] = useState(""); // typed text for chip input
+  const [newToolsArr, setNewToolsArr] = useState<string[]>([]); // parsed chips
+  const [toolInput, setToolInput] = useState(""); // edit-form chip input
   const [editing, setEditing] = useState<string | null>(null);
   const [editDesc, setEditDesc] = useState("");
   const [editBody, setEditBody] = useState("");
-  const [editTools, setEditTools] = useState("");
+  const [editToolsArr, setEditToolsArr] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   // Import-skill-package flow: staged upload preview → confirm.
   const [importPreview, setImportPreview] = useState<{ token: string; name: string; description: string; files: string[] } | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  // Scope filter: all / custom (project+global) / plugin / modelscope-installed.
+  const [scopeFilter, setScopeFilter] = useState<"all" | "custom" | "plugin" | "modelscope">("all");
 
   const parseTools = (s: string): string[] =>
     s.split(",").map((t) => t.trim()).filter(Boolean);
 
   const startCreate = () => {
     setCreating(true);
+    setWizardStep(1);
     setNewName("");
     setNewDesc("");
     setNewBody("");
     setNewTools("");
+    setNewToolsArr([]);
   };
 
+  // kebab-case normalization + live validation for the skill name (Step 1).
+  const nameKebab = newName.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  const existingNames = new Set(skills.map((s) => s.name));
+  const nameError =
+    !newName.trim() ? ""
+    : newName.trim().length < 2 ? t("skills.wizard_name_short")
+    : !/^[a-z0-9-]+$/.test(nameKebab) || nameKebab.length < 2 ? t("skills.wizard_name_invalid")
+    : existingNames.has(nameKebab) ? t("skills.wizard_name_taken")
+    : "";
+  const nameValid = newName.trim().length >= 2 && !nameError;
+
   const submitCreate = async () => {
-    const name = newName.trim();
+    const name = nameKebab || newName.trim();
     if (!name) return;
     setBusy(true);
-    const tools = parseTools(newTools);
+    const tools = [...newToolsArr, ...parseTools(newTools)].filter((v, i, a) => a.indexOf(v) === i);
     const r = await createSkill({ name, description: newDesc.trim(), instructions: newBody, allowed_tools: tools });
     setBusy(false);
     if (!r.ok) {
@@ -1093,15 +1111,17 @@ function SkillsPanel({
     // body is optional (append). A full edit fetches the skill folder — but for
     // a clean panel we keep it to desc + body-overwrite here.
     setEditBody("");
-    setEditTools((s.allowed_tools || []).join(", "));
+    setEditToolsArr(s.allowed_tools || []);
+    setToolInput("");
   };
 
   const submitEdit = async (name: string) => {
     setBusy(true);
+    const tools = [...editToolsArr, ...parseTools(toolInput)].filter((v, i, a) => a.indexOf(v) === i);
     const r = await updateSkill(name, {
       description: editDesc.trim(),
       instructions: editBody || undefined,
-      allowed_tools: parseTools(editTools),
+      allowed_tools: tools,
     });
     setBusy(false);
     if (!r.ok) {
@@ -1149,17 +1169,35 @@ function SkillsPanel({
 
   const scopeBadge = (s: Skill) => {
     const scope = s.scope || "global";
-    const label = t(`skills.scope_${scope}`);
+    // Plugin skills get a "插件" badge; skills installed from the 魔搭 marketplace get "魔搭".
+    const isModelscope = scope !== "plugin" && (s.source || "").toLowerCase().includes("modelscope");
+    const label = scope === "plugin"
+      ? t("skills.scope_plugin")
+      : isModelscope
+        ? t("skills.scope_modelscope")
+        : t(`skills.scope_${scope}`);
     const cls =
       scope === "plugin"
         ? "bg-paper border border-line text-faint"
-        : scope === "project"
-          ? "bg-accentSoft text-accent"
-          : "bg-paper border border-line text-muted";
+        : isModelscope
+          ? "bg-accentSoft border border-accentSoft text-accent"
+          : scope === "project"
+            ? "bg-accentSoft text-accent"
+            : "bg-paper border border-line text-muted";
     return (
       <span className={"text-[10.5px] px-1.5 py-0.5 rounded-full shrink-0 " + cls}>{label}</span>
     );
   };
+
+  // Apply the scope filter to the skills list.
+  const filteredSkills = skills.filter((s) => {
+    if (scopeFilter === "all") return true;
+    if (scopeFilter === "plugin") return s.scope === "plugin";
+    if (scopeFilter === "modelscope") return s.scope !== "plugin" && (s.source || "").toLowerCase().includes("modelscope");
+    // custom = project + global, excluding plugin + modelscope-installed
+    if (s.scope === "plugin") return false;
+    return !(s.source || "").toLowerCase().includes("modelscope");
+  });
 
   return (
     <div>
@@ -1223,53 +1261,209 @@ function SkillsPanel({
       )}
 
       {creating && (
-        <div className="mb-3 rounded-lg border border-lineStrong bg-paper p-3 space-y-2">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <input
-              className={SEARCH_INPUT}
-              placeholder={t("skills.name_ph")}
-              value={newName}
-              spellCheck={false}
-              onChange={(e) => setNewName(e.target.value)}
-            />
-            <input
-              className={SEARCH_INPUT}
-              placeholder={t("skills.desc_ph")}
-              value={newDesc}
-              spellCheck={false}
-              onChange={(e) => setNewDesc(e.target.value)}
-            />
+        <div className="mb-3 rounded-lg border border-lineStrong bg-paper p-4 space-y-3">
+          {/* Step indicator */}
+          <div className="flex items-center gap-2 text-[11.5px]">
+            {[1, 2, 3].map((step) => (
+              <button
+                key={step}
+                className={
+                  "flex items-center gap-1 px-2 py-1 rounded-full border transition-colors " +
+                  (wizardStep === step
+                    ? "bg-accent text-white border-accent"
+                    : "bg-paper border-line text-muted hover:text-ink")
+                }
+                onClick={() => wizardStep > step && setWizardStep(step)}
+              >
+                <span className="font-medium">{step}</span>
+                <span>{t(`skills.wizard_step${step}`)}</span>
+              </button>
+            ))}
           </div>
-          <textarea
-            className={SEARCH_INPUT + " min-h-[200px] resize-y font-mono text-[12px]"}
-            placeholder={t("skills.body_ph")}
-            value={newBody}
-            spellCheck={false}
-            onChange={(e) => setNewBody(e.target.value)}
-          />
-          <input
-            className={SEARCH_INPUT}
-            placeholder={t("skills.tools_ph")}
-            value={newTools}
-            spellCheck={false}
-            onChange={(e) => setNewTools(e.target.value)}
-          />
-          <div className="flex justify-end gap-2">
-            <button
-              className="text-[12.5px] px-3 py-1.5 rounded-lg border border-line text-muted hover:text-ink"
-              onClick={() => setCreating(false)}
-              disabled={busy}
-            >
-              {t("common.cancel")}
-            </button>
-            <button
-              className="text-[12.5px] px-3 py-1.5 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
-              onClick={submitCreate}
-              disabled={busy || !newName.trim()}
-            >
-              {t("common.create")}
-            </button>
-          </div>
+
+          {/* Step 1: name + description */}
+          {wizardStep === 1 && (
+            <div className="space-y-2.5">
+              <div>
+                <label className="text-[11.5px] text-muted block mb-1">{t("skills.wizard_step1")}</label>
+                <input
+                  className={SEARCH_INPUT}
+                  placeholder={t("skills.name_ph")}
+                  value={newName}
+                  spellCheck={false}
+                  onChange={(e) => setNewName(e.target.value)}
+                />
+                {newName.trim() && (
+                  <div className={"text-[11px] mt-1 " + (nameError ? "text-danger" : "text-accent")}>
+                    {nameError || t("skills.wizard_name_preview", { name: nameKebab })}
+                  </div>
+                )}
+              </div>
+              <div>
+                <label className="text-[11.5px] text-muted block mb-1">{t("skills.desc_ph")}</label>
+                <textarea
+                  className={SEARCH_INPUT + " min-h-[60px] resize-y"}
+                  placeholder={t("skills.desc_ph")}
+                  value={newDesc}
+                  spellCheck={false}
+                  onChange={(e) => setNewDesc(e.target.value)}
+                />
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  className="text-[12.5px] px-3 py-1.5 rounded-lg border border-line text-muted hover:text-ink"
+                  onClick={() => setCreating(false)}
+                  disabled={busy}
+                >
+                  {t("common.cancel")}
+                </button>
+                <button
+                  className="text-[12.5px] px-3 py-1.5 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
+                  onClick={() => setWizardStep(2)}
+                  disabled={!nameValid}
+                >
+                  {t("skills.wizard_next")}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 2: body Markdown editor + preview */}
+          {wizardStep === 3 ? null : wizardStep === 2 && (
+            <div className="space-y-2.5">
+              <div>
+                <label className="text-[11.5px] text-muted block mb-1">{t("skills.wizard_step2")}</label>
+                <textarea
+                  className={SEARCH_INPUT + " min-h-[240px] resize-y font-mono text-[12px]"}
+                  placeholder={t("skills.body_ph")}
+                  value={newBody}
+                  spellCheck={false}
+                  onChange={(e) => setNewBody(e.target.value)}
+                />
+              </div>
+              {newBody.trim() && (
+                <div className="rounded-md border border-line bg-panel p-2 max-h-[200px] overflow-y-auto">
+                  <div className="text-[10.5px] text-faint mb-1">{t("skills.wizard_preview")}</div>
+                  <pre className="text-[11.5px] text-muted whitespace-pre-wrap font-mono">{newBody}</pre>
+                </div>
+              )}
+              <div className="flex justify-between gap-2">
+                <button
+                  className="text-[12.5px] px-3 py-1.5 rounded-lg border border-line text-muted hover:text-ink"
+                  onClick={() => setWizardStep(1)}
+                  disabled={busy}
+                >
+                  {t("skills.wizard_back")}
+                </button>
+                <button
+                  className="text-[12.5px] px-3 py-1.5 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
+                  onClick={() => setWizardStep(3)}
+                  disabled={!newBody.trim()}
+                >
+                  {t("skills.wizard_next")}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 3: allowed-tools chip input + SKILL.md preview */}
+          {wizardStep === 3 && (
+            <div className="space-y-2.5">
+              <div>
+                <label className="text-[11.5px] text-muted block mb-1">{t("skills.wizard_step3")}</label>
+                <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-line bg-paper px-2 py-1.5">
+                  {newToolsArr.map((tool) => (
+                    <span
+                      key={tool}
+                      className="inline-flex items-center gap-1 text-[11.5px] px-2 py-0.5 rounded-full bg-accentSoft text-accent"
+                    >
+                      {tool}
+                      <button
+                        className="text-accent hover:text-danger"
+                        onClick={() => setNewToolsArr((arr) => arr.filter((t) => t !== tool))}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  <input
+                    className="flex-1 min-w-[120px] bg-transparent text-[12px] text-ink outline-none px-1 py-0.5"
+                    placeholder={t("skills.wizard_tools_ph")}
+                    value={newTools}
+                    spellCheck={false}
+                    onChange={(e) => setNewTools(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === ",") {
+                        e.preventDefault();
+                        const v = newTools.trim();
+                        if (v && !newToolsArr.includes(v)) setNewToolsArr((arr) => [...arr, v]);
+                        setNewTools("");
+                      }
+                      if (e.key === "Backspace" && !newTools && newToolsArr.length) {
+                        setNewToolsArr((arr) => arr.slice(0, -1));
+                      }
+                    }}
+                  />
+                </div>
+                <div className="text-[10.5px] text-faint mt-1">{t("skills.wizard_tools_hint")}</div>
+              </div>
+
+              {/* Full SKILL.md preview */}
+              <div className="rounded-md border border-line bg-panel p-2 max-h-[200px] overflow-y-auto">
+                <div className="text-[10.5px] text-faint mb-1">{t("skills.wizard_preview")}</div>
+                <pre className="text-[11.5px] text-muted whitespace-pre-wrap font-mono">
+{[
+  "---",
+  `name: ${nameKebab || newName.trim()}`,
+  `description: ${newDesc.trim()}`,
+  newToolsArr.length ? `allowed-tools: ${newToolsArr.join(", ")}` : null,
+  "---",
+  newBody,
+].filter(Boolean).join("\n")}
+                </pre>
+              </div>
+
+              <div className="flex justify-between gap-2">
+                <button
+                  className="text-[12.5px] px-3 py-1.5 rounded-lg border border-line text-muted hover:text-ink"
+                  onClick={() => setWizardStep(2)}
+                  disabled={busy}
+                >
+                  {t("skills.wizard_back")}
+                </button>
+                <button
+                  className="text-[12.5px] px-3 py-1.5 rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50"
+                  onClick={submitCreate}
+                  disabled={busy}
+                >
+                  {t("common.create")}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Scope filter dropdown — lets users isolate plugin skills, modelscope-installed
+          skills, or their own custom ones. Plugin skills ship with installed plugins
+          (e.g. hyperframes contributes ~19) and would otherwise crowd the list. */}
+      {skills.length > 0 && !creating && (
+        <div className="flex items-center gap-2 mb-2">
+          <select
+            className="text-[12px] px-2 py-1 rounded-md border border-line bg-panel text-ink outline-none focus:border-accent"
+            value={scopeFilter}
+            onChange={(e) => setScopeFilter(e.target.value as "all" | "custom" | "plugin" | "modelscope")}
+          >
+            <option value="all">{t("skills.scope_filter_all")} ({skills.length})</option>
+            <option value="custom">{t("skills.scope_filter_custom")}</option>
+            <option value="plugin">{t("skills.scope_filter_plugin")}</option>
+            <option value="modelscope">{t("skills.scope_filter_modelscope")}</option>
+          </select>
+          {scopeFilter !== "all" && (
+            <span className="text-[11px] text-faint">
+              {t("skills.scope_filter_count", { shown: filteredSkills.length, total: skills.length })}
+            </span>
+          )}
         </div>
       )}
 
@@ -1277,7 +1471,7 @@ function SkillsPanel({
         <EmptyKind kind={t("customize.skills_title")} t={t} />
       ) : (
         <div className="divide-y divide-line">
-          {skills.map((s) => {
+          {filteredSkills.map((s) => {
             const isPlugin = s.scope === "plugin";
             const isEditing = editing === s.name;
             return (
@@ -1353,30 +1547,66 @@ function SkillsPanel({
                   </button>
                 </div>
 
-                {/* Inline edit form */}
+                {/* Inline edit form — labeled fields + chip-tag tool input */}
                 {isEditing && (
-                  <div className="mt-2 ml-7 space-y-2">
-                    <input
-                      className={SEARCH_INPUT}
-                      placeholder={t("skills.desc_ph")}
-                      value={editDesc}
-                      spellCheck={false}
-                      onChange={(e) => setEditDesc(e.target.value)}
-                    />
-                    <textarea
-                      className={SEARCH_INPUT + " min-h-[180px] resize-y font-mono text-[12px]"}
-                      placeholder={t("skills.body_edit_ph")}
-                      value={editBody}
-                      spellCheck={false}
-                      onChange={(e) => setEditBody(e.target.value)}
-                    />
-                    <input
-                      className={SEARCH_INPUT}
-                      placeholder={t("skills.tools_ph")}
-                      value={editTools}
-                      spellCheck={false}
-                      onChange={(e) => setEditTools(e.target.value)}
-                    />
+                  <div className="mt-2 ml-7 space-y-2.5">
+                    <div>
+                      <label className="text-[11px] text-muted block mb-1">{t("skills.edit_label_desc")}</label>
+                      <input
+                        className={SEARCH_INPUT}
+                        placeholder={t("skills.desc_ph")}
+                        value={editDesc}
+                        spellCheck={false}
+                        onChange={(e) => setEditDesc(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-muted block mb-1">{t("skills.edit_label_body")}</label>
+                      <textarea
+                        className={SEARCH_INPUT + " min-h-[180px] resize-y font-mono text-[12px]"}
+                        placeholder={t("skills.body_edit_ph")}
+                        value={editBody}
+                        spellCheck={false}
+                        onChange={(e) => setEditBody(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-muted block mb-1">{t("skills.edit_label_tools")}</label>
+                      <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-line bg-paper px-2 py-1.5">
+                        {editToolsArr.map((tool) => (
+                          <span
+                            key={tool}
+                            className="inline-flex items-center gap-1 text-[11.5px] px-2 py-0.5 rounded-full bg-accentSoft text-accent"
+                          >
+                            {tool}
+                            <button
+                              className="text-accent hover:text-danger"
+                              onClick={() => setEditToolsArr((arr) => arr.filter((t) => t !== tool))}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                        <input
+                          className="flex-1 min-w-[120px] bg-transparent text-[12px] text-ink outline-none px-1 py-0.5"
+                          placeholder={t("skills.wizard_tools_ph")}
+                          value={toolInput}
+                          spellCheck={false}
+                          onChange={(e) => setToolInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === ",") {
+                              e.preventDefault();
+                              const v = toolInput.trim();
+                              if (v && !editToolsArr.includes(v)) setEditToolsArr((arr) => [...arr, v]);
+                              setToolInput("");
+                            }
+                            if (e.key === "Backspace" && !toolInput && editToolsArr.length) {
+                              setEditToolsArr((arr) => arr.slice(0, -1));
+                            }
+                          }}
+                        />
+                      </div>
+                    </div>
                     <div className="flex justify-end gap-2">
                       <button
                         className="text-[12px] px-2.5 py-1 rounded-lg border border-line text-muted hover:text-ink"

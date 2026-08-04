@@ -28,6 +28,8 @@ class PluginSource:
     enabled: bool = True
     is_default: bool = False
     source_type: str = "git"  # only "git" marketplaces supported (marketplace.json layout)
+    ref: str = ""  # git ref (branch/tag/commit); "" = default branch
+    sparse_path: str = ""  # sparse-checkout subdirectory; "" = whole repo
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +39,8 @@ class PluginSource:
             "enabled": self.enabled,
             "is_default": self.is_default,
             "source_type": self.source_type,
+            "ref": self.ref,
+            "sparse_path": self.sparse_path,
         }
 
     @classmethod
@@ -48,31 +52,23 @@ class PluginSource:
             enabled=bool(d.get("enabled", True)),
             is_default=bool(d.get("is_default", False)),
             source_type=str(d.get("source_type") or "git"),
+            ref=str(d.get("ref") or ""),
+            sparse_path=str(d.get("sparse_path") or ""),
         )
 
 
 # Built-in plugin marketplaces. The Anthropic official plugins repo is a git marketplace
-# whose .claude-plugin/marketplace.json lists ~100+ plugins across categories (security,
+# whose .claude-plugin/marketplace.json lists ~276 plugins across 14 categories (security,
 # development, database, productivity, ...). Re-asserted on every startup so the source
 # list is never empty — same guard as DHP / skills.
 #
-# ModelScope (魔搭社区) skills repo ships a Claude-Code-compatible
-# .claude-plugin/marketplace.json listing ms-hub / ms-studio-deploy — the ModelScope
-# skill center (https://www.modelscope.cn/skills) mirrors this catalog. Added as a second
-# default so the 魔搭 skills appear out-of-the-box alongside the Anthropic catalog.
+# Note: ModelScope (魔搭社区) is a *skills* source, not a plugins source — it lives in
+# coworker/skills/sources.py, not here.
 BUILTIN_SOURCES: list[PluginSource] = [
     PluginSource(
         id="claude-official",
         name="Claude 官方插件市场",
         url="https://github.com/anthropics/claude-plugins-official.git",
-        enabled=True,
-        is_default=True,
-        source_type="git",
-    ),
-    PluginSource(
-        id="modelscope-skills",
-        name="魔搭社区技能中心",
-        url="https://github.com/modelscope/modelscope-skills.git",
         enabled=True,
         is_default=True,
         source_type="git",
@@ -120,9 +116,18 @@ class PluginSourceManager:
         deleted (via ``remove``) stays deleted across restarts because it's recorded in the
         ``deleted_builtin_plugin_sources`` pref — the user chose "deleted means deleted, no
         auto-restore".
+
+        Also prunes stale former-builtins: sources with ``is_default=True`` whose ``id`` is
+        no longer in ``BUILTIN_SOURCES``. These are builtins that were removed from the code
+        (e.g. ``modelscope-skills`` was once mis-filed as a plugin source — it's a skills
+        source now). User-added sources (``is_default=False``, ``id`` starting ``src-``) are
+        never pruned.
         """
         deleted = self._deleted_builtins()
+        builtin_ids = {b.id for b in BUILTIN_SOURCES}
         sources = [PluginSource.from_dict(d) for d in self._raw()]
+        # Prune stale former-builtins that are no longer in BUILTIN_SOURCES.
+        sources = [s for s in sources if not (s.is_default and s.id not in builtin_ids)]
         seen_ids = {s.id for s in sources}
         for builtin in BUILTIN_SOURCES:
             if builtin.id in deleted:
@@ -134,6 +139,8 @@ class PluginSourceManager:
                         s.url = builtin.url
                         s.is_default = True
                         s.source_type = builtin.source_type
+                        s.ref = builtin.ref
+                        s.sparse_path = builtin.sparse_path
                         break
                 continue
             sources.append(PluginSource(**builtin.__dict__))
@@ -157,7 +164,10 @@ class PluginSourceManager:
                 return s
         return None
 
-    def add(self, name: str, url: str, *, source_type: str = "git") -> PluginSource:
+    def add(
+        self, name: str, url: str, *, source_type: str = "git",
+        ref: str = "", sparse_path: str = "",
+    ) -> PluginSource:
         name = (name or "").strip()
         url = (url or "").strip()
         if not name or not url:
@@ -170,6 +180,8 @@ class PluginSourceManager:
             enabled=True,
             is_default=False,
             source_type=source_type,
+            ref=ref,
+            sparse_path=sparse_path,
         )
         sources.append(src)
         self._write(sources)
@@ -188,6 +200,10 @@ class PluginSourceManager:
                     s.enabled = bool(changes["enabled"])
                 if "source_type" in changes:
                     s.source_type = str(changes["source_type"]) or s.source_type
+                if "ref" in changes:
+                    s.ref = str(changes["ref"] or "")
+                if "sparse_path" in changes:
+                    s.sparse_path = str(changes["sparse_path"] or "")
                 updated = s
                 break
         if updated is None:
@@ -209,3 +225,18 @@ class PluginSourceManager:
         sources = [s for s in sources if s.id != source_id]
         self._write(sources)
         return True
+
+    def reset(self) -> list[PluginSource]:
+        """Restore all builtin sources (clears the deleted-builtin record).
+
+        The 'reset to defaults' escape hatch: after deleting the official source, the user
+        can bring it back without restarting. Returns the post-reset source list.
+        """
+        self._prefs.pop("deleted_builtin_plugin_sources", None)
+        sources = [PluginSource.from_dict(d) for d in self._raw()]
+        seen_ids = {s.id for s in sources}
+        for builtin in BUILTIN_SOURCES:
+            if builtin.id not in seen_ids:
+                sources.append(PluginSource(**builtin.__dict__))
+        self._write(sources)
+        return self.list()

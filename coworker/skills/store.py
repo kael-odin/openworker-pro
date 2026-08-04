@@ -96,6 +96,10 @@ class SkillStore:
         self._settings_path = state_dir() / "skills-settings.json"
         self._staging_dir = state_dir() / "skills-staged"
         self._lock = threading.Lock()
+        # Ensure the global skills dir exists on startup so users can navigate to it in
+        # their file manager and hand-drop SKILL.md folders before installing any via the
+        # marketplace. Without this, the dir only appears after the first skill install.
+        self.global_dir.mkdir(parents=True, exist_ok=True)
 
     # -- scope dirs ---------------------------------------------------------------
     def project_dir(self, workspace: str | Path) -> Path:

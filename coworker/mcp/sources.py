@@ -1,23 +1,15 @@
-"""Skill source management — mirrors DHP's ``digital_human/sources.py``.
+"""MCP source management — mirrors ``coworker/skills/sources.py``.
 
-A *skill source* is an HTTP index or a local directory that serves a catalog of installable
-Anthropic SKILL.md skills. The index format is a small ``index.json``::
+An *MCP source* is a marketplace that serves a catalog of installable MCP servers.
+The ModelScope MCP plaza (https://www.modelscope.cn/mcp, ~9.8k servers) is the built-in
+default; it's queried via the public ``PUT /api/v1/dolphin/agg`` API (same-origin on
+www.modelscope.cn, no auth). Each catalog entry carries a ``ServerConfig`` in the standard
+Claude Code ``{mcpServers: {name: {command, args}}}`` format — install just registers it
+via :func:`coworker.mcp.config.put_global_server`.
 
-    {
-      "skills": [
-        {"name": "pdf", "description": "extract text from PDFs", "path": "pdf"},
-        ...
-      ]
-    }
-
-For an HTTP source, ``path`` is joined to the source URL and ``SKILL.md`` (+ any sibling
-resource files listed in the index entry's ``files``) is fetched. For a local source, the
-URL is a directory whose subfolders each contain a ``SKILL.md`` (the existing
-:class:`~coworker.skills.base.SkillLoader` discovery layout) — install copies the folder.
-
-Sources live in the manager prefs (``skill_sources`` key) so they survive restarts without a
-separate store file. Builtin sources are re-asserted on every startup and cannot be deleted
-— only disabled — mirroring the DHP empty-store guard.
+Sources live in the manager prefs (``mcp_sources`` key) so they survive restarts without a
+separate store file. Builtin sources are re-asserted on every startup; a deleted builtin is
+recorded in ``deleted_builtin_mcp_sources`` so it stays deleted ("deleted means deleted").
 """
 
 from __future__ import annotations
@@ -28,15 +20,15 @@ from typing import Any, Callable, Optional
 
 
 @dataclass
-class SkillSource:
-    """One addressable skill catalog source."""
+class McpSource:
+    """One addressable MCP server marketplace source."""
 
     id: str
     name: str
-    url: str  # HTTP index URL, or a local dir path for source_type="local"
+    url: str  # ModelScope agg API URL, or a custom HTTP catalog endpoint
     enabled: bool = True
     is_default: bool = False
-    source_type: str = "http"  # "http" (index.json) | "local" (dir of SKILL.md folders)
+    source_type: str = "modelscope"  # "modelscope" (agg API) | "http" (custom index)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,67 +41,38 @@ class SkillSource:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SkillSource":
+    def from_dict(cls, d: dict[str, Any]) -> "McpSource":
         return cls(
             id=str(d.get("id") or ""),
             name=str(d.get("name") or ""),
             url=str(d.get("url") or ""),
             enabled=bool(d.get("enabled", True)),
             is_default=bool(d.get("is_default", False)),
-            source_type=str(d.get("source_type") or "http"),
+            source_type=str(d.get("source_type") or "modelscope"),
         )
 
 
-# Built-in skill sources. The Anthropic official skills repo is a GitHub repo of SKILL.md
-# folders; we expose it as a local-clone-via-git source (the fetcher clones it on demand).
-# Re-asserted on every startup so the source list is never empty — same guard as DHP's
-# empty-store fix.
-#
-# ModelScope (魔搭社区) skill center (https://www.modelscope.cn/skills) hosts ~76k skills.
-# The real catalog is served by the public API `PUT /api/v1/dolphin/skills` (same-origin on
-# www.modelscope.cn). The GitHub repo `modelscope/modelscope-skills` is just a 2-skill SDK,
-# NOT the catalog — so we point at the API directly via the ``modelscope`` source type.
-# See coworker/skills/installer.py:_list_modelscope_skills for the fetch logic.
-BUILTIN_SOURCES: list[SkillSource] = [
-    SkillSource(
-        id="anthropic-official",
-        name="Anthropic 官方技能",
-        url="https://github.com/anthropics/skills",
+# Built-in MCP marketplace. The ModelScope 魔搭 MCP plaza (https://www.modelscope.cn/mcp)
+# hosts ~9.8k MCP servers. Its catalog is served by the public PUT /api/v1/dolphin/agg API
+# (same-origin on www.modelscope.cn, no auth). The agg endpoint returns all business types
+# in one response (models, datasets, skills, MCP, ...); we extract the ``Mcp`` section.
+# See coworker/mcp/catalog.py for the fetch + parse logic.
+BUILTIN_SOURCES: list[McpSource] = [
+    McpSource(
+        id="modelscope-mcp",
+        name="魔搭社区 MCP 广场",
+        url="https://www.modelscope.cn/api/v1/dolphin/agg",
         enabled=True,
         is_default=True,
-        source_type="git",  # cloned via git on demand
-    ),
-    SkillSource(
-        id="mattpocock-skills",
-        name="Matt Pocock 技能集",
-        url="https://github.com/mattpocock/skills",
-        enabled=True,
-        is_default=True,
-        source_type="git",  # nested layout like anthropic-official: skills/engineering/* + skills/productivity/*
-    ),
-    SkillSource(
-        id="modelscope-skills",
-        name="魔搭社区技能中心",
-        url="https://www.modelscope.cn/api/v1/dolphin/skills",
-        enabled=True,
-        is_default=True,
-        source_type="modelscope",  # PUT API on www.modelscope.cn — 76k skills
-    ),
-    SkillSource(
-        id="skillhub",
-        name="腾讯 SkillHub",
-        url="https://api.skillhub.cn",
-        enabled=True,
-        is_default=True,
-        source_type="skillhub",  # GET search + ZIP download on api.skillhub.cn
+        source_type="modelscope",
     ),
 ]
 
 
-class SkillSourceManager:
-    """Persists + serves the set of configured skill sources.
+class McpSourceManager:
+    """Persists + serves the set of configured MCP marketplace sources.
 
-    Sources are stored under the ``skill_sources`` key of the manager prefs dict. The caller
+    Sources are stored under the ``mcp_sources`` key of the manager prefs dict. The caller
     owns that dict and its save path (manager._load_prefs / _save_prefs); this class mutates
     the dict in place and calls ``save()`` so persistence is the caller's responsibility.
     """
@@ -119,23 +82,23 @@ class SkillSourceManager:
         self._save = save
 
     def _raw(self) -> list[dict[str, Any]]:
-        raw = self._prefs.get("skill_sources")
+        raw = self._prefs.get("mcp_sources")
         if not isinstance(raw, list):
             return []
         return raw
 
-    def _write(self, sources: list[SkillSource]) -> None:
-        self._prefs["skill_sources"] = [s.to_dict() for s in sources]
+    def _write(self, sources: list[McpSource]) -> None:
+        self._prefs["mcp_sources"] = [s.to_dict() for s in sources]
         self._save()
 
     def _deleted_builtins(self) -> set[str]:
-        raw = self._prefs.get("deleted_builtin_skill_sources")
+        raw = self._prefs.get("deleted_builtin_mcp_sources")
         if not isinstance(raw, list):
             return set()
         return {str(x) for x in raw}
 
     def _write_deleted_builtins(self, ids: set[str]) -> None:
-        self._prefs["deleted_builtin_skill_sources"] = sorted(ids)
+        self._prefs["deleted_builtin_mcp_sources"] = sorted(ids)
         self._save()
 
     def ensure_builtins(self) -> None:
@@ -143,11 +106,11 @@ class SkillSourceManager:
 
         Idempotent; preserves user edits to a builtin's enabled flag. A builtin that was
         deleted (via ``remove``) stays deleted across restarts because it's recorded in the
-        ``deleted_builtin_skill_sources`` pref — the user chose "deleted means deleted, no
+        ``deleted_builtin_mcp_sources`` pref — the user chose "deleted means deleted, no
         auto-restore".
         """
         deleted = self._deleted_builtins()
-        sources = [SkillSource.from_dict(d) for d in self._raw()]
+        sources = [McpSource.from_dict(d) for d in self._raw()]
         seen_ids = {s.id for s in sources}
         for builtin in BUILTIN_SOURCES:
             if builtin.id in deleted:
@@ -161,11 +124,11 @@ class SkillSourceManager:
                         s.source_type = builtin.source_type
                         break
                 continue
-            sources.append(SkillSource(**builtin.__dict__))
+            sources.append(McpSource(**builtin.__dict__))
         self._write(sources)
 
-    def list(self, *, enabled_only: bool = False) -> list[SkillSource]:
-        sources = [SkillSource.from_dict(d) for d in self._raw()]
+    def list(self, *, enabled_only: bool = False) -> list[McpSource]:
+        sources = [McpSource.from_dict(d) for d in self._raw()]
         # The BUILTIN_SOURCES fallback only applies on a truly fresh state (no prefs key at
         # all). Once ensure_builtins() has run, an empty list means the user deleted every
         # source — don't resurrect builtins that were explicitly removed.
@@ -176,19 +139,19 @@ class SkillSourceManager:
         sources.sort(key=lambda s: (not s.is_default, s.name.lower()))
         return sources
 
-    def get(self, source_id: str) -> Optional[SkillSource]:
+    def get(self, source_id: str) -> Optional[McpSource]:
         for s in self.list():
             if s.id == source_id:
                 return s
         return None
 
-    def add(self, name: str, url: str, *, source_type: str = "http") -> SkillSource:
+    def add(self, name: str, url: str, *, source_type: str = "modelscope") -> McpSource:
         name = (name or "").strip()
         url = (url or "").strip()
         if not name or not url:
             raise ValueError("name and url are required")
-        sources = [SkillSource.from_dict(d) for d in self._raw()]
-        src = SkillSource(
+        sources = [McpSource.from_dict(d) for d in self._raw()]
+        src = McpSource(
             id="src-" + uuid.uuid4().hex[:10],
             name=name,
             url=url,
@@ -200,8 +163,8 @@ class SkillSourceManager:
         self._write(sources)
         return src
 
-    def update(self, source_id: str, changes: dict[str, Any]) -> Optional[SkillSource]:
-        sources = [SkillSource.from_dict(d) for d in self._raw()]
+    def update(self, source_id: str, changes: dict[str, Any]) -> Optional[McpSource]:
+        sources = [McpSource.from_dict(d) for d in self._raw()]
         updated = None
         for s in sources:
             if s.id == source_id:
@@ -221,7 +184,7 @@ class SkillSourceManager:
         return updated
 
     def remove(self, source_id: str) -> bool:
-        sources = [SkillSource.from_dict(d) for d in self._raw()]
+        sources = [McpSource.from_dict(d) for d in self._raw()]
         target = next((s for s in sources if s.id == source_id), None)
         if target is None:
             return False
@@ -235,17 +198,17 @@ class SkillSourceManager:
         self._write(sources)
         return True
 
-    def reset(self) -> list[SkillSource]:
+    def reset(self) -> list[McpSource]:
         """Restore all builtin sources (clears the deleted-builtin record).
 
         The 'reset to defaults' escape hatch: after deleting the official source, the user
         can bring it back without restarting. Returns the post-reset source list.
         """
-        self._prefs.pop("deleted_builtin_skill_sources", None)
-        sources = [SkillSource.from_dict(d) for d in self._raw()]
+        self._prefs.pop("deleted_builtin_mcp_sources", None)
+        sources = [McpSource.from_dict(d) for d in self._raw()]
         seen_ids = {s.id for s in sources}
         for builtin in BUILTIN_SOURCES:
             if builtin.id not in seen_ids:
-                sources.append(SkillSource(**builtin.__dict__))
+                sources.append(McpSource(**builtin.__dict__))
         self._write(sources)
         return self.list()

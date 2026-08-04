@@ -1,6 +1,7 @@
 """MCP integration — our own async client on the official `mcp` SDK.
 
 Public API: config loading/mutation, the connection manager, and tool wrapping.
+Marketplace sources + catalog (ModelScope MCP plaza) live in ``sources`` and ``catalog``.
 """
 
 from __future__ import annotations

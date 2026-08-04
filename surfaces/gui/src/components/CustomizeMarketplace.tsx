@@ -9,25 +9,36 @@
 import { useEffect, useState } from "react";
 import {
   addPluginSource,
+  addMcpSource,
   addPersonaSource,
   addSkillSource,
   getDhpSources,
+  getMcpCatalog,
+  getMcpSources,
   getPersonaCatalog,
   getPersonaSources,
   getPluginCatalog,
   getPluginSources,
   getSkillCatalog,
   getSkillSources,
+  installMcpFromCatalog,
   installPlugin,
   installPersonaFromSource,
   installSkill,
+  removeMcpSource,
   removePluginSource,
   removePersonaSource,
   removeSkillSource,
+  resetMcpSources,
+  resetPluginSources,
+  resetSkillSources,
+  updateMcpSource,
   updatePluginSource,
   updatePersonaSource,
   updateSkillSource,
   type DhpSource,
+  type McpCatalogItem,
+  type McpSource,
   type PersonaCatalogItem,
   type PersonaSource,
   type PluginCatalogItem,
@@ -57,11 +68,47 @@ const CATS: { key: Cat; labelKey: string; icon: string }[] = [
   { key: "hooks", labelKey: "customize.hooks_title", icon: "sliders" },
 ];
 
+// ModelScope MCP plaza has 13 categories. The agg API has no category-list endpoint and its
+// Criterion filter is ignored, so we hardcode the full set here (mirroring the site sidebar)
+// rather than deriving from page data (which only surfaces the 7 hottest slugs). The backend
+// (catalog.py) returns the same 13 slugs as the `categories` array; we render chips from this
+// richer local list to get the Chinese label.
+//
+// NOTE: no per-category counts. The ModelScope agg API ignores Criterion/PageSize/PageNumber
+// (it always returns the same 10 hot servers), so a category count from the site sidebar
+// (e.g. "浏览器自动化 589") is unverifiable from this API and would mislead users into
+// expecting 589 results when the query-based category filter returns far fewer. Selecting a
+// category folds the slug into the agg `Query` (the only field the API honors), returning the
+// servers that match that category — an honest, installable result set.
+const MCP_CATEGORIES: { slug: string; zh: string }[] = [
+  { slug: "browser-automation", zh: "浏览器自动化" },
+  { slug: "search", zh: "搜索工具" },
+  { slug: "communication-and-collaboration", zh: "交流协作工具" },
+  { slug: "developer-tools", zh: "开发者工具" },
+  { slug: "entertainment-and-media", zh: "娱乐与多媒体" },
+  { slug: "file-system", zh: "文件系统" },
+  { slug: "finance", zh: "金融" },
+  { slug: "knowledge-management-and-memory", zh: "知识管理与记忆" },
+  { slug: "location-services", zh: "位置服务" },
+  { slug: "culture-and-art", zh: "文化与艺术" },
+  { slug: "academic-research", zh: "学术研究" },
+  { slug: "schedule-management", zh: "日程管理" },
+  { slug: "other", zh: "其他" },
+];
+
+const MCP_CATEGORY_ZH: Record<string, string> = Object.fromEntries(
+  MCP_CATEGORIES.map((c) => [c.slug, c.zh]),
+);
+
+function mcpCategoryLabel(slug: string): string {
+  return MCP_CATEGORY_ZH[slug] || slug;
+}
+
 export function CustomizeMarketplace({ onClose }: { onClose: () => void }) {
   const { t } = useT();
   // Sources shown in the strip: skill sources on the skills tab (live, E1), DHP sources
   // elsewhere (read-only marketplace preview). Typed loosely since both share the same shape.
-  const [sources, setSources] = useState<(DhpSource | SkillSource)[]>([]);
+  const [sources, setSources] = useState<(DhpSource | SkillSource | McpSource)[]>([]);
   const [cat, setCat] = useState<Cat>("plugins");
 
   useEffect(() => {
@@ -71,6 +118,10 @@ export function CustomizeMarketplace({ onClose }: { onClose: () => void }) {
         .catch(() => setSources([]));
     } else if (cat === "plugins") {
       getPluginSources()
+        .then((r) => setSources(r ?? []))
+        .catch(() => setSources([]));
+    } else if (cat === "mcp") {
+      getMcpSources()
         .then((r) => setSources(r ?? []))
         .catch(() => setSources([]));
     } else if (cat === "subagents") {
@@ -181,6 +232,8 @@ export function CustomizeMarketplace({ onClose }: { onClose: () => void }) {
         <div className="flex-1 overflow-y-auto px-5 py-4 hairline-scroll">
           {cat === "plugins" ? (
             <PluginBrowseSection onInstalled={onClose} />
+          ) : cat === "mcp" ? (
+            <McpBrowseSection onInstalled={onClose} />
           ) : cat === "skills" ? (
             <SkillBrowseSection onInstalled={onClose} />
           ) : cat === "subagents" ? (
@@ -207,6 +260,10 @@ export function CustomizeMarketplace({ onClose }: { onClose: () => void }) {
 // item shows whether it's already installed; install writes to state_dir()/skills/<name>/.
 // Sources are fully manageable here (add/toggle/delete, mirroring PluginBrowseSection) — the
 // backend + api.ts had full CRUD from the start, this wires it up.
+//
+// ModelScope sources (source_type="modelscope") return a paginated catalog (~76k items).
+// For those we render a search box + page controls + icon/category/downloads per card.
+// git/local/http sources return a flat list (no pagination) and degrade to the simple layout.
 function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const { t } = useT();
   const [sources, setSources] = useState<SkillSource[]>([]);
@@ -216,6 +273,14 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const [err, setErr] = useState("");
   const [installing, setInstalling] = useState<string>("");
   const [justInstalled, setJustInstalled] = useState<string>("");
+  // ModelScope pagination + search state (ignored for git/local/http sources).
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(50);
+  const [totalCount, setTotalCount] = useState(0);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const [categories, setCategories] = useState<string[]>([]);
+  const [selCat, setSelCat] = useState<string>("__all");
 
   // Inline source-add form state.
   const [showAdd, setShowAdd] = useState(false);
@@ -223,6 +288,16 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const [addUrl, setAddUrl] = useState("");
   const [addType, setAddType] = useState("http");
   const [addBusy, setAddBusy] = useState(false);
+
+  const selSource = sources.find((s) => s.id === selId);
+  // modelscope + skillhub support server-side search (the query is forwarded to their
+  // APIs and returns a fresh page). git/local/http sources return a small flat list with
+  // no server-side search, so we filter that list client-side in `visible`.
+  const isServerSearch = selSource?.source_type === "modelscope" || selSource?.source_type === "skillhub";
+  // The text the user has typed into the search box. For server-search sources this is
+  // committed to `searchQuery` (which triggers a refetch) on Enter/click. For client-search
+  // sources `searchQuery` stays "" (no refetch) and `clientQuery` filters `items` directly.
+  const [clientQuery, setClientQuery] = useState("");
 
   const loadSources = () => {
     getSkillSources()
@@ -243,21 +318,46 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Load the catalog when the selected source changes.
+  // Load the catalog when the selected source, page, search, or category changes.
   useEffect(() => {
     if (!selId) {
       setItems([]);
+      setCategories([]);
+      setTotalCount(0);
       return;
     }
     setLoading(true);
     setErr("");
-    getSkillCatalog(selId)
+    const opts = isServerSearch
+      ? { page, page_size: pageSize, query: searchQuery }
+      : undefined;
+    getSkillCatalog(selId, opts)
       .then((r) => {
-        if (r.ok) setItems(r.skills ?? []);
-        else setErr(r.error || "failed to load");
+        if (r.ok) {
+          setItems(r.skills ?? []);
+          setTotalCount(r.total_count ?? 0);
+          setCategories(r.categories ?? []);
+        } else {
+          // Catalog fetch failed (git clone error, API down, etc.) — surface the error
+          // instead of showing a silently-empty list (the original empty-catalog bug).
+          setErr(r.error || "failed to load");
+          setItems([]);
+          setTotalCount(0);
+          setCategories([]);
+        }
       })
       .catch(() => setErr("failed to load"))
       .finally(() => setLoading(false));
+  }, [selId, page, searchQuery, selCat]);
+
+  // Reset to page 1 when the source or search query changes. Also clear the client-side
+  // search input when switching sources so a stale filter doesn't carry over.
+  useEffect(() => {
+    setPage(1);
+  }, [selId, searchQuery]);
+  useEffect(() => {
+    setSearchInput("");
+    setClientQuery("");
   }, [selId]);
 
   const install = async (name: string, sourceId: string) => {
@@ -268,7 +368,8 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
     if (r.ok) {
       setJustInstalled(name);
       // Refresh the catalog so the installed flag flips on this item.
-      const cat = await getSkillCatalog(sourceId);
+      const opts = isServerSearch ? { page, page_size: pageSize, query: searchQuery } : undefined;
+      const cat = await getSkillCatalog(sourceId, opts);
       if (cat.ok) setItems(cat.skills ?? []);
       // Close the marketplace shortly after a successful install so the user sees the
       // newly-installed skill in the Customize list. A short delay lets the "installed"
@@ -305,19 +406,64 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
     loadSources();
   };
 
+  const resetSources = async () => {
+    await resetSkillSources();
+    loadSources();
+  };
+
+  const doSearch = () => {
+    const q = searchInput.trim();
+    if (isServerSearch) {
+      // Server-side search: commit the query, which triggers the catalog refetch effect.
+      setSearchQuery(q);
+    } else {
+      // Client-side search: filter the already-loaded items (git/local/http catalogs are
+      // small flat lists with no server-side query support).
+      setClientQuery(q);
+    }
+  };
+
   if (sources.length === 0 && !showAdd) {
     return (
       <div className="py-6 text-center">
         <div className="text-[12.5px] text-faint mb-3">{t("customize.marketplace_empty")}</div>
-        <button
-          className="text-[12px] px-2.5 py-1 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent"
-          onClick={() => setShowAdd(true)}
-        >
-          + {t("customize.marketplace_add_source")}
-        </button>
+        <div className="flex items-center justify-center gap-3">
+          <button
+            className="text-[12px] px-2.5 py-1 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent"
+            onClick={() => setShowAdd(true)}
+          >
+            + {t("customize.marketplace_add_source")}
+          </button>
+          <button
+            className="flex items-center gap-1 text-[12px] text-muted hover:text-accent"
+            onClick={resetSources}
+            title={t("customize.reset_sources_help")}
+          >
+            <Icon name="refresh" size={12} />
+            {t("customize.reset_sources")}
+          </button>
+        </div>
       </div>
     );
   }
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  // Filter by category chip (client-side; the API doesn't support category filtering for
+  // skills, so we filter the current page's items). For client-search sources we also
+  // apply the `clientQuery` text filter here (name/description substring, case-insensitive).
+  const q = clientQuery.toLowerCase();
+  const visible = items.filter((it) => {
+    if (selCat !== "__all" && it.category !== selCat) return false;
+    if (q && !isServerSearch) {
+      const hay = (it.name + " " + (it.description || "")).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  // Count label: server-search sources show the server-reported total; client-search
+  // sources show the full catalog length (not the filtered count, so the user sees how
+  // many skills the source has in total).
+  const countTotal = isServerSearch ? totalCount : items.length;
 
   return (
     <div>
@@ -350,6 +496,14 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
             onClick={() => setShowAdd((v) => !v)}
           >
             + {t("customize.marketplace_add_source")}
+          </button>
+          <button
+            className="flex items-center gap-1 text-[11.5px] px-2 py-1 rounded-full border border-line text-muted hover:text-accent hover:border-accent"
+            onClick={resetSources}
+            title={t("customize.reset_sources_help")}
+          >
+            <Icon name="refresh" size={12} />
+            {t("customize.reset_sources")}
           </button>
         </div>
 
@@ -405,6 +559,7 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
               <option value="http">http</option>
               <option value="git">git</option>
               <option value="local">local</option>
+              <option value="modelscope">modelscope</option>
             </select>
             <button
               className="text-[12px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-50"
@@ -417,6 +572,61 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
         )}
       </div>
 
+      {/* Search + total count — shown for all sources. modelscope/skillhub do server-side
+          search (the query refetches the catalog); git/local/http filter client-side. */}
+      <div className="flex items-center gap-2 mb-3">
+        <input
+          className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent flex-1 min-w-0"
+          placeholder={t("customize.skill_search_placeholder")}
+          value={searchInput}
+          spellCheck={false}
+          onChange={(e) => setSearchInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && doSearch()}
+        />
+        <button
+          className="text-[12px] px-2.5 py-1 rounded-md border border-lineStrong bg-panel hover:border-accent hover:text-accent shrink-0"
+          onClick={doSearch}
+        >
+          {t("customize.marketplace_search")}
+        </button>
+        {countTotal > 0 && (
+          <span className="text-[11px] text-faint shrink-0">
+            {t("customize.skill_total_count", { count: countTotal })}
+          </span>
+        )}
+      </div>
+
+      {/* Category filter chips */}
+      {categories.length > 0 && (
+        <div className="flex flex-wrap gap-1 mb-3">
+          <button
+            className={
+              "text-[11.5px] px-2 py-0.5 rounded-full border transition-colors " +
+              (selCat === "__all"
+                ? "bg-accent text-white border-accent"
+                : "bg-paper border-line text-muted hover:text-ink")
+            }
+            onClick={() => setSelCat("__all")}
+          >
+            {t("customize.marketplace_category_all")}
+          </button>
+          {categories.map((c) => (
+            <button
+              key={c}
+              className={
+                "text-[11.5px] px-2 py-0.5 rounded-full border transition-colors " +
+                (selCat === c
+                  ? "bg-accent text-white border-accent"
+                  : "bg-paper border-line text-muted hover:text-ink")
+              }
+              onClick={() => setSelCat(c)}
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+      )}
+
       {err && (
         <div className="text-[12px] text-danger py-2">{err}</div>
       )}
@@ -425,20 +635,42 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
         <div className="text-[12.5px] text-faint py-6 text-center">
           {t("customize.marketplace_loading")}
         </div>
-      ) : items.length === 0 ? (
+      ) : visible.length === 0 ? (
         <div className="text-[12.5px] text-faint py-6 text-center">
           {t("customize.marketplace_empty")}
         </div>
       ) : (
         <div className="divide-y divide-line">
-          {items.map((it) => {
+          {visible.map((it) => {
             const isInstalling = installing === it.name;
             const justDone = justInstalled === it.name;
             return (
               <div key={it.name} className="flex items-center gap-3 py-2.5">
-                <Icon name="file" size={14} className="text-faint shrink-0" />
+                {it.icon ? (
+                  <img
+                    src={it.icon}
+                    alt=""
+                    className="w-7 h-7 rounded-md object-cover shrink-0 bg-paper border border-line"
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                  />
+                ) : (
+                  <Icon name="file" size={14} className="text-faint shrink-0" />
+                )}
                 <div className="flex-1 min-w-0">
-                  <div className="text-[13px] font-medium text-ink">{it.name}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[13px] font-medium text-ink truncate">{it.name}</span>
+                    {it.category && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-paper border border-line text-faint shrink-0">
+                        {it.category}
+                      </span>
+                    )}
+                    {it.author && (
+                      <span className="text-[10.5px] text-faint truncate">· {it.author}</span>
+                    )}
+                    {it.downloads != null && it.downloads > 0 && (
+                      <span className="text-[10px] text-faint shrink-0">↓ {it.downloads}</span>
+                    )}
+                  </div>
                   {it.description && (
                     <div className="text-[11.5px] text-faint truncate">{it.description}</div>
                   )}
@@ -459,6 +691,29 @@ function SkillBrowseSection({ onInstalled }: { onInstalled: () => void }) {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Pagination (server-search sources only — git/local/http return one full page). */}
+      {isServerSearch && totalCount > pageSize && (
+        <div className="flex items-center justify-center gap-3 mt-3 pt-3 border-t border-line">
+          <button
+            className="text-[12px] px-2.5 py-1 rounded-md border border-lineStrong bg-panel hover:border-accent hover:text-accent disabled:opacity-40"
+            disabled={page <= 1}
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+          >
+            ←
+          </button>
+          <span className="text-[11.5px] text-faint">
+            {page} / {totalPages}
+          </span>
+          <button
+            className="text-[12px] px-2.5 py-1 rounded-md border border-lineStrong bg-panel hover:border-accent hover:text-accent disabled:opacity-40"
+            disabled={page >= totalPages}
+            onClick={() => setPage((p) => p + 1)}
+          >
+            →
+          </button>
         </div>
       )}
     </div>
@@ -482,11 +737,16 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const [installing, setInstalling] = useState<string>("");
   const [justInstalled, setJustInstalled] = useState<string>("");
 
-  // Inline source-add form state.
+  // Inline source-add form state (Codex-style 3-field: url + ref + sparse_path, plus name).
   const [showAdd, setShowAdd] = useState(false);
   const [addName, setAddName] = useState("");
   const [addUrl, setAddUrl] = useState("");
+  const [addRef, setAddRef] = useState("");
+  const [addSparse, setAddSparse] = useState("");
   const [addBusy, setAddBusy] = useState(false);
+  // Client-side search (plugin catalogs are small — 276 items from claude-official — so we
+  // filter in-browser rather than round-tripping a server query like the MCP/Skill tabs do).
+  const [pluginQuery, setPluginQuery] = useState("");
 
   const loadSources = () => {
     getPluginSources()
@@ -553,11 +813,15 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
   const addSource = async () => {
     if (!addName.trim() || !addUrl.trim()) return;
     setAddBusy(true);
-    const r = await addPluginSource(addName.trim(), addUrl.trim());
+    const r = await addPluginSource(
+      addName.trim(), addUrl.trim(), "git", addRef.trim(), addSparse.trim(),
+    );
     setAddBusy(false);
     if (r.ok) {
       setAddName("");
       setAddUrl("");
+      setAddRef("");
+      setAddSparse("");
       setShowAdd(false);
       loadSources();
     } else {
@@ -576,8 +840,23 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
     loadSources();
   };
 
-  // Filter by selected category chip.
-  const visible = selCat === "__all" ? items : items.filter((it) => it.category === selCat);
+  const resetSources = async () => {
+    await resetPluginSources();
+    loadSources();
+  };
+
+  // Filter by selected category chip + client-side search query.
+  const q = pluginQuery.trim().toLowerCase();
+  const visible = items.filter((it) => {
+    if (selCat !== "__all" && it.category !== selCat) return false;
+    if (!q) return true;
+    return (
+      it.name.toLowerCase().includes(q) ||
+      (it.description || "").toLowerCase().includes(q) ||
+      (it.author || "").toLowerCase().includes(q) ||
+      (it.category || "").toLowerCase().includes(q)
+    );
+  });
 
   return (
     <div>
@@ -611,6 +890,14 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
           >
             + {t("customize.marketplace_add_source")}
           </button>
+          <button
+            className="flex items-center gap-1 text-[11.5px] px-2 py-1 rounded-full border border-line text-muted hover:text-accent hover:border-accent"
+            onClick={resetSources}
+            title={t("customize.reset_sources_help")}
+          >
+            <Icon name="refresh" size={12} />
+            {t("customize.reset_sources")}
+          </button>
         </div>
 
         {/* Source management (toggle + delete) for non-builtin sources, and a toggle for builtins. */}
@@ -639,31 +926,67 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
           </div>
         )}
 
-        {/* Add-source form */}
+        {/* Add-source form (Codex-style 3 fields: url + ref + sparse_path, plus name) */}
         {showAdd && (
-          <div className="mt-2 flex flex-wrap items-center gap-1.5 p-2 rounded-lg border border-line bg-paper">
-            <input
-              className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-1"
-              placeholder={t("customize.marketplace_source_name_ph")}
-              value={addName}
-              spellCheck={false}
-              onChange={(e) => setAddName(e.target.value)}
-            />
-            <input
-              className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-[2]"
-              placeholder={t("customize.marketplace_source_url_ph")}
-              value={addUrl}
-              spellCheck={false}
-              onChange={(e) => setAddUrl(e.target.value)}
-            />
-            <button
-              className="text-[12px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-50"
-              disabled={addBusy || !addName.trim() || !addUrl.trim()}
-              onClick={addSource}
-            >
-              {t("customize.marketplace_add_source")}
-            </button>
+          <div className="mt-2 p-2.5 rounded-lg border border-line bg-paper space-y-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <input
+                className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-1"
+                placeholder={t("customize.marketplace_source_name_ph")}
+                value={addName}
+                spellCheck={false}
+                onChange={(e) => setAddName(e.target.value)}
+              />
+              <input
+                className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-[2]"
+                placeholder={t("customize.plugin_source_url_ph")}
+                value={addUrl}
+                spellCheck={false}
+                onChange={(e) => setAddUrl(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <input
+                className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-1"
+                placeholder={t("customize.plugin_source_ref_ph")}
+                value={addRef}
+                spellCheck={false}
+                onChange={(e) => setAddRef(e.target.value)}
+              />
+              <input
+                className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-1"
+                placeholder={t("customize.plugin_source_sparse_ph")}
+                value={addSparse}
+                spellCheck={false}
+                onChange={(e) => setAddSparse(e.target.value)}
+              />
+              <button
+                className="text-[12px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-50 shrink-0"
+                disabled={addBusy || !addName.trim() || !addUrl.trim()}
+                onClick={addSource}
+              >
+                {t("customize.marketplace_add_source")}
+              </button>
+            </div>
           </div>
+        )}
+      </div>
+
+      {/* Search + total count (client-side filter — plugin catalogs are small) */}
+      <div className="flex items-center gap-2 mb-3">
+        <input
+          className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent flex-1 min-w-0"
+          placeholder={t("customize.plugin_search_placeholder")}
+          value={pluginQuery}
+          spellCheck={false}
+          onChange={(e) => setPluginQuery(e.target.value)}
+        />
+        {items.length > 0 && (
+          <span className="text-[11px] text-faint shrink-0">
+            {q
+              ? t("customize.plugin_filtered_count", { shown: visible.length, total: items.length })
+              : t("customize.plugin_total_count", { count: items.length })}
+          </span>
         )}
       </div>
 
@@ -748,6 +1071,400 @@ function PluginBrowseSection({ onInstalled }: { onInstalled: () => void }) {
               </div>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// MCP tab: pick an MCP marketplace source → browse its catalog (paginated, searchable) →
+// install. The built-in ModelScope MCP plaza (魔搭社区 MCP 广场) has ~9.8k servers served via
+// the public agg API. Each server carries a ServerConfig in the standard Claude Code format
+// ({mcpServers: {name: {command, args}}}) — install extracts it and registers via add_mcp.
+// Sources are fully manageable here (add/toggle/delete, mirroring SkillBrowseSection).
+function McpBrowseSection({ onInstalled }: { onInstalled: () => void }) {
+  const { t } = useT();
+  const [sources, setSources] = useState<McpSource[]>([]);
+  const [selId, setSelId] = useState<string>("");
+  const [items, setItems] = useState<McpCatalogItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const [installing, setInstalling] = useState<string>("");
+  const [justInstalled, setJustInstalled] = useState<string>("");
+  const [page, setPage] = useState(1);
+  // The ModelScope agg API ignores PageSize (always returns max 10) and PageNumber (page 2
+  // returns the same 10 as page 1), so pageSize is set to 10 to match reality and pagination
+  // is hidden entirely — there's no next page to fetch. Users narrow via search/category.
+  const [pageSize] = useState(10);
+  const [totalCount, setTotalCount] = useState(0);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  // Category chips are rendered from the hardcoded MCP_CATEGORIES list (the agg API has no
+  // category endpoint and its Criterion filter is ignored). Selecting a category folds the
+  // slug into the agg `Query` server-side, so `items` is already category-scoped.
+  const [selCat, setSelCat] = useState<string>("__all");
+
+  const [showAdd, setShowAdd] = useState(false);
+  const [addName, setAddName] = useState("");
+  const [addUrl, setAddUrl] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+
+  const loadSources = () => {
+    getMcpSources()
+      .then((r) => {
+        setSources(r ?? []);
+        const stillThere = (r ?? []).find((s) => s.id === selId && s.enabled);
+        if (!stillThere) {
+          const first = (r ?? []).find((s) => s.enabled);
+          setSelId(first ? first.id : "");
+        }
+      })
+      .catch(() => setSources([]));
+  };
+
+  useEffect(() => {
+    loadSources();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!selId) {
+      setItems([]);
+      setTotalCount(0);
+      return;
+    }
+    setLoading(true);
+    setErr("");
+    getMcpCatalog(selId, { page, page_size: pageSize, query: searchQuery, category: selCat === "__all" ? "" : selCat })
+      .then((r) => {
+        if (r.ok) {
+          setItems(r.servers ?? []);
+          setTotalCount(r.total_count ?? 0);
+        } else {
+          setErr(r.error || "failed to load");
+          setItems([]);
+          setTotalCount(0);
+        }
+      })
+      .catch(() => setErr("failed to load"))
+      .finally(() => setLoading(false));
+  }, [selId, page, searchQuery, selCat]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [selId, searchQuery, selCat]);
+
+  const install = async (name: string, sourceId: string) => {
+    setInstalling(name);
+    setErr("");
+    const r = await installMcpFromCatalog(sourceId, name);
+    setInstalling("");
+    if (r.ok) {
+      setJustInstalled(name);
+      const cat = await getMcpCatalog(sourceId, { page, page_size: pageSize, query: searchQuery, category: selCat === "__all" ? "" : selCat });
+      if (cat.ok) setItems(cat.servers ?? []);
+      setTimeout(onInstalled, 500);
+    } else {
+      setErr(r.error || "install failed");
+    }
+  };
+
+  const addSource = async () => {
+    if (!addName.trim() || !addUrl.trim()) return;
+    setAddBusy(true);
+    const r = await addMcpSource(addName.trim(), addUrl.trim(), "modelscope");
+    setAddBusy(false);
+    if (r.ok) {
+      setAddName("");
+      setAddUrl("");
+      setShowAdd(false);
+      loadSources();
+    } else {
+      setErr(r.error || "failed to add source");
+    }
+  };
+
+  const toggleSource = async (s: McpSource) => {
+    await updateMcpSource(s.id, { enabled: !s.enabled });
+    loadSources();
+  };
+
+  const deleteSource = async (s: McpSource) => {
+    await removeMcpSource(s.id);
+    loadSources();
+  };
+
+  const resetSources = async () => {
+    await resetMcpSources();
+    loadSources();
+  };
+
+  const doSearch = () => {
+    setSearchQuery(searchInput.trim());
+  };
+
+  if (sources.length === 0 && !showAdd) {
+    return (
+      <div className="py-6 text-center">
+        <div className="text-[12.5px] text-faint mb-3">{t("customize.marketplace_empty")}</div>
+        <div className="flex items-center justify-center gap-3">
+          <button
+            className="text-[12px] px-2.5 py-1 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent"
+            onClick={() => setShowAdd(true)}
+          >
+            + {t("customize.marketplace_add_source")}
+          </button>
+          <button
+            className="flex items-center gap-1 text-[12px] text-muted hover:text-accent"
+            onClick={resetSources}
+            title={t("customize.reset_sources_help")}
+          >
+            <Icon name="refresh" size={12} />
+            {t("customize.reset_sources")}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // No client-side category filter: the backend folds the selected category into the agg
+  // API `Query` (the only field it honors — Criterion/PageSize/PageNumber are all ignored),
+  // so `items` is already scoped to the selected category. Re-filtering here would drop
+  // servers whose `category` list doesn't literally contain the slug even though they
+  // matched the query, showing 0 results for a non-empty category.
+  const visible = items;
+
+  return (
+    <div>
+      {/* Source picker + manage */}
+      <div className="mb-3">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {sources.filter((s) => s.enabled).map((s) => (
+            <button
+              key={s.id}
+              className={
+                "text-[12px] px-2.5 py-1 rounded-full border transition-colors " +
+                (selId === s.id
+                  ? "bg-accent text-white border-accent"
+                  : "bg-paper border-line text-muted hover:text-ink")
+              }
+              onClick={() => setSelId(s.id)}
+              title={s.url}
+            >
+              {s.name}
+              {s.is_default && <span className="opacity-70"> · {t("customize.marketplace_source_default")}</span>}
+            </button>
+          ))}
+          {sources.filter((s) => !s.enabled).length > 0 && (
+            <span className="text-[11px] text-faint">
+              +{sources.filter((s) => !s.enabled).length} disabled
+            </span>
+          )}
+          <button
+            className="text-[11.5px] px-2 py-1 rounded-full border border-line border-dashed text-muted hover:text-accent hover:border-accent"
+            onClick={() => setShowAdd((v) => !v)}
+          >
+            + {t("customize.marketplace_add_source")}
+          </button>
+          <button
+            className="flex items-center gap-1 text-[11.5px] px-2 py-1 rounded-full border border-line text-muted hover:text-accent hover:border-accent"
+            onClick={resetSources}
+            title={t("customize.reset_sources_help")}
+          >
+            <Icon name="refresh" size={12} />
+            {t("customize.reset_sources")}
+          </button>
+        </div>
+
+        {sources.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {sources.map((s) => (
+              <div key={s.id} className="flex items-center gap-2 text-[11.5px] text-faint">
+                <span className={"w-1.5 h-1.5 rounded-full " + (s.enabled ? "bg-accent" : "bg-faint")} />
+                <span className="truncate flex-1 min-w-0" title={s.url}>{s.url}</span>
+                <span className="text-[10px] px-1 rounded bg-paper border border-line shrink-0">{s.source_type}</span>
+                <button
+                  className="text-muted hover:text-accent"
+                  onClick={() => toggleSource(s)}
+                  title={s.enabled ? "Disable" : "Enable"}
+                >
+                  {s.enabled ? "●" : "○"}
+                </button>
+                <button
+                  className="text-faint hover:text-danger p-0.5"
+                  title={t("common.delete_aria", { title: s.name })}
+                  onClick={() => deleteSource(s)}
+                >
+                  <Icon name="trash" size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {showAdd && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5 p-2 rounded-lg border border-line bg-paper">
+            <input
+              className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-1"
+              placeholder={t("customize.marketplace_source_name_ph")}
+              value={addName}
+              spellCheck={false}
+              onChange={(e) => setAddName(e.target.value)}
+            />
+            <input
+              className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent min-w-0 flex-[2]"
+              placeholder={t("customize.marketplace_source_url_ph")}
+              value={addUrl}
+              spellCheck={false}
+              onChange={(e) => setAddUrl(e.target.value)}
+            />
+            <button
+              className="text-[12px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-50"
+              disabled={addBusy || !addName.trim() || !addUrl.trim()}
+              onClick={addSource}
+            >
+              {t("customize.marketplace_add_source")}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Search + total count */}
+      <div className="flex items-center gap-2 mb-3">
+        <input
+          className="px-2.5 py-1 rounded-md border border-line bg-panel text-[12px] text-ink outline-none focus:border-accent flex-1 min-w-0"
+          placeholder={t("customize.mcp_search_placeholder")}
+          value={searchInput}
+          spellCheck={false}
+          onChange={(e) => setSearchInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && doSearch()}
+        />
+        <button
+          className="text-[12px] px-2.5 py-1 rounded-md border border-lineStrong bg-panel hover:border-accent hover:text-accent shrink-0"
+          onClick={doSearch}
+        >
+          {t("customize.marketplace_search")}
+        </button>
+        {totalCount > 0 && (
+          <span className="text-[11px] text-faint shrink-0">
+            {t("customize.mcp_total_count", { count: totalCount })}
+          </span>
+        )}
+      </div>
+
+      {/* Category filter chips — always render the full 13 hardcoded ModelScope MCP
+          categories with Chinese labels. Selecting a chip folds the slug into the agg API
+          `Query` (the only field it honors — Criterion/PageSize/PageNumber are all ignored),
+          so the backend returns servers matching that category with an honest total. No
+          per-category counts are shown: the API can't surface the site's "589" figure, so
+          showing it would mislead. */}
+      <div className="flex flex-wrap gap-1 mb-3">
+        <button
+          className={
+            "text-[11.5px] px-2 py-0.5 rounded-full border transition-colors " +
+            (selCat === "__all"
+              ? "bg-accent text-white border-accent"
+              : "bg-paper border-line text-muted hover:text-ink")
+          }
+          onClick={() => setSelCat("__all")}
+        >
+          {t("customize.marketplace_category_all")}
+        </button>
+        {MCP_CATEGORIES.map((c) => (
+          <button
+            key={c.slug}
+            className={
+              "text-[11.5px] px-2 py-0.5 rounded-full border transition-colors " +
+              (selCat === c.slug
+                ? "bg-accent text-white border-accent"
+                : "bg-paper border-line text-muted hover:text-ink")
+            }
+            onClick={() => setSelCat(c.slug)}
+          >
+            {c.zh}
+          </button>
+        ))}
+      </div>
+
+      {err && <div className="text-[12px] text-danger py-2">{err}</div>}
+
+      {loading ? (
+        <div className="text-[12.5px] text-faint py-6 text-center">
+          {t("customize.marketplace_loading")}
+        </div>
+      ) : items.length === 0 ? (
+        <div className="text-[12.5px] text-faint py-6 text-center">
+          {t("customize.marketplace_empty")}
+        </div>
+      ) : (
+        <div className="divide-y divide-line">
+          {visible.map((it) => {
+            const isInstalling = installing === it.name;
+            const justDone = justInstalled === it.name;
+            return (
+              <div key={it.name} className="flex items-center gap-3 py-2.5">
+                {it.icon ? (
+                  <img
+                    src={it.icon}
+                    alt=""
+                    className="w-7 h-7 rounded-md object-cover shrink-0 bg-paper border border-line"
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                  />
+                ) : (
+                  <Icon name="code" size={14} className="text-faint shrink-0" />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[13px] font-medium text-ink truncate">{it.name}</span>
+                    {it.verified && (
+                      <span className="text-[9.5px] px-1.5 py-0.5 rounded-full bg-accentSoft text-accent shrink-0" title={t("customize.mcp_verified")}>
+                        ✓ {t("customize.mcp_verified")}
+                      </span>
+                    )}
+                    {it.hosted && (
+                      <span className="text-[9.5px] px-1.5 py-0.5 rounded-full bg-paper border border-line text-faint shrink-0">
+                        {t("customize.mcp_hosted")}
+                      </span>
+                    )}
+                    {it.category.map((c) => (
+                      <span key={c} className="text-[10px] px-1.5 py-0.5 rounded-full bg-paper border border-line text-faint shrink-0">
+                        {mcpCategoryLabel(c)}
+                      </span>
+                    ))}
+                    {it.stars > 0 && (
+                      <span className="text-[10px] text-faint shrink-0">★ {it.stars}</span>
+                    )}
+                  </div>
+                  {it.description && (
+                    <div className="text-[11.5px] text-faint truncate">{it.description}</div>
+                  )}
+                </div>
+                {it.installed || justDone ? (
+                  <span className="text-[10.5px] px-2 py-1 rounded-full bg-accentSoft text-accent shrink-0">
+                    {t("customize.marketplace_installed")}
+                  </span>
+                ) : (
+                  <button
+                    className="text-[12px] px-2.5 py-1 rounded-lg border border-lineStrong bg-panel hover:border-accent hover:text-accent shrink-0 disabled:opacity-50"
+                    disabled={isInstalling}
+                    onClick={() => install(it.name, selId)}
+                  >
+                    {isInstalling ? t("customize.marketplace_installing") : t("customize.marketplace_install")}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* The ModelScope agg API ignores PageNumber (page 2 returns the same 10 as page 1)
+          and caps results at 10 per call, so real pagination is impossible. Instead of a
+          broken "1 / 328" pager that always shows the same items, show an honest note when
+          there are more results than the API surfaced, pointing the user to search/category. */}
+      {totalCount > items.length && (
+        <div className="text-[11px] text-faint text-center mt-3 pt-3 border-t border-line">
+          {t("customize.mcp_limited_results", { shown: items.length, total: totalCount })}
         </div>
       )}
     </div>
